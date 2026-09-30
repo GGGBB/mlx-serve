@@ -3820,153 +3820,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
-    // DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH=N): time N decode-width forward
-    // passes back to back, with NO sampling, detokenization, stop-checking or
-    // cache bookkeeping around them. The server reports `predicted_ms` around
-    // the whole decode LOOP, so this is the only way to say how much of a
-    // token is the model and how much is everything else. Resets the KV cache
-    // afterwards so the probe cannot pollute real requests.
-    if (std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH")) |raw| {
-        const n = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
-        if (n > 0) {
-            const io_u = @import("io_util.zig");
-            const tio = std.Io.Threaded.global_single_threaded.io();
-            var ctx = xfm_ptr.defaultCtx();
-            // MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>: verify-width forwards
-            // (per-position SSM capture on, as spec verify runs them).
-            // MLX_SERVE_DECODE_FWD_UBENCH_KV=<tokens>: prefill that many
-            // tokens first so the meter runs at a real context length.
-            const rows: usize = blk: {
-                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_S") orelse break :blk 1;
-                break :blk @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1);
-            };
-            const kv_pre: usize = blk: {
-                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
-                break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
-            };
-            const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
-            defer sch.allocator.free(tok_slice);
-            for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
-            const tok = tok_slice.ptr;
-            const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
-            if (kv_pre > 0) {
-                var done_pre: usize = 0;
-                const pre_buf = try sch.allocator.alloc(i32, 2048);
-                defer sch.allocator.free(pre_buf);
-                for (pre_buf, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
-                while (done_pre < kv_pre) {
-                    const n_chunk = @min(2048, kv_pre - done_pre);
-                    const psh = [_]c_int{ 1, @intCast(n_chunk) };
-                    const ti = mlx.mlx_array_new_data(pre_buf.ptr, &psh, 2, .int32);
-                    defer _ = mlx.mlx_array_free(ti);
-                    const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
-                    _ = mlx.mlx_array_eval(lg);
-                    _ = mlx.mlx_array_free(lg);
-                    done_pre += n_chunk;
-                }
-                log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
-            }
-            ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
-            // Prefill widths: every forward starts from an empty cache (else each
-            // one attends over the previous ones' rows) and skips the lm_head,
-            // which a real intermediate chunk never evaluates.
-            const prefill_rows = rows > 16 and kv_pre == 0;
-            ctx.skip_lm_head = prefill_rows;
-            log.info("[fwd-ubench] rows={d} capture={} prefill={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, prefill_rows });
-            // Warm: first forward pays kernel JIT + lazy weight materialization.
-            for (0..3) |_| {
-                if (prefill_rows) try xfm_ptr.resetCache();
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
-                defer _ = mlx.mlx_array_free(ti);
-                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
-                _ = mlx.mlx_array_eval(lg);
-                _ = mlx.mlx_array_free(lg);
-            }
-            // DIAGNOSTIC (MLX_SERVE_DECODE_GRAPH_DUMP=<path>): print the lazy
-            // graph of ONE forward (every primitive with its shape) before it
-            // is evaluated, to map which ops a decode step dispatches.
-            if (std.c.getenv("MLX_SERVE_DECODE_GRAPH_DUMP")) |path| {
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
-                defer _ = mlx.mlx_array_free(ti);
-                if (xfm_ptr.forwardWith(&ctx, ti)) |lg| {
-                    defer _ = mlx.mlx_array_free(lg);
-                    if (std.c.fopen(path, "w")) |f| {
-                        const outs = mlx.mlx_vector_array_new_value(lg);
-                        defer _ = mlx.mlx_vector_array_free(outs);
-                        const namer = mlx.mlx_node_namer_new();
-                        defer _ = mlx.mlx_node_namer_free(namer);
-                        _ = mlx.mlx_print_graph(f, namer, outs);
-                        _ = std.c.fclose(f);
-                        log.info("[fwd-ubench] graph dumped to {s}\n", .{std.mem.sliceTo(path, 0)});
-                    }
-                    _ = mlx.mlx_array_eval(lg);
-                } else |_| {}
-            }
-            // Split CPU graph CONSTRUCTION from GPU execution. MLX is lazy, so
-            // `forwardWith` only issues ops — if that half dominates, the token
-            // is bounded by op count / FFI overhead, not by memory bandwidth,
-            // and no kernel-level optimization can reach it.
-            var sw = io_u.Stopwatch.init(tio);
-            var build_ns: u64 = 0;
-            var eval_ns: u64 = 0;
-            var ops_total: u64 = 0;
-            var done: usize = 0;
-            for (0..n) |_| {
-                if (prefill_rows) try xfm_ptr.resetCache();
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
-                defer _ = mlx.mlx_array_free(ti);
-                const ops_before = mlx.op_count.load(.monotonic);
-                var swb = io_u.Stopwatch.init(tio);
-                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
-                build_ns += swb.read();
-                ops_total += mlx.op_count.load(.monotonic) - ops_before;
-                var swe = io_u.Stopwatch.init(tio);
-                _ = mlx.mlx_array_eval(lg);
-                eval_ns += swe.read();
-                _ = mlx.mlx_array_free(lg);
-                done += 1;
-            }
-            const dn: f64 = @floatFromInt(@max(done, 1));
-            const ms = if (prefill_rows) @as(f64, @floatFromInt(build_ns + eval_ns)) / 1.0e6 / dn else @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
-            transformer_mod.decodeProfReport();
-            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{
-                done,
-                ms,
-                @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
-                @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
-                @as(f64, @floatFromInt(ops_total)) / dn,
-            });
-
-            // Same forward with the vocab projection suppressed. lm_head is
-            // terminal — nothing downstream depends on it — so dropping it
-            // cannot change the work the rest of the graph does, which makes
-            // this the one sound ablation in the probe.
-            ctx.skip_lm_head = true;
-            for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
-                defer _ = mlx.mlx_array_free(ti);
-                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
-                _ = mlx.mlx_array_eval(lg);
-                _ = mlx.mlx_array_free(lg);
-            }
-            var sw_nolm = io_u.Stopwatch.init(tio);
-            var done_nolm: usize = 0;
-            for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
-                defer _ = mlx.mlx_array_free(ti);
-                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
-                _ = mlx.mlx_array_eval(lg);
-                _ = mlx.mlx_array_free(lg);
-                done_nolm += 1;
-            }
-            const ms_nolm = @as(f64, @floatFromInt(sw_nolm.read())) / 1.0e6 / @as(f64, @floatFromInt(@max(done_nolm, 1)));
-            ctx.skip_lm_head = false;
-            log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms\n", .{ ms_nolm, ms - ms_nolm });
-            xfm_ptr.diagProjBench(20, &ctx);
-            log.info("[fwd-ubench] done\n", .{});
-            xfm_ptr.resetCache() catch {};
-        }
-    }
 
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
     // (model declares vision in config but the safetensors didn't ship the
@@ -4146,6 +3999,155 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         d.deinit();
         sch.allocator.destroy(d);
     };
+
+    // After the drafter binds: an exact-mode arch runs its row kernels only then.
+    // DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH=N): time N decode-width forward
+    // passes back to back, with NO sampling, detokenization, stop-checking or
+    // cache bookkeeping around them. The server reports `predicted_ms` around
+    // the whole decode LOOP, so this is the only way to say how much of a
+    // token is the model and how much is everything else. Resets the KV cache
+    // afterwards so the probe cannot pollute real requests.
+    if (std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH")) |raw| {
+        const n = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
+        if (n > 0) {
+            const io_u = @import("io_util.zig");
+            const tio = std.Io.Threaded.global_single_threaded.io();
+            var ctx = xfm_ptr.defaultCtx();
+            // MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>: verify-width forwards
+            // (per-position SSM capture on, as spec verify runs them).
+            // MLX_SERVE_DECODE_FWD_UBENCH_KV=<tokens>: prefill that many
+            // tokens first so the meter runs at a real context length.
+            const rows: usize = blk: {
+                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_S") orelse break :blk 1;
+                break :blk @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1);
+            };
+            const kv_pre: usize = blk: {
+                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
+                break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
+            };
+            const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
+            defer sch.allocator.free(tok_slice);
+            for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
+            const tok = tok_slice.ptr;
+            const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
+            if (kv_pre > 0) {
+                var done_pre: usize = 0;
+                const pre_buf = try sch.allocator.alloc(i32, 2048);
+                defer sch.allocator.free(pre_buf);
+                for (pre_buf, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
+                while (done_pre < kv_pre) {
+                    const n_chunk = @min(2048, kv_pre - done_pre);
+                    const psh = [_]c_int{ 1, @intCast(n_chunk) };
+                    const ti = mlx.mlx_array_new_data(pre_buf.ptr, &psh, 2, .int32);
+                    defer _ = mlx.mlx_array_free(ti);
+                    const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                    _ = mlx.mlx_array_eval(lg);
+                    _ = mlx.mlx_array_free(lg);
+                    done_pre += n_chunk;
+                }
+                log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
+            }
+            ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            // Prefill widths: every forward starts from an empty cache (else each
+            // one attends over the previous ones' rows) and skips the lm_head,
+            // which a real intermediate chunk never evaluates.
+            const prefill_rows = rows > 16 and kv_pre == 0;
+            ctx.skip_lm_head = prefill_rows;
+            log.info("[fwd-ubench] rows={d} capture={} prefill={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, prefill_rows });
+            // Warm: first forward pays kernel JIT + lazy weight materialization.
+            for (0..3) |_| {
+                if (prefill_rows) try xfm_ptr.resetCache();
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+            }
+            // DIAGNOSTIC (MLX_SERVE_DECODE_GRAPH_DUMP=<path>): print the lazy
+            // graph of ONE forward (every primitive with its shape) before it
+            // is evaluated, to map which ops a decode step dispatches.
+            if (std.c.getenv("MLX_SERVE_DECODE_GRAPH_DUMP")) |path| {
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                if (xfm_ptr.forwardWith(&ctx, ti)) |lg| {
+                    defer _ = mlx.mlx_array_free(lg);
+                    if (std.c.fopen(path, "w")) |f| {
+                        const outs = mlx.mlx_vector_array_new_value(lg);
+                        defer _ = mlx.mlx_vector_array_free(outs);
+                        const namer = mlx.mlx_node_namer_new();
+                        defer _ = mlx.mlx_node_namer_free(namer);
+                        _ = mlx.mlx_print_graph(f, namer, outs);
+                        _ = std.c.fclose(f);
+                        log.info("[fwd-ubench] graph dumped to {s}\n", .{std.mem.sliceTo(path, 0)});
+                    }
+                    _ = mlx.mlx_array_eval(lg);
+                } else |_| {}
+            }
+            // Split CPU graph CONSTRUCTION from GPU execution. MLX is lazy, so
+            // `forwardWith` only issues ops — if that half dominates, the token
+            // is bounded by op count / FFI overhead, not by memory bandwidth,
+            // and no kernel-level optimization can reach it.
+            var sw = io_u.Stopwatch.init(tio);
+            var build_ns: u64 = 0;
+            var eval_ns: u64 = 0;
+            var ops_total: u64 = 0;
+            var done: usize = 0;
+            for (0..n) |_| {
+                if (prefill_rows) try xfm_ptr.resetCache();
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const ops_before = mlx.op_count.load(.monotonic);
+                var swb = io_u.Stopwatch.init(tio);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                build_ns += swb.read();
+                ops_total += mlx.op_count.load(.monotonic) - ops_before;
+                var swe = io_u.Stopwatch.init(tio);
+                _ = mlx.mlx_array_eval(lg);
+                eval_ns += swe.read();
+                _ = mlx.mlx_array_free(lg);
+                done += 1;
+            }
+            const dn: f64 = @floatFromInt(@max(done, 1));
+            const ms = if (prefill_rows) @as(f64, @floatFromInt(build_ns + eval_ns)) / 1.0e6 / dn else @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
+            transformer_mod.decodeProfReport();
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{
+                done,
+                ms,
+                @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(ops_total)) / dn,
+            });
+
+            // Same forward with the vocab projection suppressed. lm_head is
+            // terminal — nothing downstream depends on it — so dropping it
+            // cannot change the work the rest of the graph does, which makes
+            // this the one sound ablation in the probe.
+            ctx.skip_lm_head = true;
+            for (0..3) |_| {
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+            }
+            var sw_nolm = io_u.Stopwatch.init(tio);
+            var done_nolm: usize = 0;
+            for (0..n) |_| {
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+                done_nolm += 1;
+            }
+            const ms_nolm = @as(f64, @floatFromInt(sw_nolm.read())) / 1.0e6 / @as(f64, @floatFromInt(@max(done_nolm, 1)));
+            ctx.skip_lm_head = false;
+            log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms\n", .{ ms_nolm, ms - ms_nolm });
+            xfm_ptr.diagProjBench(20, &ctx);
+            log.info("[fwd-ubench] done\n", .{});
+            xfm_ptr.resetCache() catch {};
+        }
+    }
 
     // Qwen native MTP head (optional). Auto-loaded when the model dir ships
     // one — an `mtp/weights.safetensors`-class sidecar file OR in-checkpoint
