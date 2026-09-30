@@ -333,12 +333,14 @@ dc = cfg.get("dflash_config") or cfg
 print(dc.get("block_size", ""))
 ' "$DRAFTER/config.json")
 BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | head -1)
+# Trees on the tensor units draft past the trained block (dflash.TREE_NAX_BLOCK).
+TREE_NAX_BLOCK=16
 if echo "$BLINE" | grep -q ", capped ("; then
     ok "block capped for this machine's verify lanes ($BLINE)"
 elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
     ok "wide verify lane present, checkpoint block ($DECLARED_BLOCK) kept ($BLINE)"
-elif grep -q "draft trees engaged" "$LOG" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
-    ok "draft tree cap keeps the checkpoint block ($DECLARED_BLOCK) ($BLINE)"
+elif grep -q "draft trees engaged" "$LOG" && echo "$BLINE" | grep -q "block_size=$TREE_NAX_BLOCK,"; then
+    ok "draft trees on NAX draft $TREE_NAX_BLOCK positions past the checkpoint block ($DECLARED_BLOCK) ($BLINE)"
 else
     bad "block resolves against the machine's verify lanes (declared=$DECLARED_BLOCK)" "$BLINE"
 fi
