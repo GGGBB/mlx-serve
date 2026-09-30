@@ -1,12 +1,13 @@
-//! Row-exact 4-bit matmul on the M5 tensor units for 1..MAX_ROWS rows, ported
-//! from TensorFold's `lane_qmm.py` (MIT, see NOTICE). Every 64- (or 32-) input
-//! group runs one fixed 16-row `matmul2d` (32 rows past 16, in 32-row blocks
-//! across threadgroups) over the packed 4-bit codes, then
+//! Row-exact 4-, 5-, 6- and 8-bit matmul on the M5 tensor units for
+//! 1..MAX_ROWS rows, ported from TensorFold's `lane_qmm.py` and `lane_widen.py`
+//! (MIT, see NOTICE). Every 64- (or 32-) input group runs one fixed 16-row
+//! `matmul2d` (32 rows past 16, in 32-row blocks across threadgroups) over the
+//! packed codes (8-bit as bytes, 5- and 6-bit widened to bytes per group), then
 //! `C = s * P + b * XS` in group order in fp32, the K slices summed in slice
 //! order; the slice count follows the weight's shape only. A row's bits never
 //! depend on how many rows ride with it, so a drafted window verifies with the
-//! one-row step's bits. Weights whose N is a multiple of 64 take the 64-column
-//! tile two simdgroups run together (`COOP`), the rest 32 columns (`NARROW`),
+//! one-row step's bits. 4-bit weights whose N is a multiple of 64 take the
+//! 64-column tile two simdgroups run together (`COOP`), the rest 32 columns (`NARROW`),
 //! both over MLX's packed layout or, once `tileInPlace` re-ordered a weight in
 //! its own buffer, the tiled one (each column tile's group one contiguous block,
 //! scales and biases group-major); all four give the same bits. A tiled weight
