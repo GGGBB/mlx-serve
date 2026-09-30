@@ -29925,7 +29925,8 @@ pub const Transformer = struct {
     /// A joined row group serves one-row steps, and every width while the
     /// exact path runs: serial steps and verify rows then share its shapes.
     fn rowGroupServes(self: *const Transformer, rows: c_int) bool {
-        return rows <= FUSED_ROWS_MAX_M or (self.config.rowExactDecode() and rows <= simd_qmm.MAX_ROWS);
+        const exact_max: c_int = if (naxAvailable()) lane_qmm.MAX_ROWS else simd_qmm.MAX_ROWS;
+        return rows <= FUSED_ROWS_MAX_M or (self.config.rowExactDecode() and rows <= exact_max);
     }
 
     fn denseMLP(self: *Transformer, x: mlx.mlx_array, dw: *const DenseMlpWeights) !mlx.mlx_array {
@@ -29939,6 +29940,12 @@ pub const Transformer = struct {
         if (dw.gu.w.ctx != null and self.rowGroupServes(rows)) {
             const both = try self.qmatmul(x, dw.gu.w, dw.gu.s, dw.gu.b);
             defer _ = mlx.mlx_array_free(both);
+            if (self.config.hidden_act == .silu and dw.gu.widths[0] == dw.gu.widths[1]) {
+                if (try swigluJoined(self.s, both)) |act| {
+                    defer _ = mlx.mlx_array_free(act);
+                    return self.qmatmul(act, dw.down_w, dw.down_s, dw.down_b);
+                }
+            }
             try dw.gu.part(&gate, both, 0, self.s);
             try dw.gu.part(&up, both, 1, self.s);
         } else {
@@ -39060,6 +39067,71 @@ fn fusedGeluPleProj(s: mlx.mlx_stream, g: mlx.mlx_array, ple: mlx.mlx_array, tab
 /// Exact by construction (bit-level sigmoid table), so callers outside this
 /// file (tts.zig's talker/code-predictor MLPs) reuse it rather than growing a
 /// second kernel.
+// SWIGLU_SOURCE over a joined gate|up projection row (gate the first F
+// columns): the two halves are read in place instead of copied out.
+const SWIGLU_JOINED_SOURCE =
+    \\const uint i = thread_position_in_grid.x;
+    \\if (i >= uint(N_size)) return;
+    \\const uint r = i / uint(F), c = i % uint(F);
+    \\T g = both[r * uint(2 * F) + c];
+    \\T sig = sigtab[as_type<ushort>(g)];
+    \\T act = g * sig;
+    \\y[i] = act * both[r * uint(2 * F) + uint(F) + c];
+;
+var swiglu_joined_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var swiglu_joined_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var swiglu_joined_key: GateMulCfgKey = std.mem.zeroes(GateMulCfgKey);
+
+/// `fusedSwiGLU(gate, up)` for `both` = [..., gate | up] (equal halves), bit-equal to it.
+fn swigluJoined(s: mlx.mlx_stream, both: mlx.mlx_array) !?mlx.mlx_array {
+    if (!swigluFusedEnabled()) return null;
+    const dt = mlx.mlx_array_dtype(both);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    const sh = mlx.getShape(both);
+    if (sh.len == 0 or sh.len > 5 or @rem(sh[sh.len - 1], 2) != 0) return null;
+    var out_shape: [5]c_int = undefined;
+    @memcpy(out_shape[0..sh.len], sh);
+    const f = @divExact(sh[sh.len - 1], 2);
+    out_shape[sh.len - 1] = f;
+    var n: i64 = f;
+    for (sh[0 .. sh.len - 1]) |d| n *= d;
+    if (n <= 0 or n > std.math.maxInt(c_int)) return null;
+    const ni: c_int = @intCast(n);
+    const key = GateMulCfgKey{ .shape = ShapeKey.from(sh), .dtype = dt };
+    if (swiglu_joined_cfg == null or !std.meta.eql(swiglu_joined_key, key)) {
+        if (swiglu_joined_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, sh.len, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ni + 255, 256) * 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "F", f));
+        swiglu_joined_cfg = config;
+        swiglu_joined_key = key;
+    }
+    if (swiglu_joined_kernel == null) {
+        const in_names = [_][*:0]const u8{ "both", "sigtab", "N_size" };
+        const out_names = [_][*:0]const u8{"y"};
+        const in_vec = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const k = mlx.mlx_fast_metal_kernel_new("mlxserve_swiglu_joined", in_vec, out_vec, SWIGLU_JOINED_SOURCE, "", true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        swiglu_joined_kernel = k;
+    }
+    const sigtab = try swigluSigTable(s, dt, std.heap.c_allocator);
+    const ins = [_]mlx.mlx_array{ both, sigtab, cachedScalarInt(ni) };
+    const v = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    var o = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, swiglu_joined_kernel.?, v, swiglu_joined_cfg.?, s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
+    return y;
+}
+
 pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?mlx.mlx_array {
     if (!swigluFusedEnabled()) return null;
     const dt = mlx.mlx_array_dtype(gate);
@@ -48268,6 +48340,27 @@ test "fused gated conv step is bit-identical to multiply -> concat -> conv1d -> 
             try mlx.check(mlx.mlx_array_item_bool(&eq_v, eq));
             try testing.expect(eq_v);
         }
+    }
+}
+
+test "joined swiglu is bit-identical to fusedSwiGLU over the two halves" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x5316);
+    const rnd = prng.random();
+    for ([_]c_int{ 1, 16, 33 }) |rows| {
+        const both = try gdnParityRand(rnd, &.{ 1, rows, 2 * 1088 }, 6.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(both);
+        var gate = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate);
+        var up = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(up);
+        try sliceQkvPart(&gate, both, 0, 1088, s);
+        try sliceQkvPart(&up, both, 1088, 1088, s);
+        const ref = (try fusedSwiGLU(s, gate, up)) orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(ref);
+        const got = (try swigluJoined(s, both)) orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, ref, s));
     }
 }
 

@@ -161,9 +161,11 @@ const K1S_HEAD =
     \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
     \\  for (int i = 0; i < 4; ++i) st[j][i] = float(state_in[base + i]);
     \\}
-    \\if (sg < 3) {
-    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  for (int t = 0; t < TL; ++t) {
+    \\// one (q | k | v, token) pair per simdgroup at a time: a pair's arithmetic does not depend on which one runs it
+    \\for (int pw = int(sg); pw < 3 * TL; pw += NSG) {
+    \\  const int comp = pw % 3, t = pw / 3;
+    \\  uint cb = comp == 0 ? hk * DK : (comp == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
+    \\  {
     \\    T act[4];
     \\    float sumsq = 0.0f;
     \\    for (int i = 0; i < 4; ++i) {
@@ -180,16 +182,19 @@ const K1S_HEAD =
     \\      float v = float(act[i]);
     \\      sumsq += v * v;
     \\    }
-    \\    if (sg < 2) {
+    \\    if (comp < 2) {
     \\      sumsq = simd_sum(sumsq);
     \\      float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
-    \\      const T scale = sg == 0 ? q_scale : k_scale;
-    \\      threadgroup float* dst = sg == 0 ? qs[t] : ks[t];
+    \\      const T scale = comp == 0 ? q_scale : k_scale;
+    \\      threadgroup float* dst = comp == 0 ? qs[t] : ks[t];
     \\      for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = float(scale * T(1) * T(float(act[i]) * inv));
     \\    } else {
     \\      for (int i = 0; i < 4; ++i) vs[t][lane * 4 + i] = float(act[i]);
     \\    }
     \\  }
+    \\}
+    \\if (sg < 3) {
+    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
     \\  if (part == 0 && (sg == 2 || hv % GRP == 0)) {
     \\    for (int i = 0; i < 4; ++i) {
     \\      uint ch = cb + lane * 4 + i;
@@ -345,6 +350,9 @@ const K1R_SOURCE =
 
 const SPLIT: c_int = 4;
 const NT: c_int = 256; // 4 dv rows per simdgroup
+/// Multi-token rows run one dv row per simdgroup: a token's rows then take one
+/// reduction pair in sequence, not four (a row's arithmetic is the same).
+const SEQ_NT: c_int = 1024;
 
 var k1_cache: ?mlx.mlx_fast_metal_kernel = null;
 var k2_cache: ?mlx.mlx_fast_metal_kernel = null;
@@ -525,11 +533,11 @@ fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, g.hv, g.dv }, 3, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, g.hv, 2 }, 3, .float32));
     }
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * SPLIT * NT, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, NT, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * SPLIT * SEQ_NT, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, SEQ_NT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
-    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
+    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", SEQ_NT }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TL", t_len));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TREE", @intFromBool(tree)));
