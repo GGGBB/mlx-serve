@@ -9622,9 +9622,12 @@ pub fn ssmCommitTreePath(entry: *SSMCacheEntry, path: []const i32, conv_rows: [3
     if (entry.spec_prework.k.ctx != null) {
         const sh = mlx.getShape(entry.spec_state_in); // [B, Hv, Dv, Dk]
         const g = gdn_decode.Geometry{ .hk = mlx.getShape(entry.spec_prework.k)[1], .hv = sh[1], .dk = sh[3], .dv = sh[2] };
-        const st = (try gdn_decode.replay(g, entry.spec_state_in, entry.spec_prework, path, s)) orelse return error.SpecTreeUnsupported;
+        const c = (try gdn_decode.replay(g, entry.spec_state_in, entry.spec_prework, path, entry.spec_conv_input, conv_rows, s)) orelse return error.SpecTreeUnsupported;
         _ = mlx.mlx_array_free(entry.ssm_state);
-        entry.ssm_state = st;
+        entry.ssm_state = c.ssm_state;
+        _ = mlx.mlx_array_free(entry.conv_state);
+        entry.conv_state = c.conv_state;
+        return;
     } else if (entry.spec_state_seq.ctx != null) {
         const state_row: u32 = @intCast(path[path.len - 1]);
         const sh = mlx.getShape(entry.spec_state_seq); // [T, B, Hv, Dv, Dk]
@@ -62012,10 +62015,19 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype) !void {
         const nd: c_int = @intCast(node);
         try mlx.check(mlx.mlx_slice(&got_y, tree.y, &[_]c_int{ 0, nd, 0, 0 }, 4, &[_]c_int{ 1, nd + 1, hv, 128 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(want_y, got_y, s));
-        // Replaying the node's path from the round's input state gives the chain's state.
-        const replayed = (try gdn_decode.replay(g, fixed[1], tree.prework, path, s)) orelse return error.ReplayDeclined;
-        defer _ = mlx.mlx_array_free(replayed);
-        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(chain_state, replayed, s));
+        // Replaying the node's path from the round's input state gives the chain's
+        // state, and the conv window its path's last three conv inputs.
+        var conv_rows: [3]i32 = undefined;
+        for (0..3) |i| {
+            const dd: i32 = n - 3 + @as(i32, @intCast(i));
+            conv_rows[i] = if (dd < 0) dd + 3 else 3 + path[@intCast(dd)];
+        }
+        const replayed = (try gdn_decode.replay(g, fixed[1], tree.prework, path, tree.conv_input, conv_rows, s)) orelse return error.ReplayDeclined;
+        defer inline for (.{ replayed.ssm_state, replayed.conv_state }) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(chain_state, replayed.ssm_state, s));
+        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(chain_out[1], replayed.conv_state, s));
     }
 }
 

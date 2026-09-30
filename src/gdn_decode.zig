@@ -374,13 +374,16 @@ const K1TR_SOURCE =
 
 // The recurrence along `path` (window rows, oldest first) from the round's
 // input state, the tree kernel's ops and per-token rounding: the state serial
-// decoding holds after the path's last row. K1TR's grid.
+// decoding holds after the path's last row. K1TR's grid. The same launch
+// copies the kept conv window: rows `conv_rows` of the conv input.
 const K1R_SOURCE =
     \\constexpr int GRP = HV / HK;
     \\uint lane = thread_index_in_simdgroup;
     \\uint dv = thread_position_in_grid.y;
     \\uint hv = thread_position_in_grid.z;
     \\uint hk = hv / GRP;
+    \\const uint tid = (hv * DV + dv) * 32 + lane;
+    \\if (tid < uint(3 * C)) conv_out[tid] = conv_in[conv_rows[tid / C] * C + tid % C];
     \\float st[4];
     \\uint base = (hv * DV + dv) * DK + lane * 4;
     \\for (int i = 0; i < 4; ++i) st[i] = float(state_in[base + i]);
@@ -777,24 +780,33 @@ var k1r_cache: ?mlx.mlx_fast_metal_kernel = null;
 var replay_cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
 var replay_key: ?CfgKey = null;
 
+pub const Commit = struct { ssm_state: mlx.mlx_array, conv_state: mlx.mlx_array };
+
 /// The state after the window rows `path` (oldest first), recurred from
-/// `state_in` with a tree round's `prework`: the state serial decoding holds
-/// there. Null outside the kernel's geometry.
-pub fn replay(g: Geometry, state_in: mlx.mlx_array, pw: Prework, path: []const i32, s: mlx.mlx_stream) !?mlx.mlx_array {
+/// `state_in` with a tree round's `prework` (the state serial decoding holds
+/// there), and the conv state: rows `conv_rows` of `conv_input` [1,3+T,C].
+/// Null outside the kernel's geometry.
+pub fn replay(g: Geometry, state_in: mlx.mlx_array, pw: Prework, path: []const i32, conv_input: mlx.mlx_array, conv_rows: [3]i32, s: mlx.mlx_stream) !?Commit {
     if (!mlx.streamIsGpu(s) or pw.k.ctx == null or path.len == 0) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const csh = mlx.getShape(conv_input);
+    if (csh.len != 3 or csh[0] != 1 or csh[2] != c or 3 * c > 32 * g.dv * g.hv) return null;
+    for (conv_rows) |r| if (r < 0 or r >= csh[1]) return null;
     const st = mlx.mlx_array_dtype(state_in);
-    if (k1r_cache == null) k1r_cache = try makeKernel("msv_gdn_decode_replay", &.{ "state_in", "pk", "pv", "pg", "path", "n_path" }, &.{"state_out"}, K1R_SOURCE, HEADER);
-    const key = CfgKey{ .g = g, .dt = st, .st = st };
+    const dt = mlx.mlx_array_dtype(conv_input);
+    if (k1r_cache == null) k1r_cache = try makeKernel("msv_gdn_decode_replay", &.{ "state_in", "pk", "pv", "pg", "path", "n_path", "conv_in", "conv_rows" }, &.{ "state_out", "conv_out" }, K1R_SOURCE, HEADER);
+    const key = CfgKey{ .g = g, .dt = dt, .st = st };
     if (replay_key == null or !std.meta.eql(replay_key.?, key)) {
         if (replay_cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(replay_cfg);
         replay_cfg = mlx.mlx_fast_metal_kernel_config_new();
         replay_key = null;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(replay_cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(replay_cfg, &[_]c_int{ 1, 3, c }, 3, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(replay_cfg, 32, g.dv, g.hv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(replay_cfg, 32, 4, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(replay_cfg, "StT", st));
-        inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv } }) |kv|
+        inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c } }) |kv|
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(replay_cfg, kv[0], kv[1]));
         replay_key = key;
     }
@@ -803,15 +815,20 @@ pub fn replay(g: Geometry, state_in: mlx.mlx_array, pw: Prework, path: []const i
     const n: i32 = @intCast(path.len);
     const n_arr = mlx.mlx_array_new_data(&n, &[_]c_int{1}, 1, .int32);
     defer _ = mlx.mlx_array_free(n_arr);
-    const ins = [_]mlx.mlx_array{ state_in, pw.k, pw.v, pw.gb, path_arr, n_arr };
+    const rows_arr = mlx.mlx_array_new_data(&conv_rows, &[_]c_int{3}, 1, .int32);
+    defer _ = mlx.mlx_array_free(rows_arr);
+    const ins = [_]mlx.mlx_array{ state_in, pw.k, pw.v, pw.gb, path_arr, n_arr, conv_input, rows_arr };
     const v = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(v);
     var o = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, k1r_cache.?, v, replay_cfg, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&out, o, 0));
-    return out;
+    var st_out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(st_out);
+    try mlx.check(mlx.mlx_vector_array_get(&st_out, o, 0));
+    var conv_out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&conv_out, o, 1));
+    return .{ .ssm_state = st_out, .conv_state = conv_out };
 }
 
 pub const RecurSeqFold = struct { gated: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array, conv_input: mlx.mlx_array };
