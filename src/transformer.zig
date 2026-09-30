@@ -19859,11 +19859,17 @@ pub const Transformer = struct {
         const owner = @intFromPtr(self);
         var bytes: u64 = 0;
         const Tile = struct {
-            fn rows(own: usize, f: *const FusedRows, parts: []const [3]mlx.mlx_array, str: mlx.mlx_stream) !u64 {
-                if (f.w.ctx != null) return lane_qmm.tileInPlace(own, f.w, f.s, f.b, f.widths[0..f.count], str);
+            fn one(x: *const Transformer, own: usize, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !u64 {
+                if (sc.ctx == null) return 0;
+                const qp = x.quantParamsFor(w, sc);
+                if (qp.mode != .affine) return 0;
+                return lane_qmm.tileInPlace(own, w, sc, bi, qp.bits, qp.group_size, widths, x.s);
+            }
+            fn rows(x: *const Transformer, own: usize, f: *const FusedRows, parts: []const [3]mlx.mlx_array) !u64 {
+                if (f.w.ctx != null) return one(x, own, f.w, f.s, f.b, f.widths[0..f.count]);
                 var sum: u64 = 0;
                 for (parts) |p| if (p[0].ctx != null) {
-                    sum += try lane_qmm.tileInPlace(own, p[0], p[1], p[2], &.{}, str);
+                    sum += try one(x, own, p[0], p[1], p[2], &.{});
                 };
                 return sum;
             }
@@ -19871,18 +19877,18 @@ pub const Transformer = struct {
         for (layers) |*l| {
             switch (l.attn) {
                 .full => |*fa| {
-                    bytes += try Tile.rows(owner, &fa.qkv, &.{ .{ fa.q_w, fa.q_s, fa.q_b }, .{ fa.k_w, fa.k_s, fa.k_b }, .{ fa.v_w, fa.v_s, fa.v_b } }, self.s);
-                    bytes += try lane_qmm.tileInPlace(owner, fa.o_w, fa.o_s, fa.o_b, &.{}, self.s);
+                    bytes += try Tile.rows(self, owner, &fa.qkv, &.{ .{ fa.q_w, fa.q_s, fa.q_b }, .{ fa.k_w, fa.k_s, fa.k_b }, .{ fa.v_w, fa.v_s, fa.v_b } });
+                    bytes += try Tile.one(self, owner, fa.o_w, fa.o_s, fa.o_b, &.{});
                 },
                 .linear => |*la| {
-                    if (!la.combined_proj) bytes += try Tile.rows(owner, &la.in, &.{ .{ la.qkv_w, la.qkv_s, la.qkv_b }, .{ la.z_w, la.z_s, la.z_b }, .{ la.a_w, la.a_s, la.a_b }, .{ la.b_w, la.b_s, la.b_b } }, self.s);
-                    bytes += try lane_qmm.tileInPlace(owner, la.out_w, la.out_s, la.out_b, &.{}, self.s);
+                    if (!la.combined_proj) bytes += try Tile.rows(self, owner, &la.in, &.{ .{ la.qkv_w, la.qkv_s, la.qkv_b }, .{ la.z_w, la.z_s, la.z_b }, .{ la.a_w, la.a_s, la.a_b }, .{ la.b_w, la.b_s, la.b_b } });
+                    bytes += try Tile.one(self, owner, la.out_w, la.out_s, la.out_b, &.{});
                 },
             }
             switch (l.mlp) {
                 .dense => |*dm| {
-                    bytes += try Tile.rows(owner, &dm.gu, &.{ .{ dm.gate_w, dm.gate_s, dm.gate_b }, .{ dm.up_w, dm.up_s, dm.up_b } }, self.s);
-                    bytes += try lane_qmm.tileInPlace(owner, dm.down_w, dm.down_s, dm.down_b, &.{}, self.s);
+                    bytes += try Tile.rows(self, owner, &dm.gu, &.{ .{ dm.gate_w, dm.gate_s, dm.gate_b }, .{ dm.up_w, dm.up_s, dm.up_b } });
+                    bytes += try Tile.one(self, owner, dm.down_w, dm.down_s, dm.down_b, &.{});
                 },
                 .moe => {},
             }

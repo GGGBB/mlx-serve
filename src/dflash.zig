@@ -748,8 +748,7 @@ pub const DflashModel = struct {
         var bytes: u64 = 0;
         const Tile = struct {
             fn one(own: usize, lin: *const DflashLinear, st: mlx.mlx_stream) !u64 {
-                if (lin.bits != 4 or lin.group_size != 64) return 0;
-                return lane_qmm.tileInPlace(own, lin.w, lin.scales, lin.biases, &.{}, st);
+                return lane_qmm.tileInPlace(own, lin.w, lin.scales, lin.biases, lin.bits, lin.group_size, &.{}, st);
             }
         };
         bytes += try Tile.one(owner, &self.fc, s);

@@ -67,7 +67,20 @@ const NARROW =
     \\  constexpr auto desc = matmul2d_descriptor(16 * TMR, 32, GS, false, true, false, matmul2d_descriptor::mode::multiply);
     \\  matmul2d<desc, execution_simdgroup> op;
     \\  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X + (int64_t)rb * K, dextents<int32_t, 2>(K, M - rb));
+    \\#if BITS == 4
     \\  tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tB((device uchar*)W, dextents<int32_t, 2>(K, N));
+    \\#elif BITS == 8 && !TILED
+    \\  tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline> tB((device uint8_t*)W, dextents<int32_t, 2>(K, N));
+    \\#elif BITS == 8
+    \\#else
+    \\  // 5- and 6-bit: lane l widens column n0 + l's group into bytes for the bf16 x uint8 op.
+    \\  constexpr int WPG = GS * BITS / 32;
+    \\  threadgroup uint stage_all[SK * 32 * (GS / 4)];
+    \\  threadgroup uint* stage = stage_all + sg * 32 * (GS / 4);
+    \\  tensor<threadgroup uint8_t, dextents<int32_t, 2>, tensor_inline> b((threadgroup uint8_t*)stage, dextents<int32_t, 2>(GS, 32));
+    \\  const device uint* wcol = TILED ? (const device uint*)W + (int64_t)(R0 / 32 + threadgroup_position_in_grid.x) * KG * 32 * WPG + lane * WPG
+    \\                                  : (const device uint*)W + (int64_t)(n0 + lane) * (K * BITS / 32);
+    \\#endif
     \\  float C[TMR][NF * 8];
     \\  for (int t = 0; t < TMR; t++) for (int i = 0; i < NF * 8; i++) C[t][i] = 0.0f;
     \\#if !TILED
@@ -90,14 +103,36 @@ const NARROW =
     \\      for (int j = 0; j < 4; j++) { s[f][j] = float(v[2 * j]); bb[f][j] = float(v[2 * j + 1]); }
     \\    }
     \\    auto a = tA.slice(g * GS, 0);
-    \\#if TILED
+    \\#if BITS != 4 && BITS != 8
+    \\    {
+    \\      // A group is one little-endian bit stream; each word takes 4 values.
+    \\      uint w[WPG + 1];
+    \\      for (int i = 0; i <= WPG; i++) w[i] = 0;
+    \\      if (n0 + lane < N) for (int i = 0; i < WPG; i++) w[i] = wcol[g * (TILED ? 32 * WPG : WPG) + i];
+    \\      for (int c = 0; c < GS / 4; c++) {
+    \\        const int bit = 4 * BITS * c, i = bit >> 5, sh = bit & 31;
+    \\        uint word = w[i] >> sh;
+    \\        if (sh + 4 * BITS > 32) word |= w[i + 1] << (32 - sh);
+    \\        word = (word & ((1u << (2 * BITS)) - 1u)) | (((word >> (2 * BITS)) & ((1u << (2 * BITS)) - 1u)) << 16);
+    \\        word = (word & ((0x10001u << BITS) - 0x10001u)) | (((word >> BITS) & ((0x10001u << BITS) - 0x10001u)) << 8);
+    \\        stage[lane * (GS / 4) + c] = word;
+    \\      }
+    \\    }
+    \\    simdgroup_barrier(mem_flags::mem_threadgroup);
+    \\#elif TILED && BITS == 4
     \\    tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> b(
     \\        (device uchar*)W + (int64_t)((R0 / 32 + threadgroup_position_in_grid.x) * KG + g) * (32 * GS / 2), dextents<int32_t, 2>(GS, 32));
+    \\#elif TILED
+    \\    tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline> b(
+    \\        (device uint8_t*)W + (int64_t)((R0 / 32 + threadgroup_position_in_grid.x) * KG + g) * (32 * GS), dextents<int32_t, 2>(GS, 32));
     \\#else
     \\    auto b = tB.slice(g * GS, n0);
     \\#endif
     \\    auto P = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
     \\    op.run(a, b, P);
+    \\#if BITS != 4 && BITS != 8
+    \\    simdgroup_barrier(mem_flags::mem_threadgroup); // the op has read the stage
+    \\#endif
     \\    for (int t = 0; t < TMR; t++) {
     \\      const float xs0 = simd_shuffle(row_sum[t], ushort(2 * fm));
     \\      const float xs1 = simd_shuffle(row_sum[t], ushort(2 * (fm + 8)));
@@ -211,13 +246,14 @@ const PREFILL =
     \\  threadgroup bfloat Ws[BN * BK_padded];
     \\  const int y_row = threadgroup_position_in_grid.y * BM;
     \\  const int y_col = threadgroup_position_in_grid.x * BN;
-    \\  // thread t dequantizes 32 codes (16 bytes) of weight row t / 2 per group
+    \\  // thread t dequantizes 32 codes (4 * BITS bytes) of weight row t / 2 per group
+    \\  constexpr int GB = 8 * BITS; // bytes per column per group
     \\  const short tidx = simd_gid * 32 + simd_lid;
-    \\  const short bi = tidx / 2, bj = (tidx % 2) * 16;
+    \\  const short bi = tidx / 2, bj = (tidx % 2) * (GB / 2);
     \\  const bool row_ok = y_col + bi < N;
     \\  const int nrow = R0 + y_col + bi;
-    \\  const device uint8_t* wsrc = (const device uint8_t*)W + ((int64_t)(nrow / NT) * KG * (NT * 32) + (nrow % NT) * 32 + bj);
-    \\  threadgroup bfloat* wdst = Ws + bi * BK_padded + bj * 2;
+    \\  const device uint8_t* wsrc = (const device uint8_t*)W + ((int64_t)(nrow / NT) * KG * (NT * GB) + (nrow % NT) * GB + bj);
+    \\  threadgroup bfloat* wdst = Ws + bi * BK_padded + (tidx % 2) * 32;
     \\  constexpr short SM = BM / WM, SN = BN / WN, SKK = 32;
     \\  constexpr short TM = SM / 16, TN = SN / 16, TK = SKK / 16;
     \\  const short tm = SM * (simd_gid / WN);
@@ -238,12 +274,22 @@ const PREFILL =
     \\        if (row_ok) {
     \\          const device bfloat* sb = (g < KG / 2 ? ST : BT) + (size_t(g % (KG / 2)) * NTOT + nrow) * 2;
     \\          const float s = float(sb[0]), b = float(sb[1]);
+    \\          const device uint8_t* w = wsrc + (int64_t)g * (NT * GB);
+    \\#if BITS == 4
     \\          const float sc[2] = {s, s / 16.0f};
-    \\          const device uint8_t* w = wsrc + (int64_t)g * (NT * 32);
     \\          for (int i = 0; i < 16; i++) {
     \\            wdst[2 * i] = static_cast<bfloat>(sc[0] * (w[i] & 0x0f) + b);
     \\            wdst[2 * i + 1] = static_cast<bfloat>(sc[1] * (w[i] & 0xf0) + b);
     \\          }
+    \\#else
+    \\          // code i sits at bit i * BITS of the little-endian stream (MLX's `code * s + b`)
+    \\          for (int i = 0; i < 32; i++) {
+    \\            const int bit = i * BITS, by = bit >> 3, sh = bit & 7;
+    \\            const uint hi = sh + BITS > 8 ? uint(w[by + 1]) << 8 : 0u;
+    \\            const uint code = ((uint(w[by]) | hi) >> sh) & ((1u << BITS) - 1u);
+    \\            wdst[i] = static_cast<bfloat>(code * s + b);
+    \\          }
+    \\#endif
     \\        } else {
     \\          for (int i = 0; i < 32; i++) wdst[i] = bfloat(0);
     \\        }
@@ -315,7 +361,7 @@ fn coopFor(n: c_int) bool {
 
 const Kind = enum { narrow, coop, prefill };
 /// `tmr` is the prefill block's BM there; `ntot`/`r0` place a tiled view in its buffer.
-const KernelKey = struct { kind: Kind, tiled: bool, tmr: c_int, k: c_int, n: c_int, gs: c_int, sk: c_int, ntot: c_int = 0, r0: c_int = 0, nt: c_int = 0 };
+const KernelKey = struct { kind: Kind, tiled: bool, tmr: c_int, k: c_int, n: c_int, gs: c_int, sk: c_int, ntot: c_int = 0, r0: c_int = 0, nt: c_int = 0, bits: c_int = 4 };
 
 /// 16-row blocks a threadgroup's op covers: one up to 16 rows, two past it.
 fn tmrFor(rows: c_int) c_int {
@@ -338,7 +384,7 @@ var packed_scales: std.AutoHashMapUnmanaged(DerivedKey, Derived) = .{};
 /// A weight (or a row view of one) whose buffer `tileInPlace` re-ordered: the
 /// base handles it lives in, its first row there, and the column tile width.
 /// The entry holds the base alive, so its addresses are never reused.
-const Tiled = struct { owner: usize, w: mlx.mlx_array, st: mlx.mlx_array, bt: mlx.mlx_array, ntot: c_int, r0: c_int, nt: c_int };
+const Tiled = struct { owner: usize, w: mlx.mlx_array, st: mlx.mlx_array, bt: mlx.mlx_array, ntot: c_int, r0: c_int, nt: c_int, bits: c_int };
 const TiledKey = struct { ptr: usize, n: c_int, kw: c_int };
 var tiled: std.AutoHashMapUnmanaged(TiledKey, Tiled) = .{};
 
@@ -452,19 +498,22 @@ fn rowContiguous(a: mlx.mlx_array) bool {
 /// registers it and the row views `widths` splits it into (a joined
 /// weight's parts). From then on only this module reads it; the caller has
 /// synchronized the GPU. Returns the bytes re-ordered, 0 when it does not fit.
-pub fn tileInPlace(owner: usize, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int, s: mlx.mlx_stream) !u64 {
-    if (!fits(w, sc, bi, 4, 64)) return 0;
+pub fn tileInPlace(owner: usize, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, widths: []const c_int, s: mlx.mlx_stream) !u64 {
+    // Shapes alone cannot tell 4-bit g64 from 8-bit g32: the caller says which.
+    if (group_size != 64 or !fits(w, sc, bi, bits, 64)) return 0;
     const ws = mlx.getShape(w);
     const n = ws[0];
     const kw = ws[1];
-    if (@rem(n, 32) != 0 or mlx.getShape(sc)[1] * 8 != kw or @rem(kw, 16) != 0) return 0;
+    const wpg: c_int = @intCast(2 * bits); // words per column per group
+    const kg = mlx.getShape(sc)[1];
+    if (@rem(n, 32) != 0 or kg * wpg != kw or @rem(kg, 2) != 0) return 0;
     if (!rowContiguous(w) or !rowContiguous(sc) or !rowContiguous(bi)) return 0;
     if (try tiledEntry(w) != null) return 0;
-    const nt: c_int = if (coopFor(n)) 64 else 32;
-    // [N, K/8] -> [N/nt][K/64][nt columns x a group's 8 words]
+    const nt: c_int = if (bits == 4 and coopFor(n)) 64 else 32;
+    // [N, KW] -> [N/nt][K/64][nt columns x a group's words]
     var r4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(r4);
-    try mlx.check(mlx.mlx_reshape(&r4, w, &[_]c_int{ @divExact(n, nt), nt, @divExact(kw, 8), 8 }, 4, s));
+    try mlx.check(mlx.mlx_reshape(&r4, w, &[_]c_int{ @divExact(n, nt), nt, kg, wpg }, 4, s));
     var tr = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(tr);
     try mlx.check(mlx.mlx_transpose_axes(&tr, r4, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
@@ -473,7 +522,7 @@ pub fn tileInPlace(owner: usize, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     try mlx.check(mlx.mlx_contiguous(&tw, tr, false, s));
     const sbt = try packedFor(sc, bi, s);
     const w_bytes: usize = @intCast(@as(i64, n) * kw * 4);
-    const s_bytes: usize = @intCast(@as(i64, n) * @divExact(kw, 8) * 2);
+    const s_bytes: usize = @intCast(@as(i64, n) * kg * 2);
     try overwrite(w, tw, 0, w_bytes);
     try overwrite(sc, sbt, 0, s_bytes);
     try overwrite(bi, sbt, s_bytes, s_bytes);
@@ -483,7 +532,7 @@ pub fn tileInPlace(owner: usize, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     const views = [_]c_int{n};
     for ([_][]const c_int{ &views, widths }, 0..) |list, li| for (list) |rows| {
         const key = TiledKey{ .ptr = base + @as(usize, @intCast(r0)) * @as(usize, @intCast(kw)) * 4, .n = rows, .kw = kw };
-        const e = Tiled{ .owner = owner, .w = try hold(w), .st = try hold(sc), .bt = try hold(bi), .ntot = n, .r0 = r0, .nt = nt };
+        const e = Tiled{ .owner = owner, .w = try hold(w), .st = try hold(sc), .bt = try hold(bi), .ntot = n, .r0 = r0, .nt = nt, .bits = @intCast(bits) };
         try tiled.put(std.heap.c_allocator, key, e);
         if (li == 1) r0 += rows;
     };
@@ -493,7 +542,7 @@ pub fn tileInPlace(owner: usize, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
 fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     if (kernels.get(key)) |k| return k;
     const a = std.heap.c_allocator;
-    const consts = try std.fmt.allocPrint(a, "#define TILED {d}\n  constexpr int TMR = {d};\n  constexpr int BM = {d};\n  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int GS = {d};\n  constexpr int SK = {d};\n  constexpr int NTOT = {d};\n  constexpr int R0 = {d};\n  constexpr int NT = {d};\n  constexpr bool ALIGNED_N = {};\n", .{ @intFromBool(key.tiled), key.tmr, key.tmr, key.k, key.n, key.gs, key.sk, key.ntot, key.r0, key.nt, @rem(key.n, 64) == 0 });
+    const consts = try std.fmt.allocPrint(a, "#define BITS {d}\n#define TILED {d}\n  constexpr int TMR = {d};\n  constexpr int BM = {d};\n  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int GS = {d};\n  constexpr int SK = {d};\n  constexpr int NTOT = {d};\n  constexpr int R0 = {d};\n  constexpr int NT = {d};\n  constexpr bool ALIGNED_N = {};\n", .{ key.bits, @intFromBool(key.tiled), key.tmr, key.tmr, key.k, key.n, key.gs, key.sk, key.ntot, key.r0, key.nt, @rem(key.n, 64) == 0 });
     defer a.free(consts);
     const body = switch (key.kind) {
         .narrow => NARROW,
@@ -502,7 +551,7 @@ fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     };
     const source = try std.mem.concatWithSentinel(a, u8, &.{ consts, body }, 0);
     defer a.free(source);
-    const name = try std.fmt.allocPrintSentinel(a, "msv_lane_qmm_{t}{s}_t{d}_k{d}_n{d}_g{d}_s{d}_o{d}_{d}", .{ key.kind, if (key.tiled) "_tiled" else "", key.tmr, key.k, key.n, key.gs, key.sk, key.ntot, key.r0 }, 0);
+    const name = try std.fmt.allocPrintSentinel(a, "msv_lane_qmm_{t}{s}_b{d}_t{d}_k{d}_n{d}_g{d}_s{d}_o{d}_{d}", .{ key.kind, if (key.tiled) "_tiled" else "", key.bits, key.tmr, key.k, key.n, key.gs, key.sk, key.ntot, key.r0 }, 0);
     defer a.free(name);
     const in_plain = [_][*:0]const u8{ "X", "W", "SBt", "mdims" };
     const in_tiled = [_][*:0]const u8{ "X", "W", "ST", "BT", "mdims" };
@@ -544,12 +593,14 @@ fn prefillBm(rows: c_int) c_int {
     return if (rows <= 32) 32 else 64;
 }
 
-/// A 4-bit affine bf16 matrix [N, K / 8] in groups of 64 or 32, K % 64 == 0, N % 4 == 0.
+/// A 4-, 5-, 6- or 8-bit affine bf16 matrix [N, K * bits / 32] in groups of
+/// 64 or 32, K % 64 == 0, N % 4 == 0.
 pub fn fits(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32) bool {
-    if (bits != 4 or (group_size != 64 and group_size != 32) or bi.ctx == null) return false;
+    if ((bits != 4 and bits != 5 and bits != 6 and bits != 8) or (group_size != 64 and group_size != 32) or bi.ctx == null) return false;
     if (mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return false;
     const ws = mlx.getShape(w);
-    return ws.len == 2 and @rem(ws[1] * 8, 64) == 0 and @rem(ws[0], 4) == 0;
+    const b: c_int = @intCast(bits);
+    return ws.len == 2 and @rem(ws[1] * 32, b * 64) == 0 and @rem(ws[0], 4) == 0;
 }
 
 fn mdimsFor(rows: c_int) !mlx.mlx_array {
@@ -597,16 +648,16 @@ pub fn tiledQmm(x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx
     if (!mlx.streamIsGpu(s)) return error.TiledWeightOffGpu;
     const xs = mlx.getShape(x);
     const n = mlx.getShape(w)[0];
-    const k = mlx.getShape(w)[1] * 8;
+    const k = @divExact(mlx.getShape(w)[1] * 32, t.bits);
     if (xs.len == 0 or xs.len > 8 or xs[xs.len - 1] != k or mlx.mlx_array_dtype(x) != .bfloat16) return error.TiledWeightShape;
     var rows: c_int = 1;
     for (xs[0 .. xs.len - 1]) |d| rows *= d;
     const coop = t.nt == 64;
     const lane = rows <= MAX_ROWS and @rem(t.r0, t.nt) == 0 and (!coop or coopFor(n));
     const key: KernelKey = if (lane)
-        .{ .kind = if (coop) .coop else .narrow, .tiled = true, .tmr = tmrFor(rows), .k = k, .n = n, .gs = 64, .sk = splitK(n, k), .ntot = t.ntot, .r0 = t.r0 }
+        .{ .kind = if (coop) .coop else .narrow, .tiled = true, .tmr = tmrFor(rows), .k = k, .n = n, .gs = 64, .sk = splitK(n, k), .ntot = t.ntot, .r0 = t.r0, .bits = t.bits }
     else
-        .{ .kind = .prefill, .tiled = true, .tmr = prefillBm(rows), .k = k, .n = n, .gs = 64, .sk = 1, .ntot = t.ntot, .r0 = t.r0, .nt = t.nt };
+        .{ .kind = .prefill, .tiled = true, .tmr = prefillBm(rows), .k = k, .n = n, .gs = 64, .sk = 1, .ntot = t.ntot, .r0 = t.r0, .nt = t.nt, .bits = t.bits };
     return try run(key, rows, x, xs, &.{ t.w, t.st, t.bt }, s);
 }
 
@@ -620,15 +671,16 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
     if (xs.len == 0 or xs.len > 8) return null;
     const ws = mlx.getShape(w);
     const k = xs[xs.len - 1];
-    if (k * 4 != ws[1] * 32) return null;
+    if (k * @as(c_int, @intCast(bits)) != ws[1] * 32) return null;
     var rows: c_int = 1;
     for (xs[0 .. xs.len - 1]) |d| rows *= d;
     if (rows < 1 or rows > MAX_ROWS) return null;
     const n = ws[0];
     const gs: c_int = @intCast(group_size);
-    const coop = coopFor(n);
+    // Wider codes are widened per group into bytes, 32 columns at a time.
+    const coop = bits == 4 and coopFor(n);
     const sbt = try packedFor(sc, bi, s);
-    return try run(.{ .kind = if (coop) .coop else .narrow, .tiled = false, .tmr = tmrFor(rows), .k = k, .n = n, .gs = gs, .sk = splitK(n, k) }, rows, x, xs, &.{ w, sbt }, s);
+    return try run(.{ .kind = if (coop) .coop else .narrow, .tiled = false, .tmr = tmrFor(rows), .k = k, .n = n, .gs = gs, .sk = splitK(n, k), .bits = @intCast(bits) }, rows, x, xs, &.{ w, sbt }, s);
 }
 
 const testing = std.testing;
@@ -645,7 +697,7 @@ fn randBf16(shape: []const c_int, scale: f32, seed: u64, s: mlx.mlx_stream) !mlx
     return out;
 }
 
-test "lane_qmm: every row of an R-row call equals its one-row call bit for bit up to 128 rows, tiled in place or not, and the product is the fp32 one" {
+test "lane_qmm: every row of an R-row call equals its one-row call bit for bit up to 128 rows, at 4, 5, 6 and 8 bits, tiled in place or not, and the product is the fp32 one" {
     if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     errdefer {
@@ -655,12 +707,12 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit u
     defer release(0);
     // 64-column tiles (MLP, down projection), 32-column ones (a joined GDN
     // projection: N % 64 == 32), and a ragged untiled one (GDN a/b: 48 columns).
-    for ([_][2]c_int{ .{ 1024, 5120 }, .{ 5120, 1024 }, .{ 16480, 1024 }, .{ 48, 5120 } }, 0..) |sh, si| for ([_]u32{ 64, 32 }) |gs| {
+    for ([_]u32{ 4, 5, 6, 8 }) |bits| for ([_][2]c_int{ .{ 1024, 5120 }, .{ 5120, 1024 }, .{ 16480, 1024 }, .{ 48, 5120 } }, 0..) |sh, si| for ([_]u32{ 64, 32 }) |gs| {
         const wf = try randBf16(&.{ sh[0], sh[1] }, 0.02, 100 + si, s);
         defer _ = mlx.mlx_array_free(wf);
         var triple = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(triple);
-        try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+        try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
         var w = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(w);
         var sc = mlx.mlx_array_new();
@@ -675,7 +727,7 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit u
         // fp32 truth: the dequantized weight times x in fp32.
         var wd = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(wd);
-        try mlx.check(mlx.mlx_dequantize(&wd, w, sc, bi, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        try mlx.check(mlx.mlx_dequantize(&wd, w, sc, bi, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
         var xf = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xf);
         try mlx.check(mlx.mlx_astype(&xf, x, .float32, s));
@@ -685,13 +737,13 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit u
         var truth = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(truth);
         try mlx.check(mlx.mlx_matmul(&truth, xf, wt, s));
-        const plain = (try qmm(x, w, sc, bi, 4, gs, s)).?;
+        const plain = (try qmm(x, w, sc, bi, bits, gs, s)).?;
         defer _ = mlx.mlx_array_free(plain);
         // Everything read in MLX's layout is evaluated before the buffers change.
         try mlx.check(mlx.mlx_array_eval(truth));
         try mlx.check(mlx.mlx_array_eval(plain));
-        _ = try tileInPlace(0, w, sc, bi, &.{}, s);
-        const all = (try qmm(x, w, sc, bi, 4, gs, s)).?;
+        _ = try tileInPlace(0, w, sc, bi, bits, gs, &.{}, s);
+        const all = (try qmm(x, w, sc, bi, bits, gs, s)).?;
         defer _ = mlx.mlx_array_free(all);
         try testing.expect(try bitEqual(all, plain, s));
         // Parity: relative RMS error vs fp32 truth at bf16 output rounding.
@@ -710,13 +762,13 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit u
             var xr = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(xr);
             try mlx.check(mlx.mlx_slice(&xr, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ r, sh[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            const part = (try qmm(xr, w, sc, bi, 4, gs, s)).?;
+            const part = (try qmm(xr, w, sc, bi, bits, gs, s)).?;
             defer _ = mlx.mlx_array_free(part);
             // Row r-1 of the r-row call == row r-1 of the one-row call == row r-1 of the full call.
             var last = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(last);
             try mlx.check(mlx.mlx_slice(&last, xr, &[_]c_int{ r - 1, 0 }, 2, &[_]c_int{ r, sh[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            const one = (try qmm(last, w, sc, bi, 4, gs, s)).?;
+            const one = (try qmm(last, w, sc, bi, bits, gs, s)).?;
             defer _ = mlx.mlx_array_free(one);
             var pr = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(pr);
@@ -731,11 +783,15 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit u
 }
 
 fn quantized(n: c_int, k: c_int, seed: u64, s: mlx.mlx_stream) ![3]mlx.mlx_array {
+    return quantizedBits(n, k, 4, seed, s);
+}
+
+fn quantizedBits(n: c_int, k: c_int, bits: u32, seed: u64, s: mlx.mlx_stream) ![3]mlx.mlx_array {
     const wf = try randBf16(&.{ n, k }, 0.02, seed, s);
     defer _ = mlx.mlx_array_free(wf);
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
-    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
     var out: [3]mlx.mlx_array = undefined;
     for (&out, 0..) |*a, j| {
         a.* = mlx.mlx_array_new();
@@ -755,10 +811,10 @@ fn mlxTakesNax(m: c_int, n: c_int, k: c_int) bool {
 }
 
 /// x times the dequantized weight in fp32, evaluated.
-fn fp32Truth(x: mlx.mlx_array, t: [3]mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+fn fp32Truth(x: mlx.mlx_array, t: [3]mlx.mlx_array, bits: u32, s: mlx.mlx_stream) !mlx.mlx_array {
     var wd = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wd);
-    try mlx.check(mlx.mlx_dequantize(&wd, t[0], t[1], t[2], mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&wd, t[0], t[1], t[2], mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
     var xf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(xf);
     try mlx.check(mlx.mlx_astype(&xf, x, .float32, s));
@@ -789,17 +845,17 @@ fn rowsOf(a: mlx.mlx_array, r0: c_int, rows: c_int, s: mlx.mlx_stream) !mlx.mlx_
     return o;
 }
 
-test "lane_qmm: past 128 rows a weight tiled in place gives MLX's qmm bits, whole and for every row view" {
+test "lane_qmm: past 128 rows a weight tiled in place gives MLX's qmm bits at 4, 5, 6 and 8 bits, whole and for every row view" {
     if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     defer release(0);
     // A joined GDN in-projection in miniature (32-column tiles, views of 48 rows
     // off the tile grid) and a joined gate|up (64-column tiles).
-    for ([_][]const c_int{ &.{ 1024, 512, 48, 48 }, &.{ 512, 512 } }, 0..) |widths, ci| {
+    for ([_]u32{ 4, 5, 6, 8 }) |bits| for ([_][]const c_int{ &.{ 1024, 512, 48, 48 }, &.{ 512, 512 } }, 0..) |widths, ci| {
         var n: c_int = 0;
         for (widths) |wd| n += wd;
         const k: c_int = 1024;
-        const t = try quantized(n, k, 400 + ci, s);
+        const t = try quantizedBits(n, k, bits, 400 + ci, s);
         defer for (t) |a| {
             _ = mlx.mlx_array_free(a);
         };
@@ -829,9 +885,9 @@ test "lane_qmm: past 128 rows a weight tiled in place gives MLX's qmm bits, whol
             xs[ri] = try randBf16(&.{ rows, k }, 1.0, 30 + ri, s);
             for (0..nv) |i| {
                 refs[ri][i] = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_quantized_matmul(&refs[ri][i], xs[ri], views[i][0], views[i][1], views[i][2], true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+                try mlx.check(mlx.mlx_quantized_matmul(&refs[ri][i], xs[ri], views[i][0], views[i][1], views[i][2], true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", s));
                 try mlx.check(mlx.mlx_array_eval(refs[ri][i]));
-                truths[ri][i] = try fp32Truth(xs[ri], views[i], s);
+                truths[ri][i] = try fp32Truth(xs[ri], views[i], bits, s);
             }
         }
         defer for (0..row_counts.len) |ri| {
@@ -839,7 +895,7 @@ test "lane_qmm: past 128 rows a weight tiled in place gives MLX's qmm bits, whol
             for (refs[ri][0..nv]) |a| _ = mlx.mlx_array_free(a);
             for (truths[ri][0..nv]) |a| _ = mlx.mlx_array_free(a);
         };
-        try testing.expect(try tileInPlace(0, t[0], t[1], t[2], widths, s) > 0);
+        try testing.expect(try tileInPlace(0, t[0], t[1], t[2], bits, 64, widths, s) > 0);
         for (0..row_counts.len) |ri| for (0..nv) |i| {
             const y = (try tiledQmm(xs[ri], views[i][0], s)).?;
             defer _ = mlx.mlx_array_free(y);
@@ -850,7 +906,7 @@ test "lane_qmm: past 128 rows a weight tiled in place gives MLX's qmm bits, whol
                 try testing.expect(try relErr(y, truths[ri][i], s) <= try relErr(refs[ri][i], truths[ri][i], s));
             }
         };
-    }
+    };
 }
 
 test "lane_qmm: releasing one model's tiled weights keeps another's" {
@@ -869,8 +925,8 @@ test "lane_qmm: releasing one model's tiled weights keeps another's" {
     const want = (try qmm(x, b[0], b[1], b[2], 4, 64, s)).?;
     defer _ = mlx.mlx_array_free(want);
     try mlx.check(mlx.mlx_array_eval(want));
-    _ = try tileInPlace(1, a[0], a[1], a[2], &.{}, s);
-    _ = try tileInPlace(2, b[0], b[1], b[2], &.{}, s);
+    _ = try tileInPlace(1, a[0], a[1], a[2], 4, 64, &.{}, s);
+    _ = try tileInPlace(2, b[0], b[1], b[2], 4, 64, &.{}, s);
     release(1);
     defer release(2);
     try testing.expect(try tiledEntry(a[0]) == null);
