@@ -29208,6 +29208,11 @@ pub const Transformer = struct {
         // Projections: combined (qkvz+ba) or separate (qkv+z+a+b)
         var qkv: mlx.mlx_array = undefined;
         var z_proj: mlx.mlx_array = undefined;
+        // [qkv | z | a | b] from one joined matmul: the verify kernels read its columns in place.
+        var in_all: mlx.mlx_array = .{ .ctx = null };
+        defer if (in_all.ctx != null) {
+            _ = mlx.mlx_array_free(in_all);
+        };
         var a_proj: mlx.mlx_array = undefined;
         var b_proj: mlx.mlx_array = undefined;
         defer _ = mlx.mlx_array_free(qkv);
@@ -29299,7 +29304,7 @@ pub const Transformer = struct {
             b_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
         } else if (la.in.w.ctx != null and self.rowGroupServes(batch * seq_len)) {
             const all = try self.qmatmul(x, la.in.w, la.in.s, la.in.b);
-            defer _ = mlx.mlx_array_free(all);
+            in_all = all;
             qkv = mlx.mlx_array_new();
             z_proj = mlx.mlx_array_new();
             a_proj = mlx.mlx_array_new();
@@ -29444,14 +29449,39 @@ pub const Transformer = struct {
                 }
                 return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, la.out_w, la.out_s, la.out_b);
             }
-            const r = (try gdn_decode.recurSeq(geo, seq_len, ins, tree, self.s)) orelse {
-                if (tree != null) return error.SpecTreeUnsupported;
-                break :fast;
-            };
+            if (tree) |tab| {
+                const w = la.in.widths;
+                const joined: ?gdn_decode.Joined = if (in_all.ctx != null) .{ .all = in_all, .a_off = w[0] + w[1], .b_off = w[0] + w[1] + w[2] } else null;
+                const r = (try gdn_decode.recurTree(geo, seq_len, ins, joined, tab, self.s)) orelse return error.SpecTreeUnsupported;
+                defer _ = mlx.mlx_array_free(r.y);
+                errdefer inline for (.{ r.conv_input, r.prework.k, r.prework.v, r.prework.gb }) |a| {
+                    _ = mlx.mlx_array_free(a);
+                };
+                const z_src = if (joined) |j| j.all else z_proj;
+                const z_off = if (joined != null) w[0] else 0;
+                const z_stride = if (joined) |j| mlx.getShape(j.all)[2] else value_dim;
+                const flat = (try gdnNormGateFused(self.s, r.y, z_src, z_off, z_stride, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse return error.SpecTreeUnsupported;
+                defer _ = mlx.mlx_array_free(flat);
+                // The states stay the round's input; the commit replays the kept path from it.
+                var state_in = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&state_in, ssm.ssm_state));
+                inline for (.{ &ssm.spec_state_seq, &ssm.spec_conv_input, &ssm.spec_state_in, &ssm.spec_prework.k, &ssm.spec_prework.v, &ssm.spec_prework.gb }) |h| if (h.ctx != null) {
+                    _ = mlx.mlx_array_free(h.*);
+                    h.* = .{ .ctx = null };
+                };
+                ssm.spec_conv_input = r.conv_input;
+                ssm.spec_state_in = state_in;
+                ssm.spec_prework = r.prework;
+                if (!gdn_verify_tree_engaged) {
+                    gdn_verify_tree_engaged = true;
+                    log.info("[gdn] verify tree engaged: S={d} Hk={d} Hv={d}\n", .{ seq_len, num_k_heads, num_v_heads });
+                }
+                return if (skip_output) standinRef(flat) else self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
+            }
+            const r = (try gdn_decode.recurSeq(geo, seq_len, ins, self.s)) orelse break :fast;
             defer _ = mlx.mlx_array_free(r.y);
             const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse {
                 inline for (.{ r.conv_state, r.ssm_state, r.state_seq }) |a| _ = mlx.mlx_array_free(a);
-                if (tree != null) return error.SpecTreeUnsupported;
                 break :fast;
             };
             defer _ = mlx.mlx_array_free(flat);
@@ -29472,11 +29502,7 @@ pub const Transformer = struct {
             ssm.spec_state_seq = r.state_seq;
             _ = mlx.mlx_array_free(ssm.conv_state);
             ssm.conv_state = r.conv_state;
-            if (tree != null) {
-                if (ssm.spec_state_in.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_in);
-                ssm.spec_state_in = ssm.ssm_state;
-                ssm.spec_prework = r.prework;
-            } else _ = mlx.mlx_array_free(ssm.ssm_state);
+            _ = mlx.mlx_array_free(ssm.ssm_state);
             ssm.ssm_state = r.ssm_state;
             if (!gdn_verify_recur_engaged) {
                 gdn_verify_recur_engaged = true;
@@ -36601,6 +36627,7 @@ pub fn gdnDecodeFusedEnabled() bool {
 var gdn_decode_recur_env: ?bool = null;
 var gdn_decode_recur_engaged: bool = false;
 var gdn_verify_recur_engaged: bool = false;
+var gdn_verify_tree_engaged: bool = false;
 var gdn_verify_fold_env: ?bool = null;
 var gdn_verify_fold_engaged: bool = false;
 
@@ -61615,7 +61642,7 @@ fn gdnDecodeRowsCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, t_
         .A_log = A_log, .dt_bias = dt_bias, .q_scale = q_scale, .k_scale = k_scale,
         .norm_w = norm_w, .eps = eps_arr, .signs = .{ .ctx = null },
     };
-    const all = (try gdn_decode.recurSeq(g, t_len, in, null, s)) orelse return error.FusedDeclined;
+    const all = (try gdn_decode.recurSeq(g, t_len, in, s)) orelse return error.FusedDeclined;
     defer for ([_]mlx.mlx_array{ all.y, all.conv_state, all.ssm_state, all.state_seq }) |a| {
         _ = mlx.mlx_array_free(a);
     };
@@ -61642,7 +61669,7 @@ fn gdnDecodeRowsCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, t_
         in.b = one[3];
         in.conv_state = conv;
         in.ssm_state = state;
-        const step = (try gdn_decode.recurSeq(g, 1, in, null, s)) orelse return error.FusedDeclined;
+        const step = (try gdn_decode.recurSeq(g, 1, in, s)) orelse return error.FusedDeclined;
         const ys = mlx.getShape(all.y);
         var want = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(want);
@@ -61743,7 +61770,7 @@ fn gdnDecodeFoldParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dty
     };
 
     // Today's verify path: recurSeq, the norm-gate kernel, the conv-input concat.
-    const ref = (try gdn_decode.recurSeq(g, t_len, in, null, s)) orelse return error.FusedDeclined;
+    const ref = (try gdn_decode.recurSeq(g, t_len, in, s)) orelse return error.FusedDeclined;
     defer {
         inline for (.{ ref.y, ref.conv_state, ref.ssm_state, ref.state_seq }) |a| _ = mlx.mlx_array_free(a);
     }
@@ -61824,7 +61851,7 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
         .signs = .{ .ctx = null },
     };
     // Control: the well-formed inputs engage both kernels.
-    const ok = (try gdn_decode.recurSeq(g, t_len, good, null, s)) orelse return error.RecurSeqDeclined;
+    const ok = (try gdn_decode.recurSeq(g, t_len, good, s)) orelse return error.RecurSeqDeclined;
     inline for (.{ ok.y, ok.conv_state, ok.ssm_state, ok.state_seq }) |a| _ = mlx.mlx_array_free(a);
     const okf = (try gdn_decode.recurSeqFold(g, t_len, good, false, s)) orelse return error.FoldDeclined;
     inline for (.{ okf.gated, okf.conv_state, okf.ssm_state, okf.state_seq, okf.conv_input }) |a| _ = mlx.mlx_array_free(a);
@@ -61842,17 +61869,22 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
             .conv => bad.conv_state = case.arr,
         }
         try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, bad, false, s)) == null);
-        try std.testing.expect((try gdn_decode.recurSeq(g, t_len, bad, null, s)) == null);
+        try std.testing.expect((try gdn_decode.recurSeq(g, t_len, bad, s)) == null);
     }
     // The same well-formed inputs on a CPU stream: the Metal kernels decline, nothing latches.
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
     try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, good, false, cpu)) == null);
-    try std.testing.expect((try gdn_decode.recurSeq(g, t_len, good, null, cpu)) == null);
+    try std.testing.expect((try gdn_decode.recurSeq(g, t_len, good, cpu)) == null);
     try std.testing.expect(!mlx.errorPending());
 }
 
-test "gdn_decode.recurSeq: every node of a draft tree equals a chain over its own path" {
+test "gdn_decode.recurTree: every node of a draft tree equals a chain over its own path" {
+    try gdnDecodeTreeCase(.bfloat16);
+    try gdnDecodeTreeCase(.float32);
+}
+
+fn gdnDecodeTreeCase(st: mlx.mlx_dtype) !void {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x7EE);
     const rnd = prng.random();
@@ -61861,9 +61893,9 @@ test "gdn_decode.recurSeq: every node of a draft tree equals a chain over its ow
     const hv: c_int = 8;
     const c_dim: c_int = hk * 128 * 2 + hv * 128;
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
-    // Rows 1 and 2 both follow the root; row 3 follows row 1.
-    const parents = [_]i32{ -1, 0, 0, 1 };
-    const paths = [_][]const i32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2 }, &.{ 0, 1, 3 } };
+    // Rows 1 and 2 follow the root, 3 and 4 follow row 1, 5 follows 2, 6 and 7 follow 3.
+    const parents = [_]i32{ -1, 0, 0, 1, 1, 2, 3, 3 };
+    const paths = [_][]const i32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2 }, &.{ 0, 1, 3 }, &.{ 0, 1, 4 }, &.{ 0, 2, 5 }, &.{ 0, 1, 3, 6 }, &.{ 0, 1, 3, 7 } };
     const w: c_int = parents.len;
     const qkv = try gdnParityRand(rnd, &[_]c_int{ 1, w, c_dim }, 1.0, dt, s);
     defer _ = mlx.mlx_array_free(qkv);
@@ -61873,7 +61905,7 @@ test "gdn_decode.recurSeq: every node of a draft tree equals a chain over its ow
     defer _ = mlx.mlx_array_free(b);
     var fixed: [7]mlx.mlx_array = undefined;
     const fixed_shapes = [_][]const c_int{ &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 }, &.{ c_dim, 4, 1 }, &.{hv}, &.{hv}, &.{128}, &.{ 1, w, hv * 128 } };
-    for (&fixed, fixed_shapes) |*f, sh| f.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
+    for (&fixed, fixed_shapes, 0..) |*f, sh, i| f.* = try gdnParityRand(rnd, sh, 1.0, if (i == 1) st else dt, s);
     defer for (fixed) |f| {
         _ = mlx.mlx_array_free(f);
     };
@@ -61890,10 +61922,43 @@ test "gdn_decode.recurSeq: every node of a draft tree equals a chain over its ow
     gdn_decode.treeTable(&parents, &table);
     const tab = mlx.mlx_array_new_data(&table, &[_]c_int{6 * w}, 1, .int32);
     defer _ = mlx.mlx_array_free(tab);
-    const tree = (try gdn_decode.recurSeq(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), tab, s)) orelse return error.TreeDeclined;
-    defer inline for (.{ tree.y, tree.conv_state, tree.ssm_state, tree.state_seq, tree.prework.k, tree.prework.v, tree.prework.gb }) |x| {
+    const tree = (try gdn_decode.recurTree(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), null, tab, s)) orelse return error.TreeDeclined;
+    defer inline for (.{ tree.y, tree.conv_input, tree.prework.k, tree.prework.v, tree.prework.gb }) |x| {
         _ = mlx.mlx_array_free(x);
     };
+    // Read in place from a joined [qkv | z | a | b] projection, the same bits.
+    {
+        var all = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(all);
+        const arr = [_]mlx.mlx_array{ qkv, fixed[6], a, b };
+        const vec = mlx.mlx_vector_array_new_data(&arr, arr.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&all, vec, 2, s));
+        const a_off = c_dim + hv * 128;
+        var parts: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+        defer for (parts) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        try sliceQkvPart(&parts[0], all, 0, c_dim, s);
+        try sliceQkvPart(&parts[1], all, a_off, hv, s);
+        try sliceQkvPart(&parts[2], all, a_off + hv, hv, s);
+        const j = (try gdn_decode.recurTree(g, w, inputs(parts[0], parts[1], parts[2], fixed, q_scale, eps_arr), .{ .all = all, .a_off = a_off, .b_off = a_off + hv }, tab, s)) orelse return error.JoinedDeclined;
+        defer inline for (.{ j.y, j.conv_input, j.prework.k, j.prework.v, j.prework.gb }) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        inline for (.{ .{ tree.y, j.y }, .{ tree.conv_input, j.conv_input }, .{ tree.prework.k, j.prework.k }, .{ tree.prework.v, j.prework.v }, .{ tree.prework.gb, j.prework.gb } }) |pair|
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pair[0], pair[1], s));
+    }
+    // The commit slices its conv window from [conv_state; window rows].
+    {
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        const arr = [_]mlx.mlx_array{ fixed[0], qkv };
+        const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&want, vec, 1, s));
+        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(want, tree.conv_input, s));
+    }
     for (paths, 0..) |path, node| {
         const idx = mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .int32);
         defer _ = mlx.mlx_array_free(idx);
@@ -61911,14 +61976,14 @@ test "gdn_decode.recurSeq: every node of a draft tree equals a chain over its ow
             chain_out = .{ r.y, r.conv_state, r.ssm_state, .{ .ctx = null } };
             chain_state = r.ssm_state;
         } else {
-            const r = (try gdn_decode.recurSeq(g, n, inputs(rows[0], rows[1], rows[2], fixed, q_scale, eps_arr), null, s)) orelse return error.ChainDeclined;
+            const r = (try gdn_decode.recurSeq(g, n, inputs(rows[0], rows[1], rows[2], fixed, q_scale, eps_arr), s)) orelse return error.ChainDeclined;
             chain_out = .{ r.y, r.conv_state, r.ssm_state, r.state_seq };
             chain_state = r.ssm_state;
         }
         defer for (chain_out) |x| if (x.ctx != null) {
             _ = mlx.mlx_array_free(x);
         };
-        // The node's y row equals the chain's last row; its stored state the chain's final state.
+        // The node's y row equals the chain's last row.
         var want_y = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(want_y);
         try mlx.check(mlx.mlx_slice(&want_y, chain_out[0], &[_]c_int{ 0, n - 1, 0, 0 }, 4, &[_]c_int{ 1, n, hv, 128 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
@@ -61927,18 +61992,10 @@ test "gdn_decode.recurSeq: every node of a draft tree equals a chain over its ow
         const nd: c_int = @intCast(node);
         try mlx.check(mlx.mlx_slice(&got_y, tree.y, &[_]c_int{ 0, nd, 0, 0 }, 4, &[_]c_int{ 1, nd + 1, hv, 128 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(want_y, got_y, s));
-        var got_st = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(got_st);
-        try mlx.check(mlx.mlx_slice(&got_st, tree.state_seq, &[_]c_int{ nd, 0, 0, 0, 0 }, 5, &[_]c_int{ nd + 1, 1, hv, 128, 128 }, 5, &[_]c_int{ 1, 1, 1, 1, 1 }, 5, s));
-        var want_st = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(want_st);
-        try mlx.check(mlx.mlx_reshape(&want_st, chain_state, &[_]c_int{ 1, 1, hv, 128, 128 }, 5, s));
-        // Replaying the node's path from the round's input state gives the chain's state too.
+        // Replaying the node's path from the round's input state gives the chain's state.
         const replayed = (try gdn_decode.replay(g, fixed[1], tree.prework, path, s)) orelse return error.ReplayDeclined;
         defer _ = mlx.mlx_array_free(replayed);
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(chain_state, replayed, s));
-        // Only rows a later node restarts from are stored: here row 0 (row 2's parent).
-        if (node == 0) try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(want_st, got_st, s));
     }
 }
 
@@ -62058,7 +62115,7 @@ fn gdnDecodeSeqParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
         .norm_w = norm_w,
         .eps = eps_arr,
         .signs = .{ .ctx = null },
-    }, null, s)) orelse return error.FusedDeclined;
+    }, s)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(got.y);
     defer _ = mlx.mlx_array_free(got.conv_state);
     defer _ = mlx.mlx_array_free(got.ssm_state);
