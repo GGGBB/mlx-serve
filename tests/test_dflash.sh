@@ -343,6 +343,15 @@ else
     bad "block resolves against the machine's verify lanes (declared=$DECLARED_BLOCK)" "$BLINE"
 fi
 
+# [10b] A draft-tree verify on a hybrid trunk runs the GDN tree kernels and,
+# on NAX, one joined q|k|v matmul per attention layer.
+if grep -q "draft trees engaged" "$LOG" && grep -q "\[gdn\]" "$LOG"; then
+    if grep -q "\[gdn\] verify tree engaged" "$LOG"; then ok "GDN tree verify engaged"; else bad "GDN tree verify engaged" "$(grep "\[gdn\]" "$LOG" | head -3)"; fi
+    if grep -q "lane kernels\|\[lane\]" "$LOG"; then
+        if grep -q "\[attn\] joined q|k|v engaged" "$LOG"; then ok "joined q|k|v engaged"; else bad "joined q|k|v engaged" "$(grep "\[attn\]" "$LOG" | head -3)"; fi
+    fi
+fi
+
 # [11] The assistant context rides the prefix cache. A restore forwards no
 # trunk layers, so without it a reused prefix drafts blind — acceptance
 # collapsed 92.6% -> 66.5% live. Same prompt twice: the second is a hit, and

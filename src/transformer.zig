@@ -27430,9 +27430,26 @@ pub const Transformer = struct {
         const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
         const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
 
-        // Q projection
-        const q_proj = if (projected) |values| values.q else try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill, layer);
-        defer if (projected == null) {
+        // Q, K, V projections: one joined matmul where the loader built it.
+        var joined: [3]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (joined) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        if (projected == null and fa.qkv.w.ctx != null and self.rowGroupServes(batch * seq_len)) {
+            const all = try self.qmatmul(x, fa.qkv.w, fa.qkv.s, fa.qkv.b);
+            defer _ = mlx.mlx_array_free(all);
+            for (&joined, 0..) |*p, i| {
+                p.* = mlx.mlx_array_new();
+                try fa.qkv.part(p, all, i, self.s);
+            }
+            if (!attn_qkv_joined_engaged) {
+                attn_qkv_joined_engaged = true;
+                log.info("[attn] joined q|k|v engaged: rows={d}\n", .{batch * seq_len});
+            }
+        }
+        const own = projected == null and joined[0].ctx == null;
+        const q_proj = if (projected) |values| values.q else if (!own) joined[0] else try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill, layer);
+        defer if (own) {
             _ = mlx.mlx_array_free(q_proj);
         };
 
@@ -27472,13 +27489,12 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_reshape(&queries, q_proj, &q_shape, 4, self.s));
         }
 
-        // K, V projections
-        const k_proj = if (projected) |values| values.k else try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill, layer);
-        defer if (projected == null) {
+        const k_proj = if (projected) |values| values.k else if (!own) joined[1] else try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill, layer);
+        defer if (own) {
             _ = mlx.mlx_array_free(k_proj);
         };
-        const v_proj = if (projected) |values| values.v else try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill, layer);
-        defer if (projected == null) {
+        const v_proj = if (projected) |values| values.v else if (!own) joined[2] else try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill, layer);
+        defer if (own) {
             _ = mlx.mlx_array_free(v_proj);
         };
 
@@ -33069,7 +33085,10 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                     fa.o_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.bias") orelse .{ .ctx = null };
                     fa.sinks = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.sinks") orelse .{ .ctx = null };
                 }
-                if (is_gemma4 and !v_aliases_k and fa.q_s.ctx != null) {
+                // Row-exact archs on NAX: one lane matmul serves q|k|v at every
+                // width (a column's bits follow the joined shape, the same at 1 row and 16).
+                const lane_join = naxAvailable() and config.rowExactArch();
+                if ((is_gemma4 or lane_join) and !v_aliases_k and fa.q_s.ctx != null) {
                     var parts = [_][3]*mlx.mlx_array{ .{ &fa.q_w, &fa.q_s, &fa.q_b }, .{ &fa.k_w, &fa.k_s, &fa.k_b }, .{ &fa.v_w, &fa.v_s, &fa.v_b } };
                     const names = [_][]const u8{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj" };
                     fa.qkv = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
@@ -36628,6 +36647,7 @@ var gdn_decode_recur_env: ?bool = null;
 var gdn_decode_recur_engaged: bool = false;
 var gdn_verify_recur_engaged: bool = false;
 var gdn_verify_tree_engaged: bool = false;
+var attn_qkv_joined_engaged: bool = false;
 var gdn_verify_fold_env: ?bool = null;
 var gdn_verify_fold_engaged: bool = false;
 
