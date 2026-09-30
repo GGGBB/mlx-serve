@@ -174,8 +174,9 @@ fn coopFor(n: c_int) bool {
     return @rem(n, 64) == 0;
 }
 
-/// Test seam and memory gate: whether 4-bit weights are read from a tiled copy.
-pub var tiling: bool = true;
+/// Bytes the tiled weight copies may still take: a machine decision the scheduler
+/// makes when the drafter binds. A weight past it is read in MLX's layout (same bits).
+pub var tile_budget: u64 = 0;
 
 const KernelKey = struct { coop: bool, tiled: bool, k: c_int, n: c_int, gs: c_int, sk: c_int };
 var kernels: std.AutoHashMapUnmanaged(KernelKey, mlx.mlx_fast_metal_kernel) = .{};
@@ -204,6 +205,7 @@ pub fn release() void {
         }
         map.clearAndFree(std.heap.c_allocator);
     }
+    tile_budget = 0;
 }
 
 fn dataKey(a: mlx.mlx_array, b: ?mlx.mlx_array) !DerivedKey {
@@ -257,11 +259,13 @@ fn packedFor(sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_a
 }
 
 /// MLX's packed [N, K / 8] regrouped [N / nt][K / gs][nt columns x a group's words].
-fn tiledFor(w: mlx.mlx_array, nt: c_int, gs: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+fn tiledFor(w: mlx.mlx_array, nt: c_int, gs: c_int, s: mlx.mlx_stream) !?mlx.mlx_array {
     const key = try dataKey(w, null);
     if (tiled_weights.get(key)) |e| return e.out;
     const n = key.n;
     const kw = key.w;
+    const bytes: u64 = @as(u64, @intCast(n)) * @as(u64, @intCast(kw)) * 4;
+    if (bytes > tile_budget) return null;
     const wg = @divExact(gs * 4, 32);
     var r4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(r4);
@@ -276,6 +280,7 @@ fn tiledFor(w: mlx.mlx_array, nt: c_int, gs: c_int, s: mlx.mlx_stream) !mlx.mlx_
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, c, &[_]c_int{ n, kw }, 2, s));
     try remember(&tiled_weights, key, w, null, out);
+    tile_budget -= bytes;
     return out;
 }
 
@@ -337,7 +342,8 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
     const gs: c_int = @intCast(group_size);
     const coop = coopFor(n);
     const width: c_int = if (coop) 64 else 32;
-    const tiled = tiling and @rem(n, width) == 0;
+    const tiled_w: ?mlx.mlx_array = if (@rem(n, width) == 0) try tiledFor(w, width, gs, s) else null;
+    const tiled = tiled_w != null;
 
     var x2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x2);
@@ -351,7 +357,7 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
         mdims_cache[ri] = mlx.mlx_array_new_data(&d, &[_]c_int{1}, 1, .int32);
     }
     const sbt = try packedFor(sc, bi, s);
-    const wk = if (tiled) try tiledFor(w, width, gs, s) else w;
+    const wk = tiled_w orelse w;
     const mk = try kernelFor(.{ .coop = coop, .tiled = tiled, .k = k, .n = n, .gs = gs, .sk = splitK(n, k) });
     const mcfg = try planFor(.{ .coop = coop, .rows = rows, .n = n, .k = k });
     const ins = [_]mlx.mlx_array{ xc, wk, sbt, mdims_cache[ri] };
@@ -393,7 +399,6 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit, 
         if (mlx.takeError(&buf)) |msg| std.debug.print("[lane_qmm] mlx: {s}\n", .{msg});
     }
     defer release();
-    defer tiling = true;
     // 64-column tiles (MLP, down projection), 32-column ones (a joined GDN
     // projection: N % 64 == 32), and a ragged untiled one (GDN a/b: 48 columns).
     for ([_][2]c_int{ .{ 1024, 5120 }, .{ 5120, 1024 }, .{ 16480, 1024 }, .{ 48, 5120 } }, 0..) |sh, si| for ([_]u32{ 64, 32 }) |gs| {
@@ -426,10 +431,10 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit, 
         var truth = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(truth);
         try mlx.check(mlx.mlx_matmul(&truth, xf, wt, s));
-        tiling = false;
+        tile_budget = 0;
         const plain = (try qmm(x, w, sc, bi, 4, gs, s)).?;
         defer _ = mlx.mlx_array_free(plain);
-        tiling = true;
+        tile_budget = std.math.maxInt(u64);
         const all = (try qmm(x, w, sc, bi, 4, gs, s)).?;
         defer _ = mlx.mlx_array_free(all);
         try testing.expect(try bitEqual(all, plain, s));
@@ -468,6 +473,45 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit, 
             try testing.expect(try bitEqual(fr, one, s));
         }
     };
+}
+
+test "lane_qmm: the tile budget bounds the tiled copies, and a weight past it keeps its bits" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    defer release();
+    var ws: [2][3]mlx.mlx_array = undefined;
+    for (&ws, 0..) |*t, i| {
+        const wf = try randBf16(&.{ 1024, 1024 }, 0.02, 300 + i, s);
+        defer _ = mlx.mlx_array_free(wf);
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+        for (t, 0..) |*a, j| {
+            a.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(a, triple, j));
+        }
+    }
+    defer for (ws) |t| for (t) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const x = try randBf16(&.{ 3, 1024 }, 1.0, 9, s);
+    defer _ = mlx.mlx_array_free(x);
+    const one_copy: u64 = 1024 * 1024 / 2;
+    tile_budget = one_copy + one_copy / 2;
+    var ys: [2]mlx.mlx_array = undefined;
+    for (ws, 0..) |t, i| ys[i] = (try qmm(x, t[0], t[1], t[2], 4, 64, s)).?;
+    defer for (ys) |y| {
+        _ = mlx.mlx_array_free(y);
+    };
+    try testing.expectEqual(@as(u32, 1), tiled_weights.count());
+    try testing.expectEqual(one_copy / 2, tile_budget);
+    release();
+    for (ws, 0..) |t, i| {
+        const plain = (try qmm(x, t[0], t[1], t[2], 4, 64, s)).?;
+        defer _ = mlx.mlx_array_free(plain);
+        try testing.expect(try bitEqual(ys[i], plain, s));
+    }
+    try testing.expectEqual(@as(u32, 0), tiled_weights.count());
 }
 
 fn meanSquare(a: mlx.mlx_array, s: mlx.mlx_stream) !f32 {

@@ -73,6 +73,7 @@ const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
+const lane_qmm = @import("lane_qmm.zig");
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const DflashModel = dflash_mod.DflashModel;
@@ -3950,6 +3951,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 wide_lane,
                 d.config.target_layer_ids,
             });
+            // The tensor-unit lane matmul reads tiled weight copies (one more copy of every
+            // projection it serves): they may take a third of what is still reachable.
+            if (transformer_mod.naxAvailable()) {
+                var active: usize = 0;
+                _ = mlx.mlx_get_active_memory(&active);
+                const room = @min(effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), 0), mlx.maxRecommendedWorkingSet() -| active);
+                lane_qmm.tile_budget = room / 3;
+                log.info("[lane] tiled weight budget {d:.1} GB\n", .{@as(f64, @floatFromInt(lane_qmm.tile_budget)) / (1 << 30)});
+            }
         }
     } else if (drafter_dir.len > 0) {
         const d = try sch.allocator.create(DrafterModel);
