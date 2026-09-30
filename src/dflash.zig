@@ -1729,6 +1729,102 @@ pub const Lattice = struct {
     }
 };
 
+// Top K of each row in one threadgroup: every thread keeps its own sorted K
+// (a compare-and-select chain), each simdgroup merges its lanes' lists, then
+// simdgroup 0 merges the 32 lists. Equal values go to the lower index.
+const TOPK_SOURCE =
+    \\constexpr int NT = 1024;
+    \\const uint row = threadgroup_position_in_grid.y;
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    \\const device T* x = logits + size_t(row) * V;
+    \\float v[K];
+    \\int id[K];
+    \\for (int j = 0; j < K; ++j) { v[j] = -INFINITY; id[j] = 0; }
+    \\for (int i = int(tid); i < V; i += NT) {
+    \\  float c = float(x[i]);
+    \\  if (!(c > v[K - 1])) continue;
+    \\  int ci = i;
+    \\  for (int j = 0; j < K; ++j) {
+    \\    const bool gt = c > v[j];
+    \\    const float tv = v[j]; const int ti = id[j];
+    \\    v[j] = gt ? c : tv; id[j] = gt ? ci : ti;
+    \\    c = gt ? tv : c; ci = gt ? ti : ci;
+    \\  }
+    \\}
+    \\threadgroup float sv[32 * K];
+    \\threadgroup int si[32 * K];
+    \\for (int r = 0; r < K; ++r) {
+    \\  const float best = simd_max(v[0]);
+    \\  const uint win = simd_min(v[0] == best ? lane : 64u);
+    \\  const int bid = simd_shuffle(id[0], ushort(win));
+    \\  if (lane == 0) { sv[sg * K + r] = best; si[sg * K + r] = bid; }
+    \\  if (lane == win) { for (int j = 0; j + 1 < K; ++j) { v[j] = v[j + 1]; id[j] = id[j + 1]; } v[K - 1] = -INFINITY; }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (sg != 0) return;
+    \\for (int j = 0; j < K; ++j) { v[j] = sv[lane * K + j]; id[j] = si[lane * K + j]; }
+    \\for (int r = 0; r < K; ++r) {
+    \\  const float best = simd_max(v[0]);
+    \\  const uint win = simd_min(v[0] == best ? lane : 64u);
+    \\  const int bid = simd_shuffle(id[0], ushort(win));
+    \\  if (lane == 0) { idx[row * K + r] = bid; val[row * K + r] = best; }
+    \\  if (lane == win) { for (int j = 0; j + 1 < K; ++j) { v[j] = v[j + 1]; id[j] = id[j + 1]; } v[K - 1] = -INFINITY; }
+    \\}
+;
+var topk_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const TopKKey = struct { m: c_int, v: c_int, k: c_int, dt: mlx.mlx_dtype };
+var topk_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var topk_key: ?TopKKey = null;
+
+/// Each row's top `k` of `logits` [1, M, V]: ids [1, M, k] int32 and values
+/// [1, M, k] f32, largest first. Null off the GPU or past 32 per row.
+fn topKRows(logits: mlx.mlx_array, k: usize, s: mlx.mlx_stream) !?[2]mlx.mlx_array {
+    if (!mlx.streamIsGpu(s) or k == 0 or k > 32) return null;
+    const sh = mlx.getShape(logits);
+    const dt = mlx.mlx_array_dtype(logits);
+    if (sh.len != 3 or sh[0] != 1 or sh[2] < 1024 * @as(c_int, @intCast(k)) or (dt != .bfloat16 and dt != .float16 and dt != .float32)) return null;
+    const key = TopKKey{ .m = sh[1], .v = sh[2], .k = @intCast(k), .dt = dt };
+    if (topk_kernel == null) {
+        const ins = [_][*:0]const u8{"logits"};
+        const outs = [_][*:0]const u8{ "idx", "val" };
+        const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const kern = mlx.mlx_fast_metal_kernel_new("msv_dflash_topk_rows", in_vec, out_vec, TOPK_SOURCE, "", true, false);
+        if (kern.ctx == null) return error.MetalKernelCompileFailed;
+        topk_kernel = kern;
+    }
+    if (topk_key == null or !std.meta.eql(topk_key.?, key)) {
+        if (topk_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        topk_cfg = null;
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.m, key.k }, 3, .int32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.m, key.k }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024, key.m, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", key.v));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", key.k));
+        topk_cfg = cfg;
+        topk_key = key;
+    }
+    const ins = [_]mlx.mlx_array{logits};
+    const vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, topk_kernel.?, vec, topk_cfg.?, s));
+    var out: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, outs, i));
+    return out;
+}
+
 pub fn lattice(
     allocator: std.mem.Allocator,
     sel: *const Selector,
@@ -1750,7 +1846,12 @@ pub fn lattice(
     defer _ = mlx.mlx_array_free(cands_i32);
     var unary_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(unary_f32);
-    {
+    if (try topKRows(draft_logits, k, s)) |top| {
+        _ = mlx.mlx_array_free(cands_i32);
+        _ = mlx.mlx_array_free(unary_f32);
+        cands_i32 = top[0];
+        unary_f32 = top[1];
+    } else {
         var part = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(part);
         try mlx.check(mlx.mlx_argpartition_axis(&part, draft_logits, vocab - @as(c_int, @intCast(k)), 2, s));
@@ -3390,6 +3491,61 @@ test "dflash2: groupedDynConv matches the closed form on a hand-computed case" {
         want[t * 4 + c] = tap0 + tap1;
     };
     for (got, want) |a, b| try testing.expect(@abs(a - b) < 1e-5);
+}
+
+test "dflash2: topKRows picks each row's k largest logits, each id at its value" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const m: c_int = 3;
+    const v: c_int = 98304;
+    const k: usize = 16;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0x70B));
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_random_normal(&f, &[_]c_int{ 1, m, v }, 3, .float32, 0.0, 4.0, key, s));
+    // Row 0 also holds 20 descending spikes all in one thread's stride.
+    const spikes = try allocator.alloc(f32, @intCast(m * v));
+    defer allocator.free(spikes);
+    @memset(spikes, 0);
+    for (0..20) |j| spikes[j * 1024] = 50.0 - @as(f32, @floatFromInt(j));
+    const sp = mlx.mlx_array_new_data(spikes.ptr, &[_]c_int{ 1, m, v }, 3, .float32);
+    defer _ = mlx.mlx_array_free(sp);
+    var fs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fs);
+    try mlx.check(mlx.mlx_add(&fs, f, sp, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, fs, .bfloat16, s));
+    const top = (try topKRows(x, k, s)) orelse return error.TopKDeclined;
+    defer for (top) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var xf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xf);
+    try mlx.check(mlx.mlx_astype(&xf, x, .float32, s));
+    const all = try TinyFix.readF32(xf, allocator, s);
+    defer allocator.free(all);
+    const vals = try TinyFix.readF32(top[1], allocator, s);
+    defer allocator.free(vals);
+    var ids_f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids_f);
+    try mlx.check(mlx.mlx_astype(&ids_f, top[0], .float32, s));
+    const ids = try TinyFix.readF32(ids_f, allocator, s);
+    defer allocator.free(ids);
+    const vu: usize = @intCast(v);
+    for (0..@intCast(m)) |r| {
+        const row = try allocator.dupe(f32, all[r * vu .. (r + 1) * vu]);
+        defer allocator.free(row);
+        std.mem.sort(f32, row, {}, std.sort.desc(f32));
+        for (0..k) |j| {
+            try testing.expectEqual(row[j], vals[r * k + j]);
+            const id: usize = @intFromFloat(ids[r * k + j]);
+            try testing.expectEqual(all[r * vu + id], vals[r * k + j]);
+        }
+    }
 }
 
 test "dflash2: the one-kernel dyn conv equals the op chain bit for bit" {
