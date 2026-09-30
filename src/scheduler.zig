@@ -586,6 +586,8 @@ pub const Slot = struct {
     /// hot-prefix-cache lookup/restore and the model forward over the
     /// uncached tail. Populated by the scheduler main loop.
     prefill_ns: u64,
+    /// The prefill's sampled token, already published; its next push is swallowed.
+    early_first: ?u32 = null,
     /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
     /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
     /// that received the tokens; subtracted from this slot's `prefill_ns` so
@@ -859,6 +861,11 @@ pub const Slot = struct {
     /// gap survived: it is invisible to output-equality tests AND to llmprobe,
     /// which probes logprobs non-streaming only.
     fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
+        // The prefill's token went out early (`publishFirstToken`): the decoder's own push of it is swallowed.
+        if (self.early_first) |e| {
+            self.early_first = null;
+            if (e == t and lp == null) return;
+        }
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         if (lp) |entry| {
@@ -4848,6 +4855,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
                 if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+                publishFirstToken(slot);
                 if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
                     slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
                 });
@@ -7199,6 +7207,18 @@ fn plannerOutputClock(slot: *Slot, gen: *Generator) void {
     slot.mtp_publish_gap_ms = if (slot.mtp_publish_ns > 0 and now >= slot.mtp_publish_ns) @as(f32, @floatFromInt(now - slot.mtp_publish_ns)) / std.time.ns_per_ms else 0;
     slot.mtp_publish_ns = now;
     if (Planner.enabled() and gen.mtp_planner_owned) gen.mtp_planner_max_gap_ms = @max(gen.mtp_planner_max_gap_ms, slot.mtp_publish_gap_ms);
+}
+
+/// The prefill already sampled the first token: send it now instead of with the
+/// first decode step or speculative round, which would hold it a forward longer.
+/// The count stays with the decoder that emits it (its push is swallowed).
+fn publishFirstToken(slot: *Slot) void {
+    const gen = if (slot.legacy_gen) |*g| g else return;
+    if (gen.done or gen.completion_tokens != 0 or slot.logprobs_n > 0 or gen.sampling.constraint != null) return;
+    const t1 = gen.next_token_id;
+    if (t1 == 0 or generate_mod.isEosId(t1, slot.eos_token_ids)) return;
+    slot.pushTokenWithLogprob(t1, null);
+    slot.early_first = t1;
 }
 
 fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {
