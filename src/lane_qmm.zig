@@ -1,6 +1,7 @@
 //! Row-exact 4-bit matmul on the M5 tensor units for 1..MAX_ROWS rows, ported
 //! from TensorFold's `lane_qmm.py` (MIT, see NOTICE). Every 64- (or 32-) input
-//! group runs one fixed 16-row `matmul2d` over the packed 4-bit codes, then
+//! group runs one fixed 16-row `matmul2d` (32 rows past 16, in 32-row blocks
+//! across threadgroups) over the packed 4-bit codes, then
 //! `C = s * P + b * XS` in group order in fp32, the K slices summed in slice
 //! order; the slice count follows the weight's shape only. A row's bits never
 //! depend on how many rows ride with it, so a drafted window verifies with the
@@ -11,7 +12,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 
-pub const MAX_ROWS = 16;
+pub const MAX_ROWS = 128;
 
 const HEADER =
     \\#include <metal_tensor>
@@ -24,20 +25,29 @@ const HEADER =
 // row: lane 2r + h adds half h of row r, and the two halves join low + high.
 const ROW_SUMS =
     \\  const int xr = lane >> 1, xh = lane & 1;
-    \\  const bool xlive = xr < M;
-    \\  const device bfloat* xp = X + size_t(xlive ? xr : 0) * K + xh * (GS / 2);
+    \\  bool xlive[TMR];
+    \\  const device bfloat* xp[TMR];
+    \\  for (int t = 0; t < TMR; t++) {
+    \\    xlive[t] = rb + t * 16 + xr < M;
+    \\    xp[t] = X + size_t(xlive[t] ? rb + t * 16 + xr : 0) * K + xh * (GS / 2);
+    \\  }
     \\
 ;
 const ROW_SUM_G =
-    \\    float half_sum = 0.0f;
-    \\    if (xlive) for (int i = 0; i < GS / 2; i++) half_sum += float(xp[g * GS + i]);
-    \\    const float other = simd_shuffle_xor(half_sum, ushort(1));
-    \\    const float row_sum = xh ? other + half_sum : half_sum + other;
+    \\    float row_sum[TMR];
+    \\    for (int t = 0; t < TMR; t++) {
+    \\      float half_sum = 0.0f;
+    \\      if (xlive[t]) for (int i = 0; i < GS / 2; i++) half_sum += float(xp[t][g * GS + i]);
+    \\      const float other = simd_shuffle_xor(half_sum, ushort(1));
+    \\      row_sum[t] = xh ? other + half_sum : half_sum + other;
+    \\    }
     \\
 ;
 
 // 32 output columns a simdgroup; SBt holds (s, b) bf16 pairs group-major [K/GS][N][2].
-const NARROW = 
+// A threadgroup covers 16 x TMR rows from `rb` with one op per group; every row
+// gets the 16-row op's bits.
+const NARROW =
     \\  const ushort lane = thread_index_in_simdgroup;
     \\  const ushort sg = simdgroup_index_in_threadgroup;     // K slice
     \\  const short qid = lane >> 2;
@@ -47,22 +57,21 @@ const NARROW =
     \\  constexpr int KG = K / GS;
     \\  constexpr int NF = 2;
     \\  const int n0 = threadgroup_position_in_grid.x * 32;
+    \\  const int rb = threadgroup_position_in_grid.y * 16 * TMR;
     \\  const int g_begin = (sg * KG) / SK;
     \\  const int g_end = ((sg + 1) * KG) / SK;
-    \\  constexpr auto desc = matmul2d_descriptor(16, 32, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+    \\  constexpr auto desc = matmul2d_descriptor(16 * TMR, 32, GS, false, true, false, matmul2d_descriptor::mode::multiply);
     \\  matmul2d<desc, execution_simdgroup> op;
-    \\  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X, dextents<int32_t, 2>(K, M));
+    \\  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X + (int64_t)rb * K, dextents<int32_t, 2>(K, M - rb));
     \\  tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tB((device uchar*)W, dextents<int32_t, 2>(K, N));
-    \\  float C[NF * 8];
-    \\  for (int i = 0; i < NF * 8; i++) C[i] = 0.0f;
+    \\  float C[TMR][NF * 8];
+    \\  for (int t = 0; t < TMR; t++) for (int i = 0; i < NF * 8; i++) C[t][i] = 0.0f;
     \\  const device uint4* sbv = (const device uint4*)SBt;
     \\  bool colok[NF];
     \\  for (int f = 0; f < NF; f++) colok[f] = n0 + f * 16 + fn < N;
 ++ "\n" ++ ROW_SUMS ++
     \\  for (int g = g_begin; g < g_end; g++) {
 ++ "\n" ++ ROW_SUM_G ++
-    \\    const float xs0 = simd_shuffle(row_sum, ushort(2 * fm));
-    \\    const float xs1 = simd_shuffle(row_sum, ushort(2 * (fm + 8)));
     \\    float s[NF][4], bb[NF][4];
     \\    for (int f = 0; f < NF; f++) {
     \\      const uint4 q = colok[f] ? sbv[(size_t(g) * N + n0 + f * 16 + fn) / 4] : uint4(0);
@@ -78,29 +87,36 @@ const NARROW =
     \\#endif
     \\    auto P = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
     \\    op.run(a, b, P);
-    \\    for (int f = 0; f < NF; f++)
-    \\      for (int r = 0; r < 2; r++)
-    \\        for (int j = 0; j < 4; j++) {
-    \\          const int i = f * 8 + r * 4 + j;
-    \\          C[i] = fma(s[f][j], P[i], fma(bb[f][j], r ? xs1 : xs0, C[i]));
+    \\    for (int t = 0; t < TMR; t++) {
+    \\      const float xs0 = simd_shuffle(row_sum[t], ushort(2 * fm));
+    \\      const float xs1 = simd_shuffle(row_sum[t], ushort(2 * (fm + 8)));
+    \\      for (int f = 0; f < NF; f++)
+    \\        for (int r = 0; r < 2; r++)
+    \\          for (int j = 0; j < 4; j++) {
+    \\            const int i = f * 8 + r * 4 + j;
+    \\            C[t][i] = fma(s[f][j], P[t * NF * 8 + i], fma(bb[f][j], r ? xs1 : xs0, C[t][i]));
+    \\          }
+    \\    }
+    \\  }
+    \\  // K slices are added in slice order, one 16-row block at a time
+    \\  threadgroup float part[(SK > 1 ? SK - 1 : 1) * NF * 8 * 32];
+    \\  for (int t = 0; t < TMR; t++) {
+    \\    if (SK > 1) {
+    \\      if (sg > 0) for (int i = 0; i < NF * 8; i++) part[((sg - 1) * NF * 8 + i) * 32 + lane] = C[t][i];
+    \\      threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\      if (sg == 0)
+    \\        for (int s2 = 1; s2 < SK; s2++) for (int i = 0; i < NF * 8; i++) C[t][i] += part[((s2 - 1) * NF * 8 + i) * 32 + lane];
+    \\      if (TMR > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    }
+    \\    if (sg == 0)
+    \\      for (int f = 0; f < NF; f++)
+    \\        for (int r = 0; r < 2; r++) {
+    \\          const int m = rb + t * 16 + fm + 8 * r;
+    \\          const int n = n0 + f * 16 + fn;
+    \\          if (m < M && n < N)
+    \\            for (int j = 0; j < 4; j++) Y[m * N + n + j] = static_cast<bfloat>(C[t][f * 8 + r * 4 + j]);
     \\        }
     \\  }
-    \\  // K slices are added in slice order
-    \\  threadgroup float part[(SK > 1 ? SK - 1 : 1) * NF * 8 * 32];
-    \\  if (SK > 1) {
-    \\    if (sg > 0) for (int i = 0; i < NF * 8; i++) part[((sg - 1) * NF * 8 + i) * 32 + lane] = C[i];
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    if (sg == 0)
-    \\      for (int s2 = 1; s2 < SK; s2++) for (int i = 0; i < NF * 8; i++) C[i] += part[((s2 - 1) * NF * 8 + i) * 32 + lane];
-    \\  }
-    \\  if (sg == 0)
-    \\    for (int f = 0; f < NF; f++)
-    \\      for (int r = 0; r < 2; r++) {
-    \\        const int m = fm + 8 * r;
-    \\        const int n = n0 + f * 16 + fn;
-    \\        if (m < M && n < N)
-    \\          for (int j = 0; j < 4; j++) Y[m * N + n + j] = static_cast<bfloat>(C[f * 8 + r * 4 + j]);
-    \\      }
     \\
 ;
 
@@ -112,16 +128,17 @@ const COOP =
     \\  const int M = mdims[0];
     \\  constexpr int KG = K / GS;
     \\  const int n0 = threadgroup_position_in_grid.x * 64;
+    \\  const int rb = threadgroup_position_in_grid.y * 16 * TMR;
     \\  const int g_begin = (slice * KG) / SK;
     \\  const int g_end = ((slice + 1) * KG) / SK;
-    \\  constexpr auto desc = matmul2d_descriptor(16, 64, GS, false, true, false, matmul2d_descriptor::mode::multiply);
+    \\  constexpr auto desc = matmul2d_descriptor(16 * TMR, 64, GS, false, true, false, matmul2d_descriptor::mode::multiply);
     \\  matmul2d<desc, execution_simdgroups<2>> op;
-    \\  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X, dextents<int32_t, 2>(K, M));
+    \\  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X + (int64_t)rb * K, dextents<int32_t, 2>(K, M - rb));
     \\  tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tB((device uchar*)W, dextents<int32_t, 2>(K, N));
     \\  auto a0 = tA.slice(0, 0);
     \\  auto b0 = tB.slice(0, 0);
     \\  auto P = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
-    \\  constexpr int CAP = 16;                                   // 16 x 64 outputs over 64 threads
+    \\  constexpr int CAP = 16 * TMR;                             // 16 TMR x 64 outputs over 64 threads
     \\  short ecol[CAP], erow[CAP];
     \\  for (int i = 0; i < CAP; i++) { auto ids = P.get_multidimensional_index(i); ecol[i] = ids[0]; erow[i] = ids[1]; }
     \\  float C[CAP];
@@ -140,22 +157,24 @@ const COOP =
     \\    op.run(a, b, P);
     \\    for (int i = 0; i < CAP; i++) {
     \\      const vec<bfloat, 2> sb = as_type<vec<bfloat, 2>>(sbw[size_t(g) * N + n0 + ecol[i]]);
-    \\      const float xs = simd_shuffle(row_sum, ushort(2 * erow[i]));
+    \\      const float xs = simd_shuffle(row_sum[erow[i] >> 4], ushort(2 * (erow[i] & 15)));
     \\      C[i] = fma(float(sb[0]), P[i], fma(float(sb[1]), xs, C[i]));
     \\    }
     \\  }
-    \\  // K slices are added in slice order
+    \\  // K slices are added in slice order, 16 outputs a thread at a time
     \\  threadgroup float part[(SK > 1 ? SK - 1 : 1) * 16 * 64];
     \\  const ushort tip = ushort(thread_position_in_threadgroup.x) - slice * 64;
-    \\  if (SK > 1) {
-    \\    if (slice > 0) for (int i = 0; i < CAP; i++) part[((slice - 1) * CAP + i) * 64 + tip] = C[i];
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    if (slice == 0)
-    \\      for (int s2 = 1; s2 < SK; s2++) for (int i = 0; i < CAP; i++) C[i] += part[((s2 - 1) * CAP + i) * 64 + tip];
-    \\  }
+    \\  if (SK > 1)
+    \\    for (int c0 = 0; c0 < CAP; c0 += 16) {
+    \\      if (slice > 0) for (int i = 0; i < 16; i++) part[((slice - 1) * 16 + i) * 64 + tip] = C[c0 + i];
+    \\      threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\      if (slice == 0)
+    \\        for (int s2 = 1; s2 < SK; s2++) for (int i = 0; i < 16; i++) C[c0 + i] += part[((s2 - 1) * 16 + i) * 64 + tip];
+    \\      if (TMR > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    }
     \\  if (slice == 0)
     \\    for (int i = 0; i < CAP; i++) {
-    \\      const int m = erow[i], n = n0 + ecol[i];
+    \\      const int m = rb + erow[i], n = n0 + ecol[i];
     \\      if (m < M) Y[m * N + n] = static_cast<bfloat>(C[i]);
     \\    }
     \\
@@ -178,7 +197,12 @@ fn coopFor(n: c_int) bool {
 /// makes when the drafter binds. A weight past it is read in MLX's layout (same bits).
 pub var tile_budget: u64 = 0;
 
-const KernelKey = struct { coop: bool, tiled: bool, k: c_int, n: c_int, gs: c_int, sk: c_int };
+const KernelKey = struct { coop: bool, tiled: bool, tmr: c_int, k: c_int, n: c_int, gs: c_int, sk: c_int };
+
+/// 16-row blocks a threadgroup's op covers: one up to 16 rows, two past it.
+fn tmrFor(rows: c_int) c_int {
+    return if (rows <= 16) 1 else 2;
+}
 var kernels: std.AutoHashMapUnmanaged(KernelKey, mlx.mlx_fast_metal_kernel) = .{};
 const PlanKey = struct { coop: bool, rows: c_int, n: c_int, k: c_int };
 var plans: std.AutoHashMapUnmanaged(PlanKey, mlx.mlx_fast_metal_kernel_config) = .{};
@@ -287,11 +311,11 @@ fn tiledFor(w: mlx.mlx_array, nt: c_int, gs: c_int, s: mlx.mlx_stream) !?mlx.mlx
 fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     if (kernels.get(key)) |k| return k;
     const a = std.heap.c_allocator;
-    const consts = try std.fmt.allocPrint(a, "#define TILED {d}\n  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int GS = {d};\n  constexpr int SK = {d};\n", .{ @intFromBool(key.tiled), key.k, key.n, key.gs, key.sk });
+    const consts = try std.fmt.allocPrint(a, "#define TILED {d}\n  constexpr int TMR = {d};\n  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int GS = {d};\n  constexpr int SK = {d};\n", .{ @intFromBool(key.tiled), key.tmr, key.k, key.n, key.gs, key.sk });
     defer a.free(consts);
     const source = try std.mem.concatWithSentinel(a, u8, &.{ consts, if (key.coop) COOP else NARROW }, 0);
     defer a.free(source);
-    const name = try std.fmt.allocPrintSentinel(a, "msv_lane_qmm_{s}{s}_k{d}_n{d}_g{d}_s{d}", .{ if (key.coop) "coop" else "narrow", if (key.tiled) "_tiled" else "", key.k, key.n, key.gs, key.sk }, 0);
+    const name = try std.fmt.allocPrintSentinel(a, "msv_lane_qmm_{s}{s}_t{d}_k{d}_n{d}_g{d}_s{d}", .{ if (key.coop) "coop" else "narrow", if (key.tiled) "_tiled" else "", key.tmr, key.k, key.n, key.gs, key.sk }, 0);
     defer a.free(name);
     const in_names = [_][*:0]const u8{ "X", "W", "SBt", "mdims" };
     const out_names = [_][*:0]const u8{"Y"};
@@ -312,7 +336,8 @@ fn planFor(key: PlanKey) !mlx.mlx_fast_metal_kernel_config {
     const sk = splitK(key.n, key.k);
     const width: c_int = if (key.coop) 64 else 32;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.rows, key.n }, 2, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(key.n + width - 1, width) * width * sk, 1, 1));
+    const block = 16 * tmrFor(key.rows);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(key.n + width - 1, width) * width * sk, @divTrunc(key.rows + block - 1, block), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, width * sk, 1, 1));
     try plans.put(std.heap.c_allocator, key, cfg);
     return cfg;
@@ -358,7 +383,7 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
     }
     const sbt = try packedFor(sc, bi, s);
     const wk = tiled_w orelse w;
-    const mk = try kernelFor(.{ .coop = coop, .tiled = tiled, .k = k, .n = n, .gs = gs, .sk = splitK(n, k) });
+    const mk = try kernelFor(.{ .coop = coop, .tiled = tiled, .tmr = tmrFor(rows), .k = k, .n = n, .gs = gs, .sk = splitK(n, k) });
     const mcfg = try planFor(.{ .coop = coop, .rows = rows, .n = n, .k = k });
     const ins = [_]mlx.mlx_array{ xc, wk, sbt, mdims_cache[ri] };
     const in_vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -391,7 +416,7 @@ fn randBf16(shape: []const c_int, scale: f32, seed: u64, s: mlx.mlx_stream) !mlx
     return out;
 }
 
-test "lane_qmm: every row of an R-row call equals its one-row call bit for bit, tiled or not, and the product is the fp32 one" {
+test "lane_qmm: every row of an R-row call equals its one-row call bit for bit up to 128 rows, tiled or not, and the product is the fp32 one" {
     if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     errdefer {
@@ -450,8 +475,7 @@ test "lane_qmm: every row of an R-row call equals its one-row call bit for bit, 
             const ref = try meanSquare(truth, s);
             try testing.expect(@sqrt(err / ref) < 1e-2);
         }
-        var r: c_int = 1;
-        while (r <= MAX_ROWS) : (r += 1) {
+        for ([_]c_int{ 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 18, 31, 32, 33, 47, 48, 49, 64, 65, 100, 127, 128 }) |r| {
             var xr = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(xr);
             try mlx.check(mlx.mlx_slice(&xr, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ r, sh[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));

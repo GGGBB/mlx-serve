@@ -19930,24 +19930,27 @@ pub const Transformer = struct {
         // not the partial-cache path.
         try self.resetCache();
 
-        const ids_8 = [_]i32{ 0, 0, 0, 0, 0, 0, 0, 0 };
-        const prefill_shape = [_]c_int{ 1, 8 };
-        const prefill_input = mlx.mlx_array_new_data(&ids_8, &prefill_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(prefill_input);
-        const prefill_logits = try self.forward(prefill_input);
-        _ = mlx.mlx_array_free(prefill_logits);
-        {
-            const eval_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(eval_vec);
-            for (self.cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+        // A verify-width pass, then a prompt-width one (past 16 rows the lane matmul runs 32-row blocks).
+        const ids: [32]i32 = @splat(0);
+        for ([_]c_int{ 8, 32 }) |width| {
+            const prefill_shape = [_]c_int{ 1, width };
+            const prefill_input = mlx.mlx_array_new_data(&ids, &prefill_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(prefill_input);
+            const prefill_logits = try self.forward(prefill_input);
+            _ = mlx.mlx_array_free(prefill_logits);
+            {
+                const eval_vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(eval_vec);
+                for (self.cache.entries) |*entry| {
+                    if (!entry.initialized) continue;
+                    _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+                    _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                }
+                _ = mlx.mlx_eval(eval_vec);
             }
-            _ = mlx.mlx_eval(eval_vec);
+            _ = mlx.mlx_clear_cache();
+            try self.resetCache();
         }
-        _ = mlx.mlx_clear_cache();
-        try self.resetCache();
     }
 
     // A throw-away slot for the spec warm-up: its own KV, SSM entries and context, so nothing
