@@ -17,6 +17,8 @@ pub const Tree = row_attn.Tree;
 const CK: c_int = 512; // keys per chunk (part of the arithmetic)
 const TK: c_int = 64; // keys per tile (part of the arithmetic)
 const TILES_PER_GROUP: c_int = 16;
+/// Simdgroups a TAIL threadgroup loads its gathered key/value tiles with (the first alone computes).
+const TAIL_SG: c_int = 4;
 
 const HEADER =
     \\#include <metal_tensor>
@@ -116,6 +118,8 @@ const PARTIAL =
 // in depth order; chunk c0's walk continues from the state PARTIAL left there.
 const TAIL =
     \\  const ushort lane = thread_index_in_simdgroup;
+    \\  const ushort tsg = simdgroup_index_in_threadgroup;           // simdgroup 0 computes, all TSG load
+    \\  const uint tid = thread_position_in_threadgroup.x;
     \\  const uint hk = threadgroup_position_in_grid.x;              // key head
     \\  const uint cb = threadgroup_position_in_grid.y;              // tail chunk (from the first chunk holding the window)
     \\  const uint node = threadgroup_position_in_grid.z;
@@ -150,7 +154,7 @@ const TAIL =
     \\  const int c = c0 + int(cb);
     \\  const int kbeg = max(c * CK, PT);
     \\  const int kend = min((c + 1) * CK, nmax);
-    \\  if (cb == 0 && PT > c0 * CK) {
+    \\  if (tsg == 0 && cb == 0 && PT > c0 * CK) {
     \\    const int64_t baseA = ((int64_t)hk * CA + c0) * RPA + node;   // PARTIAL's row g * W + node
     \\    for (int q = 0; q < 16; q++) {
     \\      const int row = fm + (q & 1) * 8;
@@ -165,7 +169,7 @@ const TAIL =
     \\    float sraw[TK / 2];
     \\    for (int h = 0; h < TK / 32; h++) {
     \\      threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\      for (uint e = lane; e < 32 * D / 8; e += 32) {           // logical slot -> physical row
+    \\      for (uint e = tid; e < 32 * D / 8; e += 32 * TSG) {      // logical slot -> physical row
     \\        const int row = int(e) / (D / 8), col = (int(e) % (D / 8)) * 8;
     \\        const int q = kt + h * 32 + row;
     \\        int phys = -1;
@@ -174,10 +178,13 @@ const TAIL =
     \\        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(kbase + phys * kstep + col) : vec<bfloat, 8>(0);
     \\      }
     \\      threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\      auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
-    \\      opS.run(tQ, tK32, S);
-    \\      for (int i = 0; i < 16; i++) sraw[h * 16 + i] = S[i];
+    \\      if (tsg == 0) {
+    \\        auto S = opS.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK32), float>();
+    \\        opS.run(tQ, tK32, S);
+    \\        for (int i = 0; i < 16; i++) sraw[h * 16 + i] = S[i];
+    \\      }
     \\    }
+    \\    if (tsg == 0) {
     \\    float s[TK / 2];
     \\    for (int i = 0; i < TK / 2; i++) {
     \\      const int key = kt + (i >> 3) * 16 + fn + (i & 3);
@@ -207,9 +214,10 @@ const TAIL =
     \\        myP[(fm + 8) * TK + f * 16 + fn + i] = half(p[f * 8 + 4 + i]);
     \\      }
     \\    for (int i = 0; i < 64; i++) { const float f = (i & 4) ? f1 : f0; Olo[i] *= f; Ohi[i] *= f; }
+    \\    }
     \\    for (int hv = 0; hv < 2; hv++) {                           // values: TK keys x 128 columns at a time
     \\      threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\      for (uint e = lane; e < TK * 128 / 8; e += 32) {
+    \\      for (uint e = tid; e < TK * 128 / 8; e += 32 * TSG) {
     \\        const int row = int(e) / 16, col = hv * 128 + (int(e) % 16) * 8;
     \\        const int q = kt + row;
     \\        int phys = -1;
@@ -218,10 +226,13 @@ const TAIL =
     \\        ((threadgroup vec<bfloat, 8>*)KV)[e] = phys >= 0 ? *(const device vec<bfloat, 8>*)(vbase + phys * vstep + col) : vec<bfloat, 8>(0);
     \\      }
     \\      threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\      if (hv == 0) opO.run(tP, tVh, Olo);
-    \\      else opO.run(tP, tVh, Ohi);
+    \\      if (tsg == 0) {
+    \\        if (hv == 0) opO.run(tP, tVh, Olo);
+    \\        else opO.run(tP, tVh, Ohi);
+    \\      }
     \\    }
     \\  }
+    \\  if (tsg != 0) return;
     \\  const int64_t base = (((int64_t)hk * NCB + cb) * W + node) * 16;
     \\  for (int q = 0; q < 16; q++) {
     \\    device float* dst = PO + (base + fm + (q & 1) * 8) * D + (q >> 1) * 16 + fn;
@@ -414,9 +425,10 @@ pub fn sdpa(out: *mlx.mlx_array, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(bcfg, &[_]c_int{nb * d}, 1, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(bcfg, &[_]c_int{nb}, 1, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(bcfg, &[_]c_int{nb}, 1, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(bcfg, hkv * 32, ncb, w));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(bcfg, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(bcfg, hkv * 32 * TAIL_SG, ncb, w));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(bcfg, 32 * TAIL_SG, 1, 1));
     try addDims(bcfg, g, d, "MAXD", maxd);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(bcfg, "TSG", TAIL_SG));
     const bins = [_]mlx.mlx_array{ qc, k, v, scale_arr, db, paths, t.depth, poa, pma, pla };
     const bin_vec = mlx.mlx_vector_array_new_data(&bins, bins.len);
     defer _ = mlx.mlx_vector_array_free(bin_vec);
