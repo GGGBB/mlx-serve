@@ -7,6 +7,7 @@
 //! out_proj. Bit-identical to the composed chain.
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const log = @import("log.zig");
 
 const HEADER =
     \\inline float msv_log1p(float x) {
@@ -259,6 +260,38 @@ const TREE_MACROS =
 const K1S_SOURCE = TREE_MACROS ++ K1S_HEAD ++ "\n" ++
     \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
 ++ "\n" ++ K1S_TAIL;
+
+// K1S at one threadgroup per head (NT=1024, SPLIT=1: the same 4 rows per
+// simdgroup, so each row's recurrence is unchanged) with the verify epilogues
+// folded in, for chains (TREE = 0). A head's 128 y values stay in threadgroup
+// memory, rounded to T as the stored y was, and simdgroup t runs the norm-gate
+// kernel's exact reduction for token t. The conv-input rows rollback slices are copied out as well.
+const K1S_FOLD_SOURCE = TREE_MACROS ++ "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
+    \\    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));
+++ "\n" ++ K1S_TAIL ++ "\n" ++
+    \\if (sg < 3 && (sg == 2 || hv % GRP == 0)) {
+    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
+    \\  for (int i = 0; i < 4; ++i) {
+    \\    uint ch = cb + lane * 4 + i;
+    \\    for (int w = 0; w < 3 + TL; ++w) conv_in[w * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
+    \\  }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (sg < TL) {
+    \\  float xs[4];
+    \\  float sumsq = 0.0f;
+    \\  for (int i = 0; i < 4; ++i) { xs[i] = ys[sg][lane * 4 + i]; sumsq += xs[i] * xs[i]; }
+    \\  sumsq = simd_sum(sumsq);
+    \\  float inv = metal::precise::rsqrt(sumsq / float(DV) + eps);
+    \\  uint base = (sg * HV + hv) * DV + lane * 4;
+    \\  for (int i = 0; i < 4; ++i) {
+    \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
+    \\    const T zv = z[base + i];
+    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); T sig = zv < T(0) ? sy : T(1) - sy;
+    \\    gated[base + i] = SWISH ? (zv * sig) * normed : normed * sig;
+    \\  }
+    \\}
+;
 
 // A tree also writes each row's recurrence inputs, the floats `replay` reads.
 const K1T_SOURCE = K1S_SOURCE ++ "\n" ++
@@ -634,4 +667,107 @@ pub fn replay(g: Geometry, state_in: mlx.mlx_array, pw: Prework, path: []const i
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, o, 0));
     return out;
+}
+
+pub const RecurSeqFold = struct { gated: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array, conv_input: mlx.mlx_array };
+
+const FOLD_NT: c_int = 1024; // one threadgroup per head, 4 dv rows per simdgroup
+pub var fold_nt_override: ?c_int = null; // test seam: 2048 exceeds every GPU's limit
+fn foldNt() c_int {
+    return fold_nt_override orelse FOLD_NT;
+}
+var k1f_cache: ?mlx.mlx_fast_metal_kernel = null;
+var fold_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+// Whether this GPU's pipeline runs each width's 1024-thread fold; null = not dispatched yet.
+var fold_ok: [MAX_SEQ + 1]?bool = @splat(null);
+const FoldKey = struct { k: CfgKey, swish: bool, nt: c_int };
+
+/// Did this GPU's pipeline refuse the fold at width `t_len`?
+pub fn foldDeclined(t_len: c_int) bool {
+    if (t_len < 0 or t_len > MAX_SEQ) return false;
+    return fold_ok[@intCast(t_len)] == false;
+}
+var fold_cfg_key: ?FoldKey = null;
+
+fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, swish: bool) !mlx.mlx_fast_metal_kernel_config {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, t_len, g.hv * g.dv }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3 + t_len, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * foldNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, foldNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", foldNt() }, .{ "SPLIT", @as(c_int, 1) }, .{ "TL", t_len } }) |kv|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SWISH", @intFromBool(swish)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TREE", 0));
+    return cfg;
+}
+
+/// A chain's recurSeq with the norm-gate and the rollback conv-input concat
+/// folded in: gated [1,T,Hv*Dv] (rms_norm(y) * gate(z), swish or sigmoid), the
+/// next conv state, the final state, state_seq (row T-1 unwritten) and
+/// conv_input [1,3+T,C]. Bit-identical to recurSeq -> gdnNormGateFused ->
+/// concat. Null outside the kernel's geometry or dtypes (caller keeps the
+/// unfolded path). Draft trees take `recurSeq` with parents and `replay`.
+pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.mlx_stream) !?RecurSeqFold {
+    if (!mlx.streamIsGpu(s)) return null;
+    if (t_len < 1 or t_len > MAX_SEQ) return null;
+    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
+    const dt = mlx.mlx_array_dtype(in.qkv);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w }) |arr|
+        if (mlx.mlx_array_dtype(arr) != dt) return null;
+    if (mlx.mlx_array_dtype(in.eps) != .float32) return null;
+    const st = mlx.mlx_array_dtype(in.ssm_state);
+    if (st != dt and st != .float32) return null;
+    if (!inputsFit(g, t_len, in, true)) return null;
+    if (k1f_cache == null) k1f_cache = try makeKernel("msv_gdn_decode_recur_seq_fold", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps", "parents" }, &.{ "gated", "conv_out", "state_out", "state_seq", "conv_in" }, K1S_FOLD_SOURCE, HEADER);
+    const key = FoldKey{ .k = .{ .g = g, .dt = dt, .st = st }, .swish = swish, .nt = foldNt() };
+    if (fold_cfg_key == null or !std.meta.eql(fold_cfg_key.?, key)) {
+        for (&fold_cfgs) |*slot| if (slot.*) |c| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(c);
+            slot.* = null;
+        };
+        fold_ok = @splat(null);
+        fold_cfg_key = key;
+    }
+    const idx: usize = @intCast(t_len);
+    if (fold_ok[idx] == false) return null;
+    if (fold_cfgs[idx] == null) fold_cfgs[idx] = try buildFoldConfig(g, t_len, dt, st, swish);
+
+    const no_tree: i32 = -1;
+    const dummy = mlx.mlx_array_new_data(&no_tree, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(dummy);
+    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w, in.eps, dummy };
+    const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
+    defer _ = mlx.mlx_vector_array_free(v1);
+    var o1 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1f_cache.?, v1, fold_cfgs[idx].?, s));
+    var out: [5]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
+    // A pipeline's thread limit is per GPU and known only once MLX builds it (896 for this
+    // kernel on some GPUs). The first dispatch per width evaluates here; a refusal is taken
+    // off the latch and the caller keeps the unfolded chain. Any other error stays latched.
+    if (fold_ok[idx] == null and !mlx.errorPending()) {
+        _ = mlx.mlx_eval(o1);
+        if (mlx.takeErrorIf("maximum allowed threads per threadgroup")) {
+            fold_ok[idx] = false;
+            log.info("[gdn-fold] declined at T={d}: this GPU's pipeline runs fewer than {d} threads per threadgroup\n", .{ t_len, foldNt() });
+            for (out) |a| _ = mlx.mlx_array_free(a);
+            return null;
+        }
+        // Only a clean eval says the pipeline runs; any other error stays latched and decides nothing.
+        if (!mlx.errorPending()) fold_ok[idx] = true;
+    }
+    return .{ .gated = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3], .conv_input = out[4] };
 }
