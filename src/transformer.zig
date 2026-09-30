@@ -18904,6 +18904,15 @@ pub const Transformer = struct {
         return rht.transform(rows, signs, reg.block, true, self.s);
     }
 
+    /// `h + delta` and its RMSNorm in one dispatch at decode/verify widths,
+    /// bit-equal to the two ops (`add_norm.zig`). Null: the caller keeps them.
+    fn narrowAddNorm(self: *const Transformer, h: mlx.mlx_array, delta: mlx.mlx_array, w: mlx.mlx_array) !?add_norm.Out {
+        if (self.config.norm_groups > 1 or w.ctx == null) return null;
+        const sh = mlx.getShape(h);
+        if (sh.len != 3 or sh[0] * sh[1] > add_norm_max_rows) return null;
+        return add_norm.addNorm(h, delta, w, self.rms_eps_arr, self.s);
+    }
+
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
         if (self.config.norm_groups > 1) {
             // Only the residual-width norms are grouped; a per-head q/k norm
@@ -25521,6 +25530,11 @@ pub const Transformer = struct {
                     h = fused.sum;
                     _ = mlx.mlx_array_free(ff_normed);
                     ff_normed = fused.normed;
+                } else if (try self.narrowAddNorm(h, attn_out, lw.post_attn_norm)) |fused| {
+                    _ = mlx.mlx_array_free(h);
+                    h = fused.h;
+                    _ = mlx.mlx_array_free(ff_normed);
+                    ff_normed = fused.normed;
                 } else if (try fusedAddRmsNorm(self.s, h, attn_out, lw.post_attn_norm, self.rms_eps_arr)) |fused| {
                     _ = mlx.mlx_array_free(h);
                     h = fused.sum;
@@ -25548,6 +25562,10 @@ pub const Transformer = struct {
                 if (try self.rhtAddNormRotate(h, mlp_out, next_norm, last or next_linear)) |fused| {
                     _ = mlx.mlx_array_free(h);
                     h = fused.sum;
+                    carried_normed = fused.normed;
+                } else if (try self.narrowAddNorm(h, mlp_out, next_norm)) |fused| {
+                    _ = mlx.mlx_array_free(h);
+                    h = fused.h;
                     carried_normed = fused.normed;
                 } else {
                     var h_next = mlx.mlx_array_new();
@@ -27719,6 +27737,16 @@ pub const Transformer = struct {
         // in the elementwise kernel), then flatten the CONTIGUOUS product —
         // a free view. Flattening attn_t/gate first paid two REAL Copy
         // kernels per call (reshape of a transpose/split view).
+        if (self.config.attn_output_gate and flat_shape[0] * flat_shape[1] <= add_norm_max_rows) {
+            if (try stridedSigmoidGateMul(self.s, attn_t, gate)) |gated_4d| {
+                defer _ = mlx.mlx_array_free(gated_4d);
+                var gated = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(gated);
+                try mlx.check(mlx.mlx_reshape(&gated, gated_4d, &flat_shape, 3, self.s));
+                if (skip_output) return standinRef(gated);
+                return self.attnProj(gated, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill, layer);
+            }
+        }
         if (self.config.attn_output_gate) {
             var gate_sig = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_sig);
@@ -38796,6 +38824,66 @@ var sig_gate_engaged: bool = false;
 /// gates x's last dim per head, 0 means g has x's shape. Bit-identical to
 /// mlx_sigmoid + mlx_multiply (pinned by the `fused sigmoid gate` test).
 /// Null → caller keeps the ops.
+// `x * sigmoid(gate)` over two equal-shape 4-D views read through their own
+// strides (a transposed attention output, a split q|gate projection), written
+// contiguous [B, S, H, D]; sigmoid from MLX's own table, so bit-equal to the pair.
+const STRIDED_SIGMOID_GATE_MUL_SOURCE =
+    \\uint i = thread_position_in_grid.x;
+    \\if (i >= uint(N_size)) return;
+    \\const uint D = x_shape[3], H = x_shape[2], S = x_shape[1];
+    \\const uint d = i % D, h = (i / D) % H, sq = (i / (D * H)) % S, b = i / (D * H * S);
+    \\const T xv = x[b * x_strides[0] + sq * x_strides[1] + h * x_strides[2] + d * x_strides[3]];
+    \\const T gv = gate[b * gate_strides[0] + sq * gate_strides[1] + h * gate_strides[2] + d * gate_strides[3]];
+    \\y[i] = xv * sigtab[as_type<ushort>(gv)];
+;
+
+var strided_sig_gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var strided_sig_gate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var strided_sig_gate_key: SigGateCfgKey = std.mem.zeroes(SigGateCfgKey);
+
+fn stridedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array) !?mlx.mlx_array {
+    const dt = mlx.mlx_array_dtype(x);
+    if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(g) != dt) return null;
+    const xsh = mlx.getShape(x);
+    if (xsh.len != 4 or !std.mem.eql(c_int, xsh, mlx.getShape(g))) return null;
+    const n: i64 = @as(i64, xsh[0]) * xsh[1] * xsh[2] * xsh[3];
+    if (n <= 0 or n > std.math.maxInt(c_int)) return null;
+    const ni: c_int = @intCast(n);
+    const tg: c_int = @min(@as(c_int, 256), @divTrunc(ni + 31, 32) * 32);
+    const key = SigGateCfgKey{ .shape = ShapeKey.from(xsh), .group = 1, .dtype = dt };
+    if (strided_sig_gate_cfg == null or !std.meta.eql(strided_sig_gate_key, key)) {
+        if (strided_sig_gate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, xsh.ptr, xsh.len, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ni + tg - 1, tg) * tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+        strided_sig_gate_cfg = config;
+        strided_sig_gate_key = key;
+    }
+    if (strided_sig_gate_kernel == null) {
+        const input_names = [_][*:0]const u8{ "x", "gate", "sigtab", "N_size" };
+        const output_names = [_][*:0]const u8{"y"};
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const kh = mlx.mlx_fast_metal_kernel_new("mlxserve_strided_sigmoid_gate_mul", in_vec, out_vec, STRIDED_SIGMOID_GATE_MUL_SOURCE, "", false, false);
+        if (kh.ctx == null) return error.MetalKernelCompileFailed;
+        strided_sig_gate_kernel = kh;
+    }
+    const sigtab = try swigluSigTable(s, dt, std.heap.c_allocator);
+    const inputs_arr = [_]mlx.mlx_array{ x, g, sigtab, cachedScalarInt(ni) };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, strided_sig_gate_kernel.?, inputs_vec, strided_sig_gate_cfg.?, s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    return y;
+}
+
 fn fusedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array, heads: c_int) !?mlx.mlx_array {
     if (!swigluFusedEnabled()) return null;
     const dt = mlx.mlx_array_dtype(x);
@@ -48180,6 +48268,35 @@ test "fused gated conv step is bit-identical to multiply -> concat -> conv1d -> 
             try mlx.check(mlx.mlx_array_item_bool(&eq_v, eq));
             try testing.expect(eq_v);
         }
+    }
+}
+
+test "strided sigmoid gate is bit-identical to mlx_sigmoid + multiply over a transposed output and a split gate" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x6A7E);
+    const rnd = prng.random();
+    for ([_]c_int{ 1, 16 }) |rows| {
+        const heads: c_int = 24;
+        const hd: c_int = 256;
+        const out_bhsd = try gdnParityRand(rnd, &.{ 1, heads, rows, hd }, 4.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(out_bhsd);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_transpose_axes(&x, out_bhsd, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+        const qg = try gdnParityRand(rnd, &.{ 1, rows, heads, 2 * hd }, 12.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(qg);
+        var g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g);
+        try mlx.check(mlx.mlx_slice(&g, qg, &[_]c_int{ 0, 0, 0, hd }, 4, &[_]c_int{ 1, rows, heads, 2 * hd }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+        var sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sig);
+        try mlx.check(mlx.mlx_sigmoid(&sig, g, s));
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try mlx.check(mlx.mlx_multiply(&ref, x, sig, s));
+        const got = (try stridedSigmoidGateMul(s, x, g)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, ref, s));
     }
 }
 
