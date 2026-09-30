@@ -352,6 +352,17 @@ if grep -q "draft trees engaged" "$LOG" && grep -q "\[gdn\]" "$LOG"; then
     fi
 fi
 
+# [10c] A continuation the context backs is verified as a copied chain, and
+# the greedy output matches the drafter-off run.
+if grep -q "draft trees engaged" "$LOG"; then
+    COPY_TEXT="The lighthouse keeper climbed the spiral stairs at dusk, trimmed the wick, polished the great lens until it shone, and wrote in the logbook that the wind had backed to the southwest and the sea was rising."
+    copy_body() { printf '{"model":"mlx-serve","temperature":0,"max_tokens":120,"chat_template_kwargs":{"enable_thinking":false},%s"messages":[{"role":"user","content":"Repeat this paragraph exactly, twice, with nothing else: %s"}]}' "$1" "$COPY_TEXT"; }
+    ON=$(curl -s -m 180 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$(copy_body '')" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])')
+    OFF=$(curl -s -m 180 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$(copy_body '"enable_drafter":false,')" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])')
+    if grep -q "context copy verified" "$LOG"; then ok "context copy verified as a chain"; else bad "context copy verified as a chain" "$(grep "\[dflash\]" "$LOG" | tail -3)"; fi
+    if [ -n "$ON" ] && [ "$ON" = "$OFF" ]; then ok "copied rounds keep the drafter-off bytes"; else bad "copied rounds keep the drafter-off bytes" "$(printf '%s\n---\n%s' "$ON" "$OFF" | head -c 400)"; fi
+fi
+
 # [11] The assistant context rides the prefix cache. A restore forwards no
 # trunk layers, so without it a reused prefix drafts blind — acceptance
 # collapsed 92.6% -> 66.5% live. Same prompt twice: the second is a hit, and
