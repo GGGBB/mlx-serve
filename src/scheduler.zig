@@ -3952,6 +3952,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             });
             const tiled_bytes = try xfm_ptr.tileLaneWeights();
             if (tiled_bytes > 0) log.info("[lane] trunk projections tiled in place ({d:.1} GB, no copy)\n", .{@as(f64, @floatFromInt(tiled_bytes)) / (1 << 30)});
+            const drafter_tiled = try d.tileLaneWeights(mlx.gpuStream());
+            if (drafter_tiled > 0) log.info("[lane] drafter projections tiled in place ({d:.2} GB, no copy)\n", .{@as(f64, @floatFromInt(drafter_tiled)) / (1 << 30)});
         }
     } else if (drafter_dir.len > 0) {
         const d = try sch.allocator.create(DrafterModel);

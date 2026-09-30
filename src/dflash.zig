@@ -726,6 +726,7 @@ pub const DflashModel = struct {
 
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
+        lane_qmm.release(@intFromPtr(self));
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
         if (self.draft_head) |*dh| dh.deinit();
@@ -735,6 +736,32 @@ pub const DflashModel = struct {
         for (self.layers) |*lw| lw.deinit();
         allocator.free(self.layers);
         self.config.deinit(allocator);
+    }
+
+    /// Re-orders every 4-bit linear into the lane kernel's tiled layout in its
+    /// own buffer (NAX only; no copy stays resident). From then on they are
+    /// read through `lane_qmm` alone, as `DflashLinear.apply` does.
+    pub fn tileLaneWeights(self: *DflashModel, s: mlx.mlx_stream) !u64 {
+        if (!transformer_mod.naxAvailable()) return 0;
+        try mlx.check(mlx.mlx_synchronize(s));
+        const owner = @intFromPtr(self);
+        var bytes: u64 = 0;
+        const Tile = struct {
+            fn one(own: usize, lin: *const DflashLinear, st: mlx.mlx_stream) !u64 {
+                if (lin.bits != 4 or lin.group_size != 64) return 0;
+                return lane_qmm.tileInPlace(own, lin.w, lin.scales, lin.biases, &.{}, st);
+            }
+        };
+        bytes += try Tile.one(owner, &self.fc, s);
+        for (self.layers) |*lw| {
+            for ([_]*const DflashLinear{ &lw.q, &lw.k, &lw.v, &lw.o, &lw.gate, &lw.up, &lw.down }) |lin| bytes += try Tile.one(owner, lin, s);
+            inline for (.{ lw.attention_conv, lw.mlp_conv }) |conv| if (conv) |c| {
+                bytes += try Tile.one(owner, &c.kernel_projection, s);
+            };
+        }
+        if (self.selector) |*sel| bytes += try Tile.one(owner, &sel.hidden_projection, s);
+        if (self.markov) |*mh| bytes += try Tile.one(owner, &mh.w2, s);
+        return bytes;
     }
 
     /// Validate compatibility with the target trunk. The assistant borrows
@@ -3183,6 +3210,26 @@ fn tinyBlockHidden(m: *DflashModel, allocator: std.mem.Allocator, s: mlx.mlx_str
     const hidden = try forwardBlock(m, &ctx, noise, 10);
     defer _ = mlx.mlx_array_free(hidden);
     return TinyFix.readF32(hidden, allocator, s);
+}
+
+test "dflash: tiling the 4-bit drafter in place leaves its forward unchanged" {
+    if (mlx.noGpuBackend() or !transformer_mod.naxAvailable()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    try TinyFix.writeAssistant(io, tmp_dir.dir, path_buf[0..root_len], s);
+    var m = try loadDflashQuant(io, allocator, s, path_buf[0..root_len], 4);
+    defer m.deinit();
+    const before = try tinyBlockHidden(&m, allocator, s);
+    defer allocator.free(before);
+    try testing.expect(try m.tileLaneWeights(s) > 0);
+    const after = try tinyBlockHidden(&m, allocator, s);
+    defer allocator.free(after);
+    try testing.expectEqualSlices(f32, before, after);
 }
 
 test "dflash: load-time quantization packs every matmul weight and tracks the dense forward" {
