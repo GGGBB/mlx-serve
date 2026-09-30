@@ -14,6 +14,7 @@ const rht = @import("rht.zig");
 const qmv2 = @import("qmv2.zig");
 const rowqmv = @import("rowqmv.zig");
 const lane_qmm = @import("lane_qmm.zig");
+const lane_attn = @import("lane_attn.zig");
 const simd_qmm = @import("simd_qmm.zig");
 const row_attn = @import("row_attn.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
@@ -27664,7 +27665,8 @@ pub const Transformer = struct {
         if (kv_fused_done) {
             // packed kernel handled this layer
         } else if (self.config.rowExactDecode() and seq_len <= row_attn.MAX_ROWS and batch == 1 and
-            try row_attn.sdpa(&attn_out, q_rope, full_k, full_v, attn_scale, if (ctx.tree) |t| t.attn else null, self.s))
+            ((naxAvailable() and try lane_attn.sdpa(&attn_out, q_rope, full_k, full_v, attn_scale, if (ctx.tree) |t| t.attn else null, self.s)) or
+                try row_attn.sdpa(&attn_out, q_rope, full_k, full_v, attn_scale, if (ctx.tree) |t| t.attn else null, self.s)))
         {
             // every row, serial steps included, through the one fixed arithmetic
         } else if (ctx.tree != null) {

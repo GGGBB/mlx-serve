@@ -2166,8 +2166,30 @@ pub fn forwardBlock(
 
         // Append block K/V into spare capacity; the view spans ctx + block.
         const view = try ctx.cache.update(@intCast(li), bk, bv, s, 0);
+        // A sliding layer never sees context before the first query's window:
+        // attend over the rest, so the cost stops growing with the context.
+        const skip: usize = if (lw.layer_type == .sliding_attention)
+            @min(ctx_len, (anchor_pos -| (cfg.sliding_window - 1)) -| ctx.base_pos)
+        else
+            0;
+        var kv_k = view.k;
+        var kv_v = view.v;
+        var cut: [2]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null } };
+        defer for (cut) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        if (skip > 0) {
+            const sh = mlx.getShape(view.k);
+            const lo: c_int = @intCast(skip);
+            for ([_]mlx.mlx_array{ view.k, view.v }, &cut) |src, *dst| {
+                dst.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice(dst, src, &[_]c_int{ 0, 0, lo, 0 }, 4, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+            }
+            kv_k = cut[0];
+            kv_v = cut[1];
+        }
 
-        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos, ctx_len, anchor_pos, q_len, cfg.sliding_window, s);
+        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos + skip, ctx_len - skip, anchor_pos, q_len, cfg.sliding_window, s);
         defer if (mask) |m| {
             _ = mlx.mlx_array_free(m);
         };
@@ -2175,9 +2197,9 @@ pub fn forwardBlock(
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (mask) |m| {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "array", m, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "array", m, .{ .ctx = null }, false, s));
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
         }
 
         var attn_t = mlx.mlx_array_new();
