@@ -7,7 +7,6 @@
 //! out_proj. Bit-identical to the composed chain.
 const std = @import("std");
 const mlx = @import("mlx.zig");
-const log = @import("log.zig");
 
 const HEADER =
     \\inline float msv_log1p(float x) {
@@ -230,7 +229,7 @@ const K1S_HEAD =
 const K1S_TAIL =
     \\    // The next token reads the state serial decoding stored (StT), not the f32.
     \\    for (int i = 0; i < 4; ++i) st[j][i] = float(static_cast<StT>(st[j][i]));
-    \\    if (STATE_ALL || t + 1 < TL) {
+    \\    if (STORE_ROW(t)) {
     \\      uint sbase = t * (HV * DV * DK) + (hv * DV + dv) * DK + lane * 4;
     \\      for (int i = 0; i < 4; ++i) state_seq[sbase + i] = static_cast<StT>(st[j][i]);
     \\    }
@@ -241,55 +240,73 @@ const K1S_TAIL =
     \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
     \\}
 ;
-const CHAIN_MACROS = "#define TAP_W(t, tap) ((t) + (tap))\n#define RELOAD(t)\n#define STATE_ALL 0\n";
 // A draft tree (TREE = 1): row t's conv window and recurrence follow its
-// ancestors. `parents` holds [TL] parent rows (-1 for the root), then [TL][4]
-// conv sources (< 3 a conv-state row, else 3 + a window row). A node whose
-// parent is not the row before restarts from the parent's stored state, the
-// state serial decoding reads at that position.
+// ancestors. `parents` holds [TL] parent rows (-1 for the root), [TL][4] conv
+// sources (< 3 a conv-state row, else 3 + a window row), then [TL] flags for
+// the rows a later node restarts from: only those land in state_seq (the
+// commit replays the kept path, `replay`). A node whose parent is not the row
+// before restarts from the parent's stored state, the state serial decoding
+// reads at that position.
 const TREE_MACROS =
     \\#define TAP_W(t, tap) (TREE ? int(parents[TL + (t) * 4 + (tap)]) : (t) + (tap))
     \\#define RELOAD(t) if (TREE && t > 0 && parents[t] != t - 1) { \
     \\  for (int j = 0; j < R; ++j) { \
     \\    uint sb = parents[t] * (HV * DV * DK) + (hv * DV + row0 + j) * DK + lane * 4; \
     \\    for (int i = 0; i < 4; ++i) st[j][i] = float(state_seq[sb + i]); } }
-    \\#define STATE_ALL TREE
+    \\#define STORE_ROW(t) (TREE ? parents[5 * TL + (t)] != 0 : (t) + 1 < TL)
     \\
 ;
-const TREE_HEADER = HEADER;
-const K1S_SOURCE = CHAIN_MACROS ++ K1S_HEAD ++ "\n" ++
+const K1S_SOURCE = TREE_MACROS ++ K1S_HEAD ++ "\n" ++
     \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
 ++ "\n" ++ K1S_TAIL;
 
-// K1S at one threadgroup per head (NT=1024, SPLIT=1: the same 4 rows per
-// simdgroup, so each row's recurrence is unchanged) with the verify epilogues
-// folded in. A head's 128 y values stay in threadgroup memory, rounded to T as
-// the stored y was, and simdgroup t runs the norm-gate kernel's exact reduction
-// for token t. The conv-input rows rollback slices are copied out as well.
-const K1S_FOLD_SOURCE = TREE_MACROS ++ "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
-    \\    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));
-++ "\n" ++ K1S_TAIL ++ "\n" ++
-    \\if (sg < 3 && (sg == 2 || hv % GRP == 0)) {
-    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    uint ch = cb + lane * 4 + i;
-    \\    for (int w = 0; w < 3 + TL; ++w) conv_in[w * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
+// A tree also writes each row's recurrence inputs, the floats `replay` reads.
+const K1T_SOURCE = K1S_SOURCE ++ "\n" ++
+    \\if (part == 0) {
+    \\  const uint tid = sg * 32 + lane;
+    \\  for (uint i = tid; i < uint(TL * DV); i += NT) pv[(i / DV * HV + hv) * DV + i % DV] = vs[i / DV][i % DV];
+    \\  if (hv % GRP == 0) for (uint i = tid; i < uint(TL * DK); i += NT) pk[(i / DK * HK + hk) * DK + i % DK] = ks[i / DK][i % DK];
+    \\  for (uint i = tid; i < uint(TL); i += NT) { pg[(i * HV + hv) * 2] = gb[i][0]; pg[(i * HV + hv) * 2 + 1] = gb[i][1]; }
+    \\}
+;
+
+// The recurrence along `path` (window rows, oldest first) from the round's
+// input state, the tree kernel's ops and per-token rounding: the state serial
+// decoding holds after the path's last row.
+const K1R_SOURCE =
+    \\constexpr int NSG = NT / 32;
+    \\constexpr int RB = DV / SPLIT;
+    \\constexpr int R = RB / NSG;
+    \\constexpr int GRP = HV / HK;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg = simdgroup_index_in_threadgroup;
+    \\uint hv = threadgroup_position_in_grid.x / SPLIT;
+    \\uint part = threadgroup_position_in_grid.x % SPLIT;
+    \\uint hk = hv / GRP;
+    \\uint row0 = part * RB + sg * R;
+    \\float st[R][4];
+    \\for (int j = 0; j < R; ++j) {
+    \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
+    \\  for (int i = 0; i < 4; ++i) st[j][i] = float(state_in[base + i]);
+    \\}
+    \\for (int p = 0; p < int(n_path[0]); ++p) {
+    \\  const int t = path[p];
+    \\  float kk[4];
+    \\  for (int i = 0; i < 4; ++i) kk[i] = pk[(t * HK + hk) * DK + lane * 4 + i];
+    \\  const float g = pg[(t * HV + hv) * 2], beta = pg[(t * HV + hv) * 2 + 1];
+    \\  for (int j = 0; j < R; ++j) {
+    \\    uint dv = row0 + j;
+    \\    float kv_mem = 0.0f;
+    \\    for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] * g; kv_mem += st[j][i] * kk[i]; }
+    \\    kv_mem = simd_sum(kv_mem);
+    \\    float delta = (pv[(t * HV + hv) * DV + dv] - kv_mem) * beta;
+    \\    for (int i = 0; i < 4; ++i) st[j][i] = st[j][i] + kk[i] * delta;
+    \\    for (int i = 0; i < 4; ++i) st[j][i] = float(static_cast<StT>(st[j][i]));
     \\  }
     \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (sg < TL) {
-    \\  float xs[4];
-    \\  float sumsq = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { xs[i] = ys[sg][lane * 4 + i]; sumsq += xs[i] * xs[i]; }
-    \\  sumsq = simd_sum(sumsq);
-    \\  float inv = metal::precise::rsqrt(sumsq / float(DV) + eps);
-    \\  uint base = (sg * HV + hv) * DV + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
-    \\    const T zv = z[base + i];
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); T sig = zv < T(0) ? sy : T(1) - sy;
-    \\    gated[base + i] = SWISH ? (zv * sig) * normed : normed * sig;
-    \\  }
+    \\for (int j = 0; j < R; ++j) {
+    \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
+    \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
     \\}
 ;
 
@@ -448,14 +465,19 @@ pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
     return .{ .rot = rot, .conv_state = r.conv_state, .ssm_state = r.ssm_state };
 }
 
-pub const RecurSeq = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array };
+/// A tree round's per-row recurrence inputs (f32): k [T,Hk,Dk], v [T,Hv,Dv],
+/// g|beta [T,Hv,2]. Null handles for a chain.
+pub const Prework = struct { k: mlx.mlx_array = .{ .ctx = null }, v: mlx.mlx_array = .{ .ctx = null }, gb: mlx.mlx_array = .{ .ctx = null } };
+
+pub const RecurSeq = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array, prework: Prework = .{} };
 
 pub const MAX_SEQ: c_int = 8;
 var k1s_cache: ?mlx.mlx_fast_metal_kernel = null;
-var seq_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var k1t_cache: ?mlx.mlx_fast_metal_kernel = null;
+var seq_cfgs: [2][MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(@splat(null));
 var seq_cfg_key: ?CfgKey = null;
 
-fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !mlx.mlx_fast_metal_kernel_config {
+fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, tree: bool) !mlx.mlx_fast_metal_kernel_config {
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -463,6 +485,11 @@ fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, st));
+    if (tree) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, g.hk, g.dk }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, g.hv, g.dv }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, g.hv, 2 }, 3, .float32));
+    }
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * SPLIT * NT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, NT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
@@ -470,13 +497,17 @@ fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TL", t_len));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TREE", @intFromBool(tree)));
     return cfg;
 }
 
 /// K1 over t_len tokens (2..MAX_SEQ) with per-step state capture: y as
 /// [1,T,Hv,Dv], the next conv state, the final state and state_seq
 /// ([T,1,Hv,Dv,Dk], row T-1 unwritten). Null outside the kernel's geometry.
-pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?RecurSeq {
+/// `parents` (`treeTable`: `[t_len]` parent rows then `[t_len][4]` conv
+/// sources) runs the rows as a draft tree: every row's state lands in
+/// state_seq; null = a chain.
+pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, parents: ?mlx.mlx_array, s: mlx.mlx_stream) !?RecurSeq {
     if (!mlx.streamIsGpu(s)) return null;
     if (t_len < 1 or t_len > MAX_SEQ) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
@@ -487,39 +518,54 @@ pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?Recu
     const st = mlx.mlx_array_dtype(in.ssm_state);
     if (st != dt and st != .float32) return null;
     if (!inputsFit(g, t_len, in, false)) return null;
-    if (k1s_cache == null) k1s_cache = try makeKernel("msv_gdn_decode_recur_seq", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out", "state_seq" }, K1S_SOURCE, HEADER);
+    const ins = [_][*:0]const u8{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "parents" };
+    if (parents == null and k1s_cache == null) k1s_cache = try makeKernel("msv_gdn_decode_recur_seq", &ins, &.{ "y", "conv_out", "state_out", "state_seq" }, K1S_SOURCE, HEADER);
+    if (parents != null and k1t_cache == null) k1t_cache = try makeKernel("msv_gdn_decode_recur_tree", &ins, &.{ "y", "conv_out", "state_out", "state_seq", "pk", "pv", "pg" }, K1T_SOURCE, HEADER);
     const key = CfgKey{ .g = g, .dt = dt, .st = st };
     if (seq_cfg_key == null or !std.meta.eql(seq_cfg_key.?, key)) {
-        for (&seq_cfgs) |*slot| if (slot.*) |c| {
+        for (&seq_cfgs) |*row| for (row) |*slot| if (slot.*) |c| {
             _ = mlx.mlx_fast_metal_kernel_config_free(c);
             slot.* = null;
         };
         seq_cfg_key = key;
     }
     const idx: usize = @intCast(t_len);
-    if (seq_cfgs[idx] == null) seq_cfgs[idx] = try buildSeqConfig(g, t_len, dt, st);
+    const ti: usize = @intFromBool(parents != null);
+    if (seq_cfgs[ti][idx] == null) seq_cfgs[ti][idx] = try buildSeqConfig(g, t_len, dt, st, parents != null);
 
-    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale };
+    const no_tree: i32 = -1;
+    const dummy = mlx.mlx_array_new_data(&no_tree, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(dummy);
+    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, parents orelse dummy };
     const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
     defer _ = mlx.mlx_vector_array_free(v1);
     var o1 = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o1);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1s_cache.?, v1, seq_cfgs[idx].?, s));
-    var out: [4]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
-    errdefer for (out) |a| {
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, if (parents != null) k1t_cache.? else k1s_cache.?, v1, seq_cfgs[ti][idx].?, s));
+    var out: [7]mlx.mlx_array = @splat(.{ .ctx = null });
+    errdefer for (out) |a| if (a.ctx != null) {
         _ = mlx.mlx_array_free(a);
     };
-    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
-    return .{ .y = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3] };
+    const n_out: usize = if (parents != null) 7 else 4;
+    for (out[0..n_out], 0..) |*a, i| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
+    }
+    return .{ .y = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3], .prework = .{ .k = out[4], .v = out[5], .gb = out[6] } };
 }
 
-/// The fold's tree table for rows with `parents` (-1 = the root): the parents,
-/// then each row's four conv-input sources oldest first (< 3 a conv-state row,
-/// else 3 + a window row), resolved on the host once instead of per channel.
+/// `recurSeq`'s tree table for rows with `parents` (-1 = the root): the parents,
+/// each row's four conv-input sources oldest first (< 3 a conv-state row, else
+/// 3 + a window row), resolved on the host once instead of per channel, then
+/// which rows a later node restarts from.
 pub fn treeTable(parents: []const i32, out: []i32) void {
     const n = parents.len;
-    std.debug.assert(out.len == 5 * n);
+    std.debug.assert(out.len == 6 * n);
     @memcpy(out[0..n], parents);
+    @memset(out[5 * n ..], 0);
+    for (parents, 0..) |p, t| {
+        if (p >= 0 and p != @as(i32, @intCast(t)) - 1) out[5 * n + @as(usize, @intCast(p))] = 1;
+    }
     for (0..n) |t| {
         var depth: i32 = 0;
         var r: i32 = @intCast(t);
@@ -540,118 +586,52 @@ pub fn treeTable(parents: []const i32, out: []i32) void {
 }
 
 test "treeTable: a chain reads t + tap, a branch reads its own ancestors" {
-    var out: [5 * 4]i32 = undefined;
+    var out: [6 * 4]i32 = undefined;
     treeTable(&.{ -1, 0, 1, 2 }, &out);
     for (0..4) |t| for (0..4) |tap| try std.testing.expectEqual(@as(i32, @intCast(t + tap)), out[4 + t * 4 + tap]);
-    var tree: [5 * 3]i32 = undefined;
+    var tree: [6 * 3]i32 = undefined;
     treeTable(&.{ -1, 0, 0 }, &tree);
     // row 2 (depth 1, parent 0): conv rows 1, 2, then window rows 0 and 2.
     try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 5 }, tree[3 + 8 .. 3 + 12]);
 }
 
-pub const RecurSeqFold = struct { gated: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array, conv_input: mlx.mlx_array };
+var k1r_cache: ?mlx.mlx_fast_metal_kernel = null;
+var replay_cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
+var replay_key: ?CfgKey = null;
 
-const FOLD_NT: c_int = 1024; // one threadgroup per head, 4 dv rows per simdgroup
-pub var fold_nt_override: ?c_int = null; // test seam: 2048 exceeds every GPU's limit
-fn foldNt() c_int {
-    return fold_nt_override orelse FOLD_NT;
-}
-var k1f_cache: ?mlx.mlx_fast_metal_kernel = null;
-var fold_cfgs: [2][MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(@splat(null));
-// Whether this GPU's pipeline runs each width's 1024-thread fold; null = not dispatched yet.
-var fold_ok: [MAX_SEQ + 1]?bool = @splat(null);
-const FoldKey = struct { k: CfgKey, swish: bool, nt: c_int };
-
-/// Did this GPU's pipeline refuse the fold at width `t_len`?
-pub fn foldDeclined(t_len: c_int) bool {
-    if (t_len < 0 or t_len > MAX_SEQ) return false;
-    return fold_ok[@intCast(t_len)] == false;
-}
-var fold_cfg_key: ?FoldKey = null;
-
-fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, swish: bool, tree: bool) !mlx.mlx_fast_metal_kernel_config {
-    const c = 2 * g.hk * g.dk + g.hv * g.dv;
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, t_len, g.hv * g.dv }, 3, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, st));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3 + t_len, c }, 3, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * foldNt(), 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, foldNt(), 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
-    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", foldNt() }, .{ "SPLIT", @as(c_int, 1) }, .{ "TL", t_len } }) |kv|
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SWISH", @intFromBool(swish)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TREE", @intFromBool(tree)));
-    return cfg;
-}
-
-/// recurSeq with the norm-gate and the rollback conv-input concat folded in:
-/// gated [1,T,Hv*Dv] (rms_norm(y) * gate(z), swish or sigmoid), the next conv
-/// state, the final state, state_seq (row T-1 unwritten) and conv_input
-/// [1,3+T,C]. Bit-identical to recurSeq -> gdnNormGateFused -> concat. Null
-/// outside the kernel's geometry or dtypes (caller keeps the unfolded path).
-/// `parents` (`treeTable`: `[t_len]` parent rows then `[t_len][4]` conv
-/// sources) runs the rows as a draft tree: every row's state lands in
-/// state_seq; null = a chain.
-pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, parents: ?mlx.mlx_array, s: mlx.mlx_stream) !?RecurSeqFold {
-    if (!mlx.streamIsGpu(s)) return null;
-    if (t_len < 1 or t_len > MAX_SEQ) return null;
+/// The state after the window rows `path` (oldest first), recurred from
+/// `state_in` with a tree round's `prework`: the state serial decoding holds
+/// there. Null outside the kernel's geometry.
+pub fn replay(g: Geometry, state_in: mlx.mlx_array, pw: Prework, path: []const i32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s) or pw.k.ctx == null or path.len == 0) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
-    const dt = mlx.mlx_array_dtype(in.qkv);
-    if (dt != .bfloat16 and dt != .float16) return null;
-    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w }) |arr|
-        if (mlx.mlx_array_dtype(arr) != dt) return null;
-    if (mlx.mlx_array_dtype(in.eps) != .float32) return null;
-    const st = mlx.mlx_array_dtype(in.ssm_state);
-    if (st != dt and st != .float32) return null;
-    if (!inputsFit(g, t_len, in, true)) return null;
-    if (k1f_cache == null) k1f_cache = try makeKernel("msv_gdn_decode_recur_seq_fold", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps", "parents" }, &.{ "gated", "conv_out", "state_out", "state_seq", "conv_in" }, K1S_FOLD_SOURCE, TREE_HEADER);
-    const tree = parents != null;
-    const key = FoldKey{ .k = .{ .g = g, .dt = dt, .st = st }, .swish = swish, .nt = foldNt() };
-    if (fold_cfg_key == null or !std.meta.eql(fold_cfg_key.?, key)) {
-        for (&fold_cfgs) |*row| for (row) |*slot| if (slot.*) |c| {
-            _ = mlx.mlx_fast_metal_kernel_config_free(c);
-            slot.* = null;
-        };
-        fold_ok = @splat(null);
-        fold_cfg_key = key;
+    const st = mlx.mlx_array_dtype(state_in);
+    if (k1r_cache == null) k1r_cache = try makeKernel("msv_gdn_decode_replay", &.{ "state_in", "pk", "pv", "pg", "path", "n_path" }, &.{"state_out"}, K1R_SOURCE, HEADER);
+    const key = CfgKey{ .g = g, .dt = st, .st = st };
+    if (replay_key == null or !std.meta.eql(replay_key.?, key)) {
+        if (replay_cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(replay_cfg);
+        replay_cfg = mlx.mlx_fast_metal_kernel_config_new();
+        replay_key = null;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(replay_cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(replay_cfg, g.hv * SPLIT * NT, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(replay_cfg, NT, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(replay_cfg, "StT", st));
+        inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(replay_cfg, kv[0], kv[1]));
+        replay_key = key;
     }
-    const idx: usize = @intCast(t_len);
-    if (fold_ok[idx] == false) return null;
-    const ti: usize = @intFromBool(tree);
-    if (fold_cfgs[ti][idx] == null) fold_cfgs[ti][idx] = try buildFoldConfig(g, t_len, dt, st, swish, tree);
-
-    const no_tree: i32 = -1;
-    const dummy = mlx.mlx_array_new_data(&no_tree, &[_]c_int{1}, 1, .int32);
-    defer _ = mlx.mlx_array_free(dummy);
-    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w, in.eps, parents orelse dummy };
-    const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
-    defer _ = mlx.mlx_vector_array_free(v1);
-    var o1 = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(o1);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1f_cache.?, v1, fold_cfgs[ti][idx].?, s));
-    var out: [5]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
-    errdefer for (out) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
-    // A pipeline's thread limit is per GPU and known only once MLX builds it (896 for this
-    // kernel on some GPUs). The first dispatch per width evaluates here; a refusal is taken
-    // off the latch and the caller keeps the unfolded chain. Any other error stays latched.
-    if (fold_ok[idx] == null and !mlx.errorPending()) {
-        _ = mlx.mlx_eval(o1);
-        if (mlx.takeErrorIf("maximum allowed threads per threadgroup")) {
-            fold_ok[idx] = false;
-            log.info("[gdn-fold] declined at T={d}: this GPU's pipeline runs fewer than {d} threads per threadgroup\n", .{ t_len, foldNt() });
-            for (out) |a| _ = mlx.mlx_array_free(a);
-            return null;
-        }
-        // Only a clean eval says the pipeline runs; any other error stays latched and decides nothing.
-        if (!mlx.errorPending()) fold_ok[idx] = true;
-    }
-    return .{ .gated = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3], .conv_input = out[4] };
+    const path_arr = mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(path_arr);
+    const n: i32 = @intCast(path.len);
+    const n_arr = mlx.mlx_array_new_data(&n, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(n_arr);
+    const ins = [_]mlx.mlx_array{ state_in, pw.k, pw.v, pw.gb, path_arr, n_arr };
+    const v = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    var o = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, k1r_cache.?, v, replay_cfg, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, o, 0));
+    return out;
 }

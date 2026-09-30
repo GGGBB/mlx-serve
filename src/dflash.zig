@@ -35,6 +35,7 @@ const transformer_mod = @import("transformer.zig");
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
 const mtp_mod = @import("mtp.zig");
+const simd_qmm = @import("simd_qmm.zig");
 const ane_mod = @import("ane.zig");
 
 const Weights = model_mod.Weights;
@@ -509,6 +510,15 @@ pub const DflashLinear = struct {
         if (!self.isQuantized()) {
             try mlx.check(mlx.mlx_matmul(&out, x, self.w, s));
             return out;
+        }
+        // Up to 16 rows (a draft block, a round's kept captures) the row kernel
+        // reads each weight once for every row; drafts need speed, not bits.
+        // Measured on M4 only: NAX GPUs keep MLX's matmul.
+        if (!transformer_mod.naxAvailable()) {
+            if (try simd_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s)) |y| {
+                _ = mlx.mlx_array_free(out);
+                return y;
+            }
         }
         try mlx.check(mlx.mlx_quantized_matmul(
             &out,

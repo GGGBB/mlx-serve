@@ -5322,13 +5322,14 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     if (commitDeclinesPadOnly(n_gen, slot.was_pad_only)) return;
 
     // Construct the full token sequence: the original prompt + everything
-    // generated this turn. The cache reflects exactly this state — Generator
-    // forwarded each emitted token into slot.cache as it was sampled.
-    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+    // generated this turn that the cache holds — Generator forwarded each
+    // emitted token into slot.cache as it was sampled, except an
+    // `unforwarded_tail` the key must not claim.
+    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len - gen_ptr.unforwarded_tail;
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
-    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
+    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items[0 .. total_len - slot.full_prompt.len]);
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-

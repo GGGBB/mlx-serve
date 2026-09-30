@@ -1462,6 +1462,9 @@ pub const Generator = struct {
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
     dflash_attempted: u64 = 0,
+    /// Emitted tokens past the KV cache: the last one, when the budget ended on
+    /// a token the previous verify already decided. Commits key on the rest.
+    unforwarded_tail: u32 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
@@ -4943,6 +4946,19 @@ pub const Generator = struct {
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
     /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        // The budget's last token is the previous verify's: emit it without a round.
+        if (!self.done and !self.spec_disabled_runtime and self.max_tokens -| self.completion_tokens == 1) {
+            if (try self.checkStop()) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            errdefer allocator.free(tokens);
+            tokens[0] = self.next_token_id;
+            try self.generated_ids.append(allocator, tokens[0]);
+            self.advanceStep(1);
+            self.unforwarded_tail = 1;
+            self.done = true;
+            self.finish_reason = "length";
+            return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+        }
         // The kv term is the same physics for either block decoder (one
         // forward, one KV read, shared across the block's rows), so a DFlash
         // round is an observation for it too — and on a DFlash-only server
@@ -5553,6 +5569,8 @@ pub const Generator = struct {
         const xfm = self.xfm;
         const s = xfm.s;
         const MAX_W = 16;
+        const tracing = dflashTraceEnabled();
+        var ph = io_util.Stopwatch.init(self.timer.io);
         var lat = try dflash_mod.lattice(allocator, &model.selector.?, model.config.selector_top_k, blk_hidden, draft_logits, t1, s);
         defer lat.deinit(allocator);
         // A sampled target's scores carry its own noise at each position's candidates.
@@ -5564,6 +5582,10 @@ pub const Generator = struct {
             .noise = noise,
         });
         defer tree.deinit(allocator);
+        if (tracing) {
+            self.dflash_trace.add(.head, ph.read());
+            ph.reset();
+        }
         if (!dflash_tree_logged) {
             dflash_tree_logged = true;
             log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{@min(m, MAX_W - 1)});
@@ -5595,9 +5617,9 @@ pub const Generator = struct {
             }
         }
         const wc: c_int = @intCast(w);
-        var table: [5 * MAX_W]i32 = undefined;
-        gdn_decode.treeTable(parents[0..w], table[0 .. 5 * w]);
-        const par_arr = mlx.mlx_array_new_data(&table, &[_]c_int{5 * wc}, 1, .int32);
+        var table: [6 * MAX_W]i32 = undefined;
+        gdn_decode.treeTable(parents[0..w], table[0 .. 6 * w]);
+        const par_arr = mlx.mlx_array_new_data(&table, &[_]c_int{6 * wc}, 1, .int32);
         defer _ = mlx.mlx_array_free(par_arr);
         const dep_arr = mlx.mlx_array_new_data(&depth, &[_]c_int{wc}, 1, .int32);
         defer _ = mlx.mlx_array_free(dep_arr);
@@ -5639,6 +5661,10 @@ pub const Generator = struct {
         defer targets.deinit();
         try mlx.check(mlx.mlx_array_eval(targets.lazy()));
         const ids = try targets.ids(w);
+        if (tracing) {
+            self.dflash_trace.add(.verify, ph.read());
+            ph.reset();
+        }
 
         // Walk the target's tokens down the tree.
         var path_rows: [MAX_W]u32 = undefined;
@@ -5676,10 +5702,16 @@ pub const Generator = struct {
                 const dd: i32 = @as(i32, @intCast(accepted)) - 2 + @as(i32, @intCast(i));
                 conv_rows[i] = if (dd < 0) dd + 3 else 3 + @as(i32, @intCast(path_rows[@intCast(dd)]));
             }
-            for (entries) |*entry| try transformer_mod.ssmCommitTreePath(entry, path_rows[accepted], conv_rows, s);
+            var kept: [MAX_W]i32 = undefined;
+            for (path_rows[0..n_commit], kept[0..n_commit]) |r, *k| k.* = @intCast(r);
+            for (entries) |*entry| try transformer_mod.ssmCommitTreePath(entry, kept[0..n_commit], conv_rows, s);
         }
         self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
         if (accepted + 1 < w) self.partial_rounds += 1;
+        if (tracing) {
+            self.dflash_trace.add(.accept, ph.read());
+            ph.reset();
+        }
 
         // The assistant context grows by the kept rows' captures.
         {
@@ -5702,7 +5734,12 @@ pub const Generator = struct {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             dctx.appendEvalArrays(eval_vec);
-            try mlx.check(mlx.mlx_async_eval(eval_vec));
+            if (tracing) {
+                try mlx.check(mlx.mlx_eval(eval_vec));
+                self.dflash_trace.add(.append, ph.read());
+            } else {
+                try mlx.check(mlx.mlx_async_eval(eval_vec));
+            }
         }
 
         const tokens = try allocator.alloc(u32, n_commit);
@@ -5715,6 +5752,10 @@ pub const Generator = struct {
         if (self.completion_tokens >= self.max_tokens) {
             self.done = true;
             self.finish_reason = "length";
+        }
+        if (tracing) {
+            self.dflashTraceRoundEnd(accepted);
+            self.dflash_gap_watch = io_util.Stopwatch.init(self.timer.io);
         }
         return DrafterStepResult{ .tokens = tokens, .accepted_tokens = accepted };
     }
@@ -18934,6 +18975,8 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         defer got.deinit(allocator);
         while (true) {
             const attempts_before = gen.dflash_attempted;
+            // The budget's last token is the previous verify's: it leaves without a round.
+            const last = gen.max_tokens -| gen.completion_tokens == 1;
             const res = (try gen.nextDflash(allocator)) orelse break;
             defer allocator.free(res.tokens);
             try got.appendSlice(allocator, res.tokens);
@@ -18941,8 +18984,8 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
             // same exact boundary at every accepted count. Falling back here
             // would make the remaining equality checks compare serial decode
             // with itself and gut the default-on draft-quantization guard.
-            try testing.expect(gen.dflash_attempted != attempts_before);
-            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
+            try testing.expect(last or gen.dflash_attempted != attempts_before);
+            try testing.expectEqual(prompt.len + gen.generated_ids.items.len - gen.unforwarded_tail, gen.ctx.cache.step);
             try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
         }
         try testing.expect(gen.dflash_attempted > 0);
@@ -18982,11 +19025,13 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         defer got.deinit(allocator);
         while (true) {
             const attempts_before = gen.dflash_attempted;
+            // The budget's last token is the previous verify's: it leaves without a round.
+            const last = gen.max_tokens -| gen.completion_tokens == 1;
             const res = (try gen.nextDflash(allocator)) orelse break;
             defer allocator.free(res.tokens);
             try got.appendSlice(allocator, res.tokens);
-            try testing.expect(gen.dflash_attempted != attempts_before);
-            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
+            try testing.expect(last or gen.dflash_attempted != attempts_before);
+            try testing.expectEqual(prompt.len + gen.generated_ids.items.len - gen.unforwarded_tail, gen.ctx.cache.step);
             try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
         }
         try testing.expect(gen.dflash_attempted > 0);
