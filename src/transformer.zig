@@ -18055,7 +18055,7 @@ pub const Transformer = struct {
 
     pub fn deinit(self: *Transformer) void {
         self.releaseJoinedVerifyLogits();
-        lane_qmm.release();
+        lane_qmm.release(@intFromPtr(self));
         if (self.ane_prefill) |eng| {
             eng.deinit();
             self.ane_prefill = null;
@@ -19839,6 +19839,48 @@ pub const Transformer = struct {
     /// output_multiplier; both are monotone, so draft argmax is unaffected).
     pub fn lmHeadForDraft(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
         return self.lmHeadProject(x, false);
+    }
+
+    /// Re-orders every trunk projection the lane matmul serves into its tiled
+    /// layout, in the weight's own buffer (no copy stays resident): the exact
+    /// path reads them there at every width, the prompt path through the same
+    /// layout. The lm_head and embeddings keep MLX's layout (other readers).
+    pub fn tileLaneWeights(self: *Transformer) !u64 {
+        if (!naxAvailable() or !self.config.rowExactDecode() or self.rht != null) return 0;
+        const layers = self.moe_layers orelse return 0;
+        try mlx.check(mlx.mlx_synchronize(self.s));
+        const owner = @intFromPtr(self);
+        var bytes: u64 = 0;
+        const Tile = struct {
+            fn rows(own: usize, f: *const FusedRows, parts: []const [3]mlx.mlx_array, str: mlx.mlx_stream) !u64 {
+                if (f.w.ctx != null) return lane_qmm.tileInPlace(own, f.w, f.s, f.b, f.widths[0..f.count], str);
+                var sum: u64 = 0;
+                for (parts) |p| if (p[0].ctx != null) {
+                    sum += try lane_qmm.tileInPlace(own, p[0], p[1], p[2], &.{}, str);
+                };
+                return sum;
+            }
+        };
+        for (layers) |*l| {
+            switch (l.attn) {
+                .full => |*fa| {
+                    bytes += try Tile.rows(owner, &fa.qkv, &.{ .{ fa.q_w, fa.q_s, fa.q_b }, .{ fa.k_w, fa.k_s, fa.k_b }, .{ fa.v_w, fa.v_s, fa.v_b } }, self.s);
+                    bytes += try lane_qmm.tileInPlace(owner, fa.o_w, fa.o_s, fa.o_b, &.{}, self.s);
+                },
+                .linear => |*la| {
+                    if (!la.combined_proj) bytes += try Tile.rows(owner, &la.in, &.{ .{ la.qkv_w, la.qkv_s, la.qkv_b }, .{ la.z_w, la.z_s, la.z_b }, .{ la.a_w, la.a_s, la.a_b }, .{ la.b_w, la.b_s, la.b_b } }, self.s);
+                    bytes += try lane_qmm.tileInPlace(owner, la.out_w, la.out_s, la.out_b, &.{}, self.s);
+                },
+            }
+            switch (l.mlp) {
+                .dense => |*dm| {
+                    bytes += try Tile.rows(owner, &dm.gu, &.{ .{ dm.gate_w, dm.gate_s, dm.gate_b }, .{ dm.up_w, dm.up_s, dm.up_b } }, self.s);
+                    bytes += try lane_qmm.tileInPlace(owner, dm.down_w, dm.down_s, dm.down_b, &.{}, self.s);
+                },
+                .moe => {},
+            }
+        }
+        return bytes;
     }
 
     /// Verify rows can form a draft tree: every per-row piece of this forward
@@ -42334,6 +42376,8 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
     if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, s);
+    // A weight re-ordered in place is read in its tiled layout only.
+    if (try lane_qmm.tiledQmm(x, w, s)) |y| return y;
     // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth
     // Dynamic checkpoints that leave a subset of layers (e.g. linear_attn
     // projections in Qwen3.6 UD) unquantized. The weight is pre-transposed at
