@@ -1320,6 +1320,34 @@ test "every speculative decoder caps accepted drafts before commit" {
 /// built as a single lazy computation graph, async_eval'd together. The GPU
 /// never idles between token generation steps.
 pub const Generator = struct {
+    /// The verify forward's inputs for a draft tree of `parents` (row 0 the root,
+    /// -1) at `depth`: the GDN tree table and each row's ancestor path.
+    pub fn specTreeFor(parents: []const i32, depth: []const i32, max_depth: i32) transformer_mod.SpecTree {
+        const MAX_W = 16;
+        const w = parents.len;
+        const maxd: usize = @intCast(max_depth + 1);
+        var path: [MAX_W * MAX_W]i32 = @splat(0);
+        for (0..w) |r| {
+            var cur: i32 = @intCast(r);
+            var d = depth[r];
+            while (cur >= 0) : (d -= 1) {
+                path[r * maxd + @as(usize, @intCast(d))] = cur;
+                cur = parents[@intCast(cur)];
+            }
+        }
+        const wc: c_int = @intCast(w);
+        var table: [6 * MAX_W]i32 = undefined;
+        gdn_decode.treeTable(parents, table[0 .. 6 * w]);
+        return .{
+            .parents = mlx.mlx_array_new_data(&table, &[_]c_int{6 * wc}, 1, .int32),
+            .attn = .{
+                .depth = mlx.mlx_array_new_data(depth.ptr, &[_]c_int{wc}, 1, .int32),
+                .path = mlx.mlx_array_new_data(&path, &[_]c_int{ wc, @intCast(maxd) }, 2, .int32),
+                .max_depth = max_depth,
+            },
+        };
+    }
+
     const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;
     xfm: *Transformer,
     /// Forward-pass context. Stores per-request KVCache pointer, moe_seq_offset
@@ -5609,26 +5637,9 @@ pub const Generator = struct {
             toks[row] = @intCast(tok);
             max_depth = @max(max_depth, depth[row]);
         }
-        const maxd: usize = @intCast(max_depth + 1);
-        var path: [MAX_W * MAX_W]i32 = @splat(0);
-        for (0..w) |r| {
-            var cur: i32 = @intCast(r);
-            var d = depth[r];
-            while (cur >= 0) : (d -= 1) {
-                path[r * maxd + @as(usize, @intCast(d))] = cur;
-                cur = parents[@intCast(cur)];
-            }
-        }
+        const spec_tree = Generator.specTreeFor(parents[0..w], depth[0..w], max_depth);
+        defer spec_tree.deinit();
         const wc: c_int = @intCast(w);
-        var table: [6 * MAX_W]i32 = undefined;
-        gdn_decode.treeTable(parents[0..w], table[0 .. 6 * w]);
-        const par_arr = mlx.mlx_array_new_data(&table, &[_]c_int{6 * wc}, 1, .int32);
-        defer _ = mlx.mlx_array_free(par_arr);
-        const dep_arr = mlx.mlx_array_new_data(&depth, &[_]c_int{wc}, 1, .int32);
-        defer _ = mlx.mlx_array_free(dep_arr);
-        const path_arr = mlx.mlx_array_new_data(&path, &[_]c_int{ wc, @intCast(maxd) }, 2, .int32);
-        defer _ = mlx.mlx_array_free(path_arr);
-        const spec_tree = transformer_mod.SpecTree{ .parents = par_arr, .attn = .{ .depth = dep_arr, .path = path_arr, .max_depth = max_depth } };
         const verify_input = mlx.mlx_array_new_data(&toks, &[_]c_int{ 1, wc }, 2, .int32);
         defer _ = mlx.mlx_array_free(verify_input);
 

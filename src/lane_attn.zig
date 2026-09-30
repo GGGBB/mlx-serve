@@ -518,13 +518,14 @@ test "lane_attn: every window row equals the one-row step at its position, and m
     if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     // Qwen3.8-27B: 24 query heads over 4 kv heads, head dim 256; cache views
-    // longer than the keys. A short prefix (one partial tile) and one past two
-    // chunks that ends mid-tile.
+    // longer than the keys. A short prefix (one partial tile), one where the
+    // later rows' steps take a tile the window's TAIL runs into PARTIAL, and one
+    // past two chunks that ends mid-tile.
     const H: c_int = 24;
     const HKV: c_int = 4;
     const D: c_int = 256;
     const CAP: c_int = 1536;
-    for ([_]c_int{ 40, 300, 1100 }) |L| {
+    for ([_]c_int{ 40, 300, 330, 1100 }) |L| {
         const W: c_int = 16;
         const q = try randBf16(&.{ 1, H, W, D }, 1, s);
         defer _ = mlx.mlx_array_free(q);

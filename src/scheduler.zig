@@ -4061,6 +4061,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
             }
             ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            // MLX_SERVE_DECODE_FWD_UBENCH_TREE=1 at 16 rows: verify a fixed draft
+            // tree (a 9-row trunk, siblings at depths 1-4, their children), as a round does.
+            const tree_parents = [16]i32{ -1, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 9, 10, 11 };
+            var tree_depth: [16]i32 = undefined;
+            for (tree_parents, 0..) |p, i| tree_depth[i] = if (p < 0) 0 else tree_depth[@intCast(p)] + 1;
+            const spec_tree = generate_mod.Generator.specTreeFor(&tree_parents, &tree_depth, 8);
+            defer spec_tree.deinit();
+            if (rows == 16 and std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_TREE") != null) ctx.tree = &spec_tree;
             // Prefill widths: every forward starts from an empty cache (else each
             // one attends over the previous ones' rows) and skips the lm_head,
             // which a real intermediate chunk never evaluates.
