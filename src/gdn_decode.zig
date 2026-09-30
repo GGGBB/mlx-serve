@@ -504,7 +504,9 @@ pub const Prework = struct { k: mlx.mlx_array = .{ .ctx = null }, v: mlx.mlx_arr
 
 pub const RecurSeq = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array, prework: Prework = .{} };
 
-pub const MAX_SEQ: c_int = 8;
+pub const MAX_SEQ: c_int = 16;
+/// The fold keeps a head's y rows in threadgroup memory beside K1S's q/k/v rows; past 8 they pass 32 KB.
+pub const FOLD_MAX_SEQ: c_int = 8;
 var k1s_cache: ?mlx.mlx_fast_metal_kernel = null;
 var k1t_cache: ?mlx.mlx_fast_metal_kernel = null;
 var seq_cfgs: [2][MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(@splat(null));
@@ -677,14 +679,14 @@ fn foldNt() c_int {
     return fold_nt_override orelse FOLD_NT;
 }
 var k1f_cache: ?mlx.mlx_fast_metal_kernel = null;
-var fold_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var fold_cfgs: [FOLD_MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 // Whether this GPU's pipeline runs each width's 1024-thread fold; null = not dispatched yet.
-var fold_ok: [MAX_SEQ + 1]?bool = @splat(null);
+var fold_ok: [FOLD_MAX_SEQ + 1]?bool = @splat(null);
 const FoldKey = struct { k: CfgKey, swish: bool, nt: c_int };
 
 /// Did this GPU's pipeline refuse the fold at width `t_len`?
 pub fn foldDeclined(t_len: c_int) bool {
-    if (t_len < 0 or t_len > MAX_SEQ) return false;
+    if (t_len < 0 or t_len > FOLD_MAX_SEQ) return false;
     return fold_ok[@intCast(t_len)] == false;
 }
 var fold_cfg_key: ?FoldKey = null;
@@ -717,7 +719,7 @@ fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dty
 /// unfolded path). Draft trees take `recurSeq` with parents and `replay`.
 pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.mlx_stream) !?RecurSeqFold {
     if (!mlx.streamIsGpu(s)) return null;
-    if (t_len < 1 or t_len > MAX_SEQ) return null;
+    if (t_len < 1 or t_len > FOLD_MAX_SEQ) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
     const dt = mlx.mlx_array_dtype(in.qkv);
     if (dt != .bfloat16 and dt != .float16) return null;

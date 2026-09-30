@@ -5576,8 +5576,11 @@ pub const Generator = struct {
         // A sampled target's scores carry its own noise at each position's candidates.
         const noise: ?[]f32 = if (serial) try self.treeNoise(allocator, &lat) else null;
         defer if (noise) |nz| allocator.free(nz);
+        // On the tensor units a 16-row window costs about what an 8-row one does, so the
+        // tree widens to 15 nodes within the lattice's depth; elsewhere a node per position.
+        const max_nodes: usize = if (transformer_mod.naxAvailable()) MAX_W - 1 else @min(m, MAX_W - 1);
         var tree = try dflash_mod.bestFirstTree(allocator, &lat, .{
-            .max_nodes = @min(m, MAX_W - 1),
+            .max_nodes = max_nodes,
             .temperature = if (serial) self.sampling.temperature else 1.0,
             .noise = noise,
         });
@@ -5588,7 +5591,7 @@ pub const Generator = struct {
         }
         if (!dflash_tree_logged) {
             dflash_tree_logged = true;
-            log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{@min(m, MAX_W - 1)});
+            log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{max_nodes});
         }
 
         // Rows: 0 = t1 (the root), 1 + i = tree node i.

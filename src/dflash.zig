@@ -36,6 +36,7 @@ const transformer_mod = @import("transformer.zig");
 // one requantizer with one chunking discipline is the point.
 const mtp_mod = @import("mtp.zig");
 const simd_qmm = @import("simd_qmm.zig");
+const lane_qmm = @import("lane_qmm.zig");
 const ane_mod = @import("ane.zig");
 
 const Weights = model_mod.Weights;
@@ -373,6 +374,8 @@ pub fn validateTargetLayers(ids: []const u32, trunk_num_layers: u32) !void {
 /// (M5-class) have a real M 8..16 lane and keep the checkpoint's block.
 pub const NO_WIDE_LANE_BLOCK_CAP: u32 = 5;
 pub const TREE_BLOCK_CAP: u32 = 8;
+/// Positions a draft tree's lattice spans on the tensor units.
+pub const TREE_NAX_BLOCK: u32 = 16;
 
 /// A no-wide-lane block cap with the machine row it came from, for the
 /// `DFlash drafter ready` line — a capped block must say WHY in tester logs.
@@ -511,14 +514,16 @@ pub const DflashLinear = struct {
             try mlx.check(mlx.mlx_matmul(&out, x, self.w, s));
             return out;
         }
-        // Up to 16 rows (a draft block, a round's kept captures) the row kernel
-        // reads each weight once for every row; drafts need speed, not bits.
-        // Measured on M4 only: NAX GPUs keep MLX's matmul.
-        if (!transformer_mod.naxAvailable()) {
-            if (try simd_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s)) |y| {
-                _ = mlx.mlx_array_free(out);
-                return y;
-            }
+        // Up to 16 rows (a draft block, a round's kept captures) the row kernels
+        // read each weight once for every row, where MLX's matmul falls off at
+        // 4..16 rows; drafts need speed, not bits.
+        const row = if (transformer_mod.naxAvailable())
+            try lane_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s)
+        else
+            try simd_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s);
+        if (row) |y| {
+            _ = mlx.mlx_array_free(out);
+            return y;
         }
         try mlx.check(mlx.mlx_quantized_matmul(
             &out,

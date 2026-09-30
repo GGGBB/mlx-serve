@@ -13,6 +13,7 @@ const mrope = @import("mrope.zig");
 const rht = @import("rht.zig");
 const qmv2 = @import("qmv2.zig");
 const rowqmv = @import("rowqmv.zig");
+const lane_qmm = @import("lane_qmm.zig");
 const simd_qmm = @import("simd_qmm.zig");
 const row_attn = @import("row_attn.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
@@ -18053,6 +18054,7 @@ pub const Transformer = struct {
 
     pub fn deinit(self: *Transformer) void {
         self.releaseJoinedVerifyLogits();
+        lane_qmm.release();
         if (self.ane_prefill) |eng| {
             eng.deinit();
             self.ane_prefill = null;
@@ -33821,6 +33823,8 @@ fn quantParamsOrDense(cfg: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_arr
 /// whose multi-row MMA reads each weight once. Null outside both.
 fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!std.mem.eql(u8, cfg.model_type, "nemotron_h")) {
+        // The pick follows the weight and the GPU, never the row count: serial and verify rows share a kernel.
+        if (naxAvailable()) if (try lane_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
         if (try simd_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
     }
     return rowqmv.qmv(x, w, sc, bi, bits, group_size, s);
@@ -36771,7 +36775,7 @@ pub fn gdnNormGateFused(
     if (dv != 128) return null;
     const prefill = gdnPrefillFusedFor(seq, batch);
     if (!prefill and !gdnDecodeFusedEnabled()) return null;
-    if (!prefill and (seq < 1 or seq > 9 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
+    if (!prefill and (seq < 1 or seq > GDN_FUSED_MAX_ROWS or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
     const dt = mlx.mlx_array_dtype(y);
     inline for (.{ y, z, norm_w }, 0..) |arr, i| {
         if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(arr) != dt) {
@@ -61402,7 +61406,7 @@ test "gdn_decode.recurSeqFold: bit-identical to recurSeq -> norm-gate -> conv-in
         for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 } }) |dts|
             for ([_]bool{ false, true }) |swish| {
                 var t: c_int = 2;
-                while (t <= gdn_decode.MAX_SEQ) : (t += 1) try gdnDecodeFoldParityCase(s, dts[0], dts[1], geo[0], geo[1], t, swish);
+                while (t <= gdn_decode.FOLD_MAX_SEQ) : (t += 1) try gdnDecodeFoldParityCase(s, dts[0], dts[1], geo[0], geo[1], t, swish);
             };
 }
 
@@ -61979,7 +61983,7 @@ test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and
     const eps_arr = mlx.mlx_array_new_float(eps);
     defer _ = mlx.mlx_array_free(eps_arr);
 
-    for ([_]c_int{ 1, 4, 9, 17, 65, 513, 8703 }) |seq| {
+    for ([_]c_int{ 1, 4, 9, 16, 17, 65, 513, 8703 }) |seq| {
         const y_shape = [_]c_int{ 1, seq, hv, dv };
         const y = try attn256RandBf16Scaled(rnd, &y_shape, 8.0, s);
         defer _ = mlx.mlx_array_free(y);

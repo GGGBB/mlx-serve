@@ -3923,6 +3923,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             );
             if (params.draft_block_size_explicit and params.draft_block_size > sch.drafter_block_size)
                 log.warn("--draft-block-size {d} is past the drafter's trained block; using {d}\n", .{ params.draft_block_size, sch.drafter_block_size });
+            // Trees on the tensor units draft past the drafter's trained block (TensorFold's
+            // tree_block): the lattice reaches depth 15 and a 16-row window costs about an 8-row one.
+            if (!params.draft_block_size_explicit and d.selector != null and xfm_ptr.specTreeSupported() and transformer_mod.naxAvailable())
+                sch.drafter_block_size = dflash_mod.TREE_NAX_BLOCK;
             var cap_note_buf: [96]u8 = undefined;
             const cap_note: []const u8 = if (params.draft_block_size_explicit)
                 ", user-clamped"
