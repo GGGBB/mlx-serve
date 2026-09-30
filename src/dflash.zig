@@ -1414,11 +1414,89 @@ fn buildBlockMask(
 /// block. `base` is per-CHANNEL `[ksize, H]`; `dynamic` is per-GROUP
 /// `[1, L, ksize, groups]`, each coefficient broadcasting over `group_size`
 /// channels. Two separate multiply-adds per tap keep the reference's bf16
-/// rounding order.
+/// rounding order. One kernel on the GPU (`dynConvFused`), the op chain
+/// elsewhere.
 pub fn groupedDynConv(
     hidden: mlx.mlx_array, // [1, L, H]
     dynamic: mlx.mlx_array, // [1, L, ksize, groups]
     base: mlx.mlx_array, // [ksize, H]
+    group_size: u32,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    if (try dynConvFused(hidden, dynamic, base, group_size, s)) |y| return y;
+    return groupedDynConvOps(hidden, dynamic, base, group_size, s);
+}
+
+// Each tap adds base[tap] * x_{t-tap}, then dyn_t[tap] * x_{t-tap}, every
+// product and sum rounded to T as the op chain's elementwise kernels do.
+const DYN_CONV_SOURCE =
+    \\uint i = thread_position_in_grid.x;
+    \\if (i >= uint(L * H)) return;
+    \\const int t = int(i) / H, c = int(i) % H;
+    \\T acc = T(0);
+    \\for (int tap = 0; tap < KS; ++tap) {
+    \\  const T v = t >= tap ? x[(t - tap) * H + c] : T(0);
+    \\  acc = T(float(acc) + float(T(float(base[tap * H + c]) * float(v))));
+    \\  acc = T(float(acc) + float(T(float(dyn[(t * KS + tap) * (H / GS) + c / GS]) * float(v))));
+    \\}
+    \\y[i] = acc;
+;
+var dyn_conv_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const DynConvKey = struct { l: c_int, h: c_int, ks: c_int, gs: c_int, dt: mlx.mlx_dtype };
+var dyn_conv_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var dyn_conv_key: ?DynConvKey = null;
+
+fn dynConvFused(hidden: mlx.mlx_array, dynamic: mlx.mlx_array, base: mlx.mlx_array, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const dt = mlx.mlx_array_dtype(hidden);
+    if (mlx.mlx_array_dtype(dynamic) != dt or mlx.mlx_array_dtype(base) != dt) return null;
+    const hsh = mlx.getShape(hidden);
+    const bsh = mlx.getShape(base);
+    const dsh = mlx.getShape(dynamic);
+    if (hsh.len != 3 or hsh[0] != 1 or bsh.len != 2 or dsh.len != 4) return null;
+    const gs: c_int = @intCast(group_size);
+    const key = DynConvKey{ .l = hsh[1], .h = hsh[2], .ks = bsh[0], .gs = gs, .dt = dt };
+    if (@rem(key.h, gs) != 0 or bsh[1] != key.h or dsh[0] != 1 or dsh[1] != key.l or dsh[2] != key.ks or dsh[3] != @divExact(key.h, gs)) return null;
+    if (dyn_conv_kernel == null) {
+        const ins = [_][*:0]const u8{ "x", "dyn", "base" };
+        const outs = [_][*:0]const u8{"y"};
+        const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_dflash_dyn_conv", in_vec, out_vec, DYN_CONV_SOURCE, "", true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        dyn_conv_kernel = k;
+    }
+    if (dyn_conv_key == null or !std.meta.eql(dyn_conv_key.?, key)) {
+        if (dyn_conv_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        dyn_conv_cfg = null;
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.l, key.h }, 3, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, key.l * key.h, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        inline for (.{ .{ "L", key.l }, .{ "H", key.h }, .{ "KS", key.ks }, .{ "GS", key.gs } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+        dyn_conv_cfg = cfg;
+        dyn_conv_key = key;
+    }
+    const ins = [_]mlx.mlx_array{ hidden, dynamic, base };
+    const vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, dyn_conv_kernel.?, vec, dyn_conv_cfg.?, s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+    return y;
+}
+
+fn groupedDynConvOps(
+    hidden: mlx.mlx_array,
+    dynamic: mlx.mlx_array,
+    base: mlx.mlx_array,
     group_size: u32,
     s: mlx.mlx_stream,
 ) !mlx.mlx_array {
@@ -3265,6 +3343,37 @@ test "dflash2: groupedDynConv matches the closed form on a hand-computed case" {
         want[t * 4 + c] = tap0 + tap1;
     };
     for (got, want) |a, b| try testing.expect(@abs(a - b) < 1e-5);
+}
+
+test "dflash2: the one-kernel dyn conv equals the op chain bit for bit" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const shapes = [_][]const c_int{ &.{ 1, 16, 5120 }, &.{ 1, 16, 2, 320 }, &.{ 2, 5120 } };
+    var in: [3]mlx.mlx_array = undefined;
+    for (&in, shapes, 0..) |*a, sh, i| {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 0xD7C + i));
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_random_normal(&f, sh.ptr, sh.len, .float32, 0.0, 1.0, key, s));
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(a, f, .bfloat16, s));
+    }
+    defer for (in) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const fused = (try dynConvFused(in[0], in[1], in[2], 16, s)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    const ops = try groupedDynConvOps(in[0], in[1], in[2], 16, s);
+    defer _ = mlx.mlx_array_free(ops);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, fused, ops, false, s));
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_eval(eq));
+    try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+    try testing.expect(ok);
 }
 
 test "dflash2: convPrepare taps base_kernel[0], convFinish taps [1], kernels from the INPUT" {
