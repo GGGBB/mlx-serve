@@ -960,7 +960,7 @@ pub const ModelConfig = struct {
     /// The MTP head's hidden input is the trunk's final-normed hidden, not the
     /// residual (Nemotron-H: more drafts kept at depth 1 and 2).
     pub fn mtpReadsFinalNorm(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "nemotron_h");
+        return std.mem.eql(u8, self.model_type, "nemotron_h") or self.isMimo();
     }
 
     /// Vocab rows a spec drafter proposes from (0 = all): Qwen3.8's tokenizer

@@ -5,13 +5,20 @@ Writes a random MiMo checkpoint in the RELEASE's storage format (FP8 e4m3 fused
 QKV in tensor-parallel slabs with rank-local 128x128 tiles, FP8 dense MLP,
 per-expert MXFP4, unfolded attention_value_scale), runs the checkpoint's own
 `modeling_mimo_v2.py` in f32 on the decoded weights, and dumps the logits.
-`tests/convert_mimo_v2.py` then packs the tiny release and the Zig test
-`mimo_v2 fixture` compares our forward against these logits.
+Three MTP heads ride along (`model.mtp.layers.{k}`); the HF reference skips
+them, so they are rendered from its OWN modules composed as SGLang's MiMo-V2
+MTP layer (head k's row p = eh_proj(cat[enorm(embed(x_{p+k+1})), hnorm(h_p)]),
+h_p the trunk's final-normed hidden, a sliding layer with sinks, a dense
+SwiGLU, its own final norm, the shared lm_head) into `mtp_fixture.safetensors`.
+`tests/convert_mimo_v2.py` then packs the tiny release and the Zig tests
+`mimo_v2 fixture` and `mimo mtp heads` compare our forward against these.
 
   venv/bin/python tests/dump_mimo_v2_fixtures.py --ref <dir holding modeling_mimo_v2.py> --out ~/claude-tmp/mimo-tiny
   venv/bin/python tests/convert_mimo_v2.py --src ~/claude-tmp/mimo-tiny/src --dst ~/claude-tmp/mimo-tiny/pack --bits 16
   MIMO_V2_MODEL=~/claude-tmp/mimo-tiny/pack MIMO_V2_FIXTURE=~/claude-tmp/mimo-tiny/fixture.safetensors \\
       zig build test -Dtest-filter="mimo_v2 fixture"
+  MIMO_V2_MODEL=~/claude-tmp/mimo-tiny/pack MIMO_V2_MTP_FIXTURE=~/claude-tmp/mimo-tiny/mtp_fixture.safetensors \\
+      zig build test -Dtest-filter="mimo mtp"
 
 Every expert runs (top-k = all), so a near-tie in expert selection cannot fail
 the comparison; selection itself is exercised by the live model.
@@ -43,7 +50,7 @@ CONFIG = {
     "moe_intermediate_size": 64, "n_group": 1, "n_routed_experts": 8, "n_shared_experts": None,
     "norm_topk_prob": True, "num_attention_heads": 8, "swa_num_attention_heads": 8,
     "num_experts_per_tok": 8, "num_hidden_layers": 4, "num_key_value_heads": 2,
-    "swa_num_key_value_heads": 4, "num_nextn_predict_layers": 0, "partial_rotary_factor": 0.334,
+    "swa_num_key_value_heads": 4, "num_nextn_predict_layers": 3, "partial_rotary_factor": 0.334,
     "rope_parameters": {"partial_rotary_factor": 0.334, "rope_theta": 10000000.0, "rope_type": "default"},
     "rope_theta": 10000000.0, "swa_rope_theta": 10000.0, "routed_scaling_factor": None,
     "scoring_func": "sigmoid", "sliding_window": 8, "sliding_window_size": 8,
@@ -182,11 +189,40 @@ def main():
                 stored[f"{pre}mlp.{p}.weight"], stored[f"{pre}mlp.{p}.weight_scale_inv"] = codes, scale
                 ref[f"{pre}mlp.{p}.weight"] = fp8_decode(codes, scale)
 
+    # MTP heads, sliding geometry, stored like the release's own `model_mtp.safetensors`,
+    # drawn off a forked RNG so the trunk fixture stays the same draw.
+    mtp_stored, mtp_ref = {}, {}
+    rng = torch.random.fork_rng()
+    rng.__enter__()
+    torch.manual_seed(args.seed + 1)
+    for k in range(c["num_nextn_predict_layers"]):
+        pre = f"model.mtp.layers.{k}."
+        for n in ("enorm", "hnorm", "input_layernorm", "pre_mlp_layernorm", "final_layernorm"):
+            t = bf16(1 + rnd(h, std=0.1))
+            mtp_stored[pre + n + ".weight"], mtp_ref[pre + n + ".weight"] = t, t.float()
+        eh = bf16(rnd(h, 2 * h))
+        mtp_stored[pre + "eh_proj.weight"], mtp_ref[pre + "eh_proj.weight"] = eh, eh.float()
+        kvh = c["swa_num_key_value_heads"]
+        codes, scale, dec = encode_qkv(rnd(c["num_attention_heads"] * c["head_dim"], h), rnd(kvh * c["head_dim"], h), rnd(kvh * c["v_head_dim"], h))
+        mtp_stored[pre + "self_attn.qkv_proj.weight"], mtp_stored[pre + "self_attn.qkv_proj.weight_scale_inv"] = codes, scale
+        mtp_ref[pre + "self_attn.qkv_proj.weight"] = dec
+        o = bf16(rnd(h, c["num_attention_heads"] * c["v_head_dim"]))
+        mtp_stored[pre + "self_attn.o_proj.weight"], mtp_ref[pre + "self_attn.o_proj.weight"] = o, o.float()
+        sink = bf16(rnd(c["num_attention_heads"], std=1.0))
+        mtp_stored[pre + "self_attn.attention_sink_bias"], mtp_ref[pre + "self_attn.attention_sink_bias"] = sink, sink.float()
+        for p_, shape in (("gate_proj", (c["intermediate_size"], h)), ("up_proj", (c["intermediate_size"], h)), ("down_proj", (h, c["intermediate_size"]))):
+            codes, scale = fp8_blocks(rnd(*shape))
+            mtp_stored[f"{pre}mlp.{p_}.weight"], mtp_stored[f"{pre}mlp.{p_}.weight_scale_inv"] = codes, scale
+            mtp_ref[f"{pre}mlp.{p_}.weight"] = fp8_decode(codes, scale)
+    rng.__exit__(None, None, None)
+
     src = args.out / "src"
     src.mkdir(parents=True, exist_ok=True)
     shard = "model_pp0_ep0_shard0.safetensors"
     save_file({k: v.contiguous() for k, v in stored.items()}, str(src / shard))
-    (src / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: shard for k in stored}}, indent=1))
+    save_file({k: v.contiguous() for k, v in mtp_stored.items()}, str(src / "model_mtp.safetensors"))
+    wmap = {**{k: shard for k in stored}, **{k: "model_mtp.safetensors" for k in mtp_stored}}
+    (src / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wmap}, indent=1))
     (src / "config.json").write_text(json.dumps(c, indent=1))
 
     cfg = MiMoV2Config(**{k: v for k, v in c.items() if k != "quantization_config"})
@@ -196,16 +232,17 @@ def main():
     missing = [m for m in missing if "rotary_emb" not in m]
     assert not missing and not unexpected, (missing, unexpected)
 
-    def ref_logits(x):
+    def masks(n):
         # Explicit masks (the reference takes a per-layer-type dict): causal, and
         # transformers' sliding definition, a query and the window-1 keys before it.
-        n = x.shape[1]
         q, kv = torch.arange(n)[:, None], torch.arange(n)[None, :]
         neg = torch.tensor(float("-inf"))
         full_mask = torch.where(kv <= q, 0.0, neg)[None, None]
         swa_mask = torch.where((kv <= q) & (kv > q - c["sliding_window"]), 0.0, neg)[None, None]
-        masks = {"full_attention": full_mask, "sliding_window_attention": swa_mask}
-        return model(x, attention_mask=masks, use_cache=False).logits[0]
+        return {"full_attention": full_mask, "sliding_window_attention": swa_mask}
+
+    def ref_logits(x):
+        return model(x, attention_mask=masks(x.shape[1]), use_cache=False).logits[0]
 
     T = 40
     ids = torch.randint(2, c["vocab_size"], (1, T))
@@ -213,7 +250,40 @@ def main():
         full = ref_logits(ids)
     fixture = {"input_ids": ids[0].to(torch.int32), "logits_full": full.float()}
     save_file({k: v.contiguous() for k, v in fixture.items()}, str(args.out / "fixture.safetensors"))
-    print(f"wrote {src} and {args.out / 'fixture.safetensors'} (T={T})")
+
+    import mimo_ref.modeling_mimo_v2 as mm
+    heads = []
+    for k in range(c["num_nextn_predict_layers"]):
+        hd = torch.nn.Module()
+        for n in ("enorm", "hnorm", "input_layernorm", "pre_mlp_layernorm", "final_layernorm"):
+            setattr(hd, n, mm.MiMoV2RMSNorm(h, eps=c["layernorm_epsilon"]))
+        hd.eh_proj = torch.nn.Linear(2 * h, h, bias=False)
+        hd.self_attn = mm.MiMoV2Attention(cfg, True, 0, projection_layout="fused_qkv")
+        hd.mlp = mm.MiMoV2MLP(cfg)
+        hd = hd.float().eval()
+        pre = f"model.mtp.layers.{k}."
+        missing, unexpected = hd.load_state_dict({n[len(pre):]: v for n, v in mtp_ref.items() if n.startswith(pre)}, strict=True)
+        heads.append(hd)
+    TM = 64
+    mids = torch.randint(2, c["vocab_size"], (1, TM))
+    mtp_fx = {"input_ids": mids[0].to(torch.int32)}
+    with torch.no_grad():
+        target = model.model(mids, attention_mask=masks(TM), use_cache=False).last_hidden_state
+        mtp_fx["target_hidden"] = target[0].float()
+        for k, hd in enumerate(heads):
+            rows = TM - 1 - k
+            emb = model.model.embed_tokens(mids[:, k + 1:k + 1 + rows])
+            x = hd.eh_proj(torch.cat([hd.enorm(emb), hd.hnorm(target[:, :rows])], dim=-1))
+            pos = torch.arange(rows)[None]
+            attn, _ = hd.self_attn(hidden_states=hd.input_layernorm(x), position_embeddings=model.model.swa_rotary_emb(x, pos),
+                                   attention_mask=masks(rows)["sliding_window_attention"], position_ids=pos)
+            x = x + attn
+            x = x + hd.mlp(hd.pre_mlp_layernorm(x))
+            out = hd.final_layernorm(x)
+            mtp_fx[f"mtp{k}_out"] = out[0].float()
+            mtp_fx[f"mtp{k}_logits"] = model.lm_head(out)[0].float()
+    save_file({k: v.contiguous() for k, v in mtp_fx.items()}, str(args.out / "mtp_fixture.safetensors"))
+    print(f"wrote {src}, {args.out / 'fixture.safetensors'} (T={T}) and {args.out / 'mtp_fixture.safetensors'} (T={TM})")
 
 
 if __name__ == "__main__":

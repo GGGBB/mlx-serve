@@ -7,9 +7,11 @@
 #   [1] short answer, thinking off  [5] needle past the 128-token window and a prefill chunk
 #   [2] thinking on by default      [6] prefix reuse: cached tokens, same answer
 #   [3] parallel tool calls         [7] streaming carries no think/tool markup
+#   [8] the checkpoint's MTP heads draft (spec-stats mode=mtp)
 #
 # Hermetic counterparts: the config-parse tests in model.zig, the generic-role-header
-# render test in chat.zig and the `mimo_v2 fixture` parity test in transformer.zig.
+# render test in chat.zig, the `mimo_v2 fixture` parity test in transformer.zig and the
+# `mimo mtp heads` oracle in mimo_mtp.zig.
 
 set -euo pipefail
 
@@ -97,6 +99,9 @@ print("REASONING:" + "".join(r)); print("CONTENT:" + "".join(c))')
 check "[7] streamed answer carries 12" "$S" "12"
 check_absent "[7] no think tags streamed" "$S" "<think"
 check_absent "[7] no tool markup streamed" "$S" "<tool_call"
+
+check "[8] MTP heads loaded" "$(cat "$LOG")" "MiMo MTP heads ready (3 heads"
+check "[8] MTP drafted" "$(cat "$LOG")" "[spec-stats] mode=mtp"
 
 check_absent "[log] no MLX error" "$(cat "$LOG")" "[mlx]"
 echo
