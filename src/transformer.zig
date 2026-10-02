@@ -2278,7 +2278,7 @@ fn runVerifyQmmNax(
 // contiguous — guaranteed for slices along T). Kill switch:
 // MLX_SERVE_FUSED_256=0 restores the composed path AND the old guard
 // budgeting (one shared predicate, so guards and dispatch cannot drift).
-const ATTN256_KERNEL_HEADER =
+pub const ATTN256_KERNEL_HEADER =
     \\#include <metal_simdgroup_matrix>
     \\
     \\// Fragment layout mirrors MLX steel BaseMMAFrag<float,8,8>: each thread
@@ -7700,6 +7700,7 @@ fn totalMemBytes() u64 {
 const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
+const dec_attn = @import("dec_attn.zig");
 const Weights = model_mod.Weights;
 
 // ── KV Cache (standard attention) ──
@@ -28383,6 +28384,8 @@ pub const Transformer = struct {
         const sinks: ?mlx.mlx_array = if (fa.sinks.ctx != null) fa.sinks else null;
         const fused: ?mlx.mlx_array = if (is_prefill and seq_len >= FUSED256_MIN_Q_LEN)
             try fusedSinkAttnPrefill(self.s, q_rope, full_k, full_v, attn_scale, if (is_full) 0 else @intCast(cfg.sliding_window), sinks)
+        else if (is_full and sinks == null)
+            try dec_attn.attention(self.s, q_rope, full_k, full_v, attn_scale)
         else
             null;
         if (fused) |f| {
