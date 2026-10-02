@@ -298,6 +298,9 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// gate, `mtpBatchedAcceptGraph`, the pre-draft and the horizon valve all work
 /// in tokens and probabilities — so the split is exactly these five operations
 /// and nothing else.
+/// Most drafts one MTP round verifies: the head chain or a prompt-lookup run.
+const MAX_ROUND_DRAFTS: usize = @max(mtp_mod.MAX_DEPTH, mtp_lookup.MAX_DRAFT_STRONG);
+
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
     /// qwen4_exp: the head and its history live on the Transformer
@@ -5971,7 +5974,7 @@ pub const Generator = struct {
         /// `[n]` int32 committed token ids: `[t1, drafts[0..accepted]]`.
         ids: mlx.mlx_array,
         /// `ids` on the host.
-        host_ids: [mtp_mod.MAX_DEPTH + 1]u32 = undefined,
+        host_ids: [MAX_ROUND_DRAFTS + 1]u32 = undefined,
         /// `[1, n, H]` trunk hiddens paired 1:1 with `ids` (a lazy concat of
         /// last_hidden + a verify-capture slice — the handle pins the ~90 KB
         /// parent until consumed, deliberately NOT a deep copy).
@@ -6653,7 +6656,7 @@ pub const Generator = struct {
                     _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                     try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                 }
-                var merged_host: [mtp_mod.MAX_DEPTH + 2]u32 = undefined;
+                var merged_host: [MAX_ROUND_DRAFTS + 2]u32 = undefined;
                 @memcpy(merged_host[0..st.n], st.host_ids[0..st.n]);
                 merged_host[st.n] = chain.t1;
                 break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx, merged_host[0 .. st.n + 1]);

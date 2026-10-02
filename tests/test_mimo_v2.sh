@@ -8,6 +8,7 @@
 #   [2] thinking on by default      [6] prefix reuse: cached tokens, same answer
 #   [3] parallel tool calls         [7] streaming carries no think/tool markup
 #   [8] the checkpoint's MTP heads draft (spec-stats mode=mtp)
+#   [9] a whole-file edit: prompt-lookup drafts commit long runs beside the heads
 #
 # Hermetic counterparts: the config-parse tests in model.zig, the generic-role-header
 # render test in chat.zig, the `mimo_v2 fixture` parity test in transformer.zig and the
@@ -99,6 +100,18 @@ print("REASONING:" + "".join(r)); print("CONTENT:" + "".join(c))')
 check "[7] streamed answer carries 12" "$S" "12"
 check_absent "[7] no think tags streamed" "$S" "<think"
 check_absent "[7] no tool markup streamed" "$S" "<tool_call"
+
+EDIT=$(python3 - "$(dirname "$0")/convert_mimo_v2.py" <<'PY'
+import json, sys
+src = open(sys.argv[1]).read()[:6000]
+msg = "Here is a file:\n```python\n" + src + "\n```\nRename the function `fp8_dequant` to `dequant_fp8` everywhere and return the complete updated file, nothing else."
+print(json.dumps({"max_tokens": 1500, "temperature": 0, "enable_thinking": False, "messages": [{"role": "user", "content": msg}]}))
+PY
+)
+E=$(chat "$EDIT" || true)
+check "[9] edit answered" "$E" "dequant_fp8"
+LOOKUP=$(grep -oE "lookup=[0-9]+" "$LOG" | tail -1 | cut -d= -f2)
+[ "${LOOKUP:-0}" -gt 0 ] && { echo "PASS [9] lookup drafts engaged ($LOOKUP)"; pass=$((pass+1)); } || { echo "FAIL [9] no lookup rounds"; fail=$((fail+1)); }
 
 check "[8] MTP heads loaded" "$(cat "$LOG")" "MiMo MTP heads ready (3 heads"
 check "[8] MTP drafted" "$(cat "$LOG")" "[spec-stats] mode=mtp"
