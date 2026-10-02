@@ -28182,17 +28182,28 @@ pub const Transformer = struct {
     /// int8-g32 affine for the body, real nvfp4-g16 for the tail (see
     /// `attnDqUseNvfp4`) — each weight belongs to exactly one layer, so the
     /// pointer-keyed cache stays mode-stable.
-    fn attnDqFor(self: *Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, layer: u32) !?AttnDqCopy {
+    fn attnDqFor(self: *Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, in_dim: ?u32, layer: u32) !?AttnDqCopy {
         const key = @intFromPtr(w.ctx orelse return null);
         if (self.attn_dq.get(key)) |slot| return slot;
-        const wsh = mlx.getShape(w);
-        if (!decodeAttnQuantEligible(wsh, mlx.mlx_array_dtype(w), sc.ctx != null)) {
+        // An 8-bit affine weight is requantized from its dequantized values,
+        // and only to nvfp4: an int8 copy of it would read the same bytes.
+        var dense = mlx.mlx_array{ .ctx = null };
+        defer if (dense.ctx != null) {
+            _ = mlx.mlx_array_free(dense);
+        };
+        if (sc.ctx != null) {
+            const qp = self.quantParamsHinted(w, sc, in_dim);
+            if (qp.mode == .affine and qp.bits == 8) dense = try denseFromAffine8(self.s, w, sc, bi, qp.group_size);
+        }
+        const src = if (dense.ctx != null) dense else w;
+        const wsh = mlx.getShape(src);
+        if (!decodeAttnQuantEligible(wsh, mlx.mlx_array_dtype(src), sc.ctx != null and dense.ctx == null)) {
             try self.attn_dq.put(self.allocator, key, null);
             log.debug("[decode-attn-quant] declined a projection: shape/dtype ineligible\n", .{});
             return null;
         }
-        const nvfp4 = attnDqUseNvfp4(layer, @intCast(self.config.num_hidden_layers), attnDqNvfp4FromEnv());
-        const copy = (try buildAttnDqCopy(self.s, w, nvfp4)) orelse {
+        const nvfp4 = dense.ctx != null or attnDqUseNvfp4(layer, @intCast(self.config.num_hidden_layers), attnDqNvfp4FromEnv());
+        const copy = (try buildAttnDqCopy(self.s, src, nvfp4)) orelse {
             try self.attn_dq.put(self.allocator, key, null);
             return null;
         };
@@ -28217,10 +28228,10 @@ pub const Transformer = struct {
     /// decode steps produced them from, making PLD-on vs PLD-off diverge at
     /// temp 0); prefill and batched forwards keep the dense weight.
     inline fn attnProj(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, decode_shape: bool, layer: u32) !mlx.mlx_array {
-        if (decode_shape and sc.ctx == null and decodeAttnQuantEnabled()) {
+        if (decode_shape and (sc.ctx == null or attnDqRequantEnabled()) and decodeAttnQuantEnabled()) {
             // A build failure falls back to the dense weight, never errors the
             // request out.
-            if (self.attnDqFor(w, sc, layer) catch null) |dq| {
+            if (self.attnDqFor(w, sc, bi, lastDim(x), layer) catch null) |dq| {
                 return qmatmulBits(x, dq.w, dq.s, dq.b, dq.bits, dq.group_size, dq.mode, self.s);
             }
         }
@@ -28287,7 +28298,8 @@ pub const Transformer = struct {
         const flat_shape = [_]c_int{ batch, seq_len, h_count * vd };
         const perm = [_]c_int{ 0, 2, 1, 3 };
         const perm_back = [_]c_int{ 0, 2, 1, 3 };
-        const decode_shape = batch == 1 and !is_prefill;
+        // MiMo's verify windows read the decode copies its serial steps read.
+        const decode_shape = batch == 1 and (!is_prefill or (cfg.isMimo() and seq_len <= dec_attn.MAX_ROWS));
 
         const use_yarn = self.rope_freqs_yarn != null;
         const rope_base = mlx.mlx_optional_float{
@@ -36260,6 +36272,13 @@ pub fn decodeAttnQuantExplicit() bool {
     return decode_attn_quant_flag orelse false;
 }
 
+/// LOSSY opt-in (`MLX_SERVE_DECODE_ATTN_QUANT_REQUANT=1`): 8-bit affine
+/// attention weights get nvfp4 decode copies too, halving their per-token read.
+var attn_dq_requant_cached: ?bool = null;
+fn attnDqRequantEnabled() bool {
+    return diagEnvOnCached(&attn_dq_requant_cached, "MLX_SERVE_DECODE_ATTN_QUANT_REQUANT");
+}
+
 pub fn decodeAttnQuantEnabled() bool {
     if (decode_attn_quant_override) |v| return v;
     if (decode_attn_quant_cached) |v| return v;
@@ -37425,6 +37444,18 @@ pub fn fusedQkNormRope256(
 /// same as any checkpoint-quantized linear). `nvfp4` picks real nvfp4-g16
 /// (half the int8 bytes, e4m3 scales, no biases) over the default INT8-g32
 /// affine. Materialized eagerly so the build never rides a token's graph.
+/// An 8-bit affine weight [out, in] back in the dense layout `buildAttnDqCopy`
+/// takes (bf16 [in, out]).
+fn denseFromAffine8(s: mlx.mlx_stream, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, group_size: u32) !mlx.mlx_array {
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    var t = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_transpose_axes(&t, deq, &[_]c_int{ 1, 0 }, 2, s));
+    return t;
+}
+
 fn buildAttnDqCopy(s: mlx.mlx_stream, w: mlx.mlx_array, nvfp4: bool) !?AttnDqCopy {
     var wt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wt);
@@ -60443,6 +60474,39 @@ test "decode-attn-quant: int8 side copy tracks the dense projection (and is hone
         // would mean the hook silently dispatched the dense weight.
         try std.testing.expect(max_diff > 0.0);
     }
+}
+
+test "decode-attn-quant: an 8-bit affine weight's nvfp4 copy tracks its own projection" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xA8);
+    // Packed weights are [out, in] = [192, 256], read transposed.
+    const w = try attn256RandBf16(prng.random(), &[_]c_int{ 192, 256 }, s);
+    defer _ = mlx.mlx_array_free(w);
+    const x = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 1, 256 }, s);
+    defer _ = mlx.mlx_array_free(x);
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_quantize(&parts, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
+    var q8: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (q8) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&q8, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, parts, i));
+    const ref = try qmatmulBits(x, q8[0], q8[1], q8[2], 8, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(ref);
+
+    const dense = try denseFromAffine8(s, q8[0], q8[1], q8[2], 64);
+    defer _ = mlx.mlx_array_free(dense);
+    const copy = (try buildAttnDqCopy(s, dense, true)) orelse return error.SideCopyDeclined;
+    defer {
+        _ = mlx.mlx_array_free(copy.w);
+        _ = mlx.mlx_array_free(copy.s);
+    }
+    const quant = try qmatmulBits(x, copy.w, copy.s, copy.b, copy.bits, copy.group_size, copy.mode, s);
+    defer _ = mlx.mlx_array_free(quant);
+    // Same lossy band as the dense nvfp4 copy; a transposed copy is off by the output's magnitude.
+    const max_diff = try attn256MaxDiff(ref, quant, s);
+    try std.testing.expect(max_diff < 0.6 and max_diff > 0.0);
 }
 
 test "decode-attn-quant: nvfp4 tail boundary is the last 20% of layers; env moves or kills it" {
