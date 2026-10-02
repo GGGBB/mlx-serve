@@ -115,6 +115,7 @@ LOOKUP=$(grep -oE "lookup=[0-9]+" "$LOG" | tail -1 | cut -d= -f2)
 
 check "[8] MTP heads loaded" "$(cat "$LOG")" "MiMo MTP heads ready (3 heads"
 check "[8] MTP drafted" "$(cat "$LOG")" "[spec-stats] mode=mtp"
+check_absent "[8] no draft past the last head" "$(grep '\[spec-stats\] mode=mtp' "$LOG")" "depth=6"
 
 check_absent "[log] no MLX error" "$(cat "$LOG")" "[mlx]"
 echo

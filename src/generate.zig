@@ -417,6 +417,15 @@ pub const MtpHeadRef = union(enum) {
         return .{ .logits = try target.lmHeadForDraft(last), .hidden_next = hidden_next };
     }
 
+    /// Deepest draft the head can make: a MiMo draft past its last head re-runs
+    /// that head at the same position and is never accepted.
+    pub fn maxDepth(self: MtpHeadRef) u32 {
+        return switch (self) {
+            .mimo => |h| @intCast(h.heads),
+            .qwen, .qwen4 => std.math.maxInt(u32),
+        };
+    }
+
     /// Append committed history without projecting logits.
     pub fn appendHistory(
         self: MtpHeadRef,
@@ -3373,7 +3382,7 @@ pub const Generator = struct {
                 .mtp_serial_accept = mtp_active and xfm.config.rowExactDecode() and std.meta.activeTag(options.mtp_acceptance) == .exact,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
-                .mtp_depth = resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile),
+                .mtp_depth = @min(resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile), if (options.mtp) |h| h.maxDepth() else std.math.maxInt(u32)),
                 .mtp_depth_free = if (xfm.mtp_depth_free != 0) xfm.mtp_depth_free else mtpDepthCapFree(xfm.config.mtpDepth(options.mtp_depth)),
                 .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
                 // Start at depth 1 and climb with evidence: the cheap depth
