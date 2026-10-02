@@ -302,6 +302,7 @@ Memory bills + admission:
 - **Long-context mechanisms of #363 gate on ONE predicate** (`ModelConfig.longCtxGated()`, qwen4_exp).
 - **Gates, preflight and COMMIT read ONE estimator** (#126, `estimatePeakResidentBytes` → `gateEstimateBytes`); a refusal quotes the number it COMPARED (`loadRequirementBytes`); staged bills are per-STAGE and a residency bill is a PLAN (`stagedPeakBytes`, `ltxPeakBytes`).
 - **A video response is ONE JSON body**: the transport cap bills DELIVERED frames incl. chain windows (#283, `videoRgbTransportReason`, 768 MB).
+- **A resident H3 DiT must skip the AdaLN precompute and keep its adapters in the cache** (`minimax_h3.Resident`): precompute frees the 13 GB of modulation weights and bakes tables for ONE schedule, and a LoRA stack's refs point into the stack that bound them. Residency is all-or-nothing against LIVE memory and every other load releases it before refusing (`availForLoad`).
 - **Serial ≠ exclusive**: module-owned decode state needs admission single-flight (`admitPendingTick` on `modelExclusiveDecode`); held slots stay in `pending`.
 - **"Free disk" is what the OS will GRANT** (`msv_volume_free_for_use`), statfs is the fallback.
 

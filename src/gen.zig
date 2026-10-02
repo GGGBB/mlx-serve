@@ -30,6 +30,7 @@ const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const minimax_h3 = @import("minimax_h3.zig");
+const ane = @import("ane.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
 const glb_mod = @import("glb.zig");
@@ -1341,6 +1342,9 @@ pub const H3VideoEngine = struct {
     /// list at load — the file layout is identical either way).
     supports_refs: bool = false,
 
+    /// The text encoder and DiT kept loaded between requests while memory allows.
+    resident: minimax_h3.Resident,
+
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
         const self = try allocator.create(H3VideoEngine);
         errdefer allocator.destroy(self);
@@ -1348,11 +1352,15 @@ pub const H3VideoEngine = struct {
             .allocator = allocator,
             .model_dir = try allocator.dupe(u8, model_dir),
             .supports_refs = h3DirDeclaresRef2va(io, allocator, model_dir),
+            .resident = minimax_h3.Resident.init(allocator),
         };
+        minimax_h3.registerResident(&self.resident);
         return self;
     }
 
     pub fn deinit(self: *H3VideoEngine) void {
+        minimax_h3.unregisterResident(&self.resident);
+        _ = self.resident.release();
         self.allocator.free(self.model_dir);
         self.allocator.destroy(self);
     }
@@ -1378,6 +1386,39 @@ pub const H3VideoEngine = struct {
         return st.size > 0;
     }
 };
+
+/// Size of one pack file, 0 when it is absent.
+fn packFileBytes(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, name: []const u8) u64 {
+    const p = std.fs.path.join(a, &.{ model_dir, name }) catch return 0;
+    defer a.free(p);
+    const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
+    return @intCast(st.size);
+}
+
+/// The cache to hand `generate`, or null for the staged plan. Residency needs the whole set to
+/// fit in the memory that is free right now plus what the cache already holds; when it does not,
+/// whatever was held is released first, so the staged peak starts from a clean slate.
+pub fn h3ResidentFor(engine: *H3VideoEngine, io: std.Io, a: std.mem.Allocator) ?*minimax_h3.Resident {
+    const dir = engine.model_dir;
+    const need = h3ResidentBytes(
+        packFileBytes(io, a, dir, "text_encoder.safetensors"),
+        packFileBytes(io, a, dir, "transformer.safetensors"),
+        packFileBytes(io, a, dir, "video_vae.safetensors") + packFileBytes(io, a, dir, "audio_vae.safetensors"),
+        packFileBytes(io, a, dir, "turbo_lora.safetensors"),
+    );
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    const avail = h3AvailBytes(metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active);
+    const keep = h3ResidentEnabled() and !ane.media_offload.video and
+        h3KeepResident(avail, engine.resident.bytes, need, h3ResidentMargin(metrics.getTotalMemBytes()));
+    if (!keep) {
+        const freed = engine.resident.release();
+        if (freed > 0) log.info("[minimax-h3] residency released ({d:.1} GB): the resident set no longer fits\n", .{@as(f64, @floatFromInt(freed)) / (1024.0 * 1024.0 * 1024.0)});
+        return null;
+    }
+    engine.resident.bytes = need;
+    return &engine.resident;
+}
 
 pub const LtxVideoEngine = struct {
     allocator: std.mem.Allocator,
@@ -3685,7 +3726,10 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         if (paths.turbo_lora) |p| allocator.free(p);
     }
 
+    const resident = h3ResidentFor(engine, io, allocator);
     var res = minimax_h3.generate(allocator, io, paths, .{
+        .resident = resident,
+        .resident_bytes = if (resident) |r| r.bytes else 0,
         .prompt = prompt,
         .width = width,
         .height = height,
@@ -4450,6 +4494,46 @@ pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u
     const generating = @max(dit_resident, vaes);
     if (te == 0 and generating == 0) return 0; // unknown dir → never block
     return stagedPeakBytes(0, &.{ te, generating + H3_ACTIVATION_BYTES });
+}
+
+/// What MiniMax-H3 holds when it keeps every piece loaded between requests: the text encoder, the
+/// WHOLE DiT (the AdaLN weights stay, since they serve any schedule), both VAEs, the LoRA and one
+/// request's activations. Zero when a size is unknown, which never keeps anything.
+pub fn h3ResidentBytes(te: u64, dit_file: u64, vaes: u64, lora: u64) u64 {
+    if (te == 0 or dit_file == 0) return 0;
+    return te + dit_file + vaes + lora + H3_ACTIVATION_BYTES;
+}
+
+/// Frees every H3 engine's resident cache; returns the bytes released. For a load that would
+/// otherwise be refused for memory.
+pub fn releaseMediaResidency() u64 {
+    return minimax_h3.releaseAllResidents();
+}
+
+/// Memory the next request can still use: the tighter of host RAM that is free and the GPU
+/// working-set room. Both exclude what the cache already holds. Zero when host RAM is unknown.
+pub fn h3AvailBytes(host_avail: u64, gpu_limit: u64, gpu_active: u64) u64 {
+    if (host_avail == 0) return 0;
+    if (gpu_limit == 0) return host_avail;
+    return @min(host_avail, gpu_limit -| gpu_active);
+}
+
+/// Headroom kept free beyond the resident set: an eighth of the RAM it does not need, floored.
+pub fn h3ResidentMargin(total_ram: u64) u64 {
+    return @max(10 * 1024 * 1024 * 1024, total_ram / 16);
+}
+
+/// `MLX_SERVE_H3_RESIDENT=0` turns residency off (the A/B arm and the kill switch).
+fn h3ResidentEnabled() bool {
+    const raw = std.c.getenv("MLX_SERVE_H3_RESIDENT") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
+/// Keep H3 resident only while it fits: what is free right now plus what the cache already holds
+/// must cover the whole set and a margin. All or nothing, because a half-resident set breaks the
+/// staged plan's disjoint-stage peak. `avail` excludes the cache's own bytes.
+pub fn h3KeepResident(avail: u64, cache_now: u64, need: u64, margin: u64) bool {
+    return need != 0 and avail +| cache_now >= need +| margin;
 }
 
 /// Per-backend generation-peak estimate for the media load preflight. A
@@ -6219,4 +6303,34 @@ test "decision limits: one set for every backend, named in the 400 text" {
     try testing.expect(std.mem.indexOf(u8, l.message(&buf, error.TooManyQuestions).?, "limit 3") != null);
     try testing.expect(std.mem.indexOf(u8, l.message(&buf, error.TooManyInputTokens).?, "10 input tokens") != null);
     try testing.expect(l.message(&buf, error.TooManyOptions) == null);
+}
+
+test "h3 residency: keeps the whole set only while it fits, counting what the cache already holds" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    const need = h3ResidentBytes(28 * gb, 35 * gb, 6 * gb, gb);
+    try std.testing.expectEqual(76 * gb, need); // te + dit + vaes + lora + the 6 GiB activation term
+    const margin = 12 * gb;
+    try std.testing.expect(h3KeepResident(150 * gb, 0, need, margin)); // a big Mac
+    try std.testing.expect(h3KeepResident(88 * gb, 0, need, margin)); // exactly enough
+    try std.testing.expect(!h3KeepResident(80 * gb, 0, need, margin)); // 128 GB class with other models loaded
+    // The cache's own bytes are available to the next request, or a resident set would evict itself.
+    try std.testing.expect(h3KeepResident(20 * gb, 70 * gb, need, margin));
+    // An unknown size never claims residency.
+    try std.testing.expect(!h3KeepResident(500 * gb, 0, h3ResidentBytes(0, 35 * gb, 6 * gb, 0), margin));
+    try std.testing.expect(!h3KeepResident(500 * gb, 0, h3ResidentBytes(28 * gb, 0, 6 * gb, 0), margin));
+}
+
+test "h3 residency: free memory is the tighter of host RAM and the GPU working-set room" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(100 * gb, h3AvailBytes(100 * gb, 192 * gb, 40 * gb)); // host binds
+    try std.testing.expectEqual(30 * gb, h3AvailBytes(100 * gb, 192 * gb, 162 * gb)); // GPU room binds
+    try std.testing.expectEqual(100 * gb, h3AvailBytes(100 * gb, 0, 40 * gb)); // no GPU limit known
+    try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(0, 192 * gb, 0)); // host unknown never keeps
+    try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(100 * gb, 192 * gb, 200 * gb)); // over the limit
+}
+
+test "h3 residency: the margin scales with RAM and never drops below 10 GiB" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(10 * gb, h3ResidentMargin(64 * gb));
+    try std.testing.expectEqual(16 * gb, h3ResidentMargin(256 * gb));
 }

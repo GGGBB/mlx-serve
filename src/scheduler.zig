@@ -3152,7 +3152,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         defer if (peeked) |p| sch.allocator.free(p);
         const backend_type = peeked orelse params.config.model_type;
         const peak = gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, backend_type);
-        const avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+        const avail = availForLoad(peak);
         const gb = 1024.0 * 1024.0 * 1024.0;
         log.info("[preflight] media peak ~{d:.2} GB (staged residency), available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(peak)) / gb,
@@ -3454,6 +3454,15 @@ test "coldLoadVision honors the process-wide vision opt-out" {
 /// model that fit comfortably inside the ~6.4 GB process limit.
 /// `gpu_limit` = Metal's working-set limit (0 = unknown): a lowered `iogpu.wired_limit_mb` makes
 /// it bind below free RAM, and weights past it OOM in warmup instead of refusing by name.
+/// Memory a load of `need` bytes can use. A resident media cache is opportunistic, so a load that
+/// would be refused makes it let go first and the figure is read again.
+fn availForLoad(need: u64) u64 {
+    var avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+    if (memInsufficientForLoad(need, avail) and gen_mod.releaseMediaResidency() > 0)
+        avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+    return avail;
+}
+
 fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
     const avail = if (proc_avail > 0) proc_avail else host_avail;
     return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
@@ -3802,7 +3811,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
         const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
-        const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+        const avail_bytes = availForLoad(weights_bytes);
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(model_bytes)) / gb,
             @as(f64, @floatFromInt(avail_bytes)) / gb,
@@ -6760,6 +6769,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             if (!fits) if (slot.model.vision_encoder) |ve| if (ve.emb_cache.bytes > 0) {
                 log.info("[scheduler] prefill does not fit: dropping {d}MB of cached media embeddings\n", .{ve.emb_cache.bytes / (1024 * 1024)});
                 ve.emb_cache.clear();
+                fits = Probe.call(&probe);
+            };
+            // A resident video pack is memory its next request can reload: give it back before refusing.
+            if (!fits) if (gen_mod.releaseMediaResidency() > 0) {
+                log.info("[scheduler] prefill does not fit: released the resident media cache\n", .{});
                 fits = Probe.call(&probe);
             };
             // A shared restore is billed a whole second copy; taking the entry over moves it instead.
@@ -10678,4 +10692,15 @@ test "applyModelSettings: --no-mtp stamps the head off unless the model's own se
         applyModelSettings(&cfg, &cc, &o, c.flag);
         try testing.expectEqual(c.want, cfg.mtp_override);
     }
+}
+
+test "availForLoad: only a load that would be refused makes media residency let go" {
+    var held = @import("minimax_h3.zig").Resident.init(std.testing.allocator);
+    held.bytes = 1000;
+    @import("minimax_h3.zig").registerResident(&held);
+    defer @import("minimax_h3.zig").unregisterResident(&held);
+    _ = availForLoad(1); // fits anywhere: the cache stays
+    try std.testing.expectEqual(@as(u64, 1000), held.bytes);
+    _ = availForLoad(1 << 50); // can never fit: the cache is released before the refusal
+    try std.testing.expectEqual(@as(u64, 0), held.bytes);
 }
