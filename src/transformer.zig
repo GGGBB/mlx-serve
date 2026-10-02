@@ -31422,20 +31422,6 @@ pub const Transformer = struct {
         const dshape = [_]c_int{D};
         try mlx.check(mlx.mlx_reshape(&x_flat, expert_x, &dshape, 1, self.s));
 
-        // MXFP4 banks: the two-dispatch fp4 decode (row-group register reuse).
-        if (gate_qp.mode == .mxfp4 and up_qp.mode == .mxfp4 and down_qp.mode == .mxfp4) {
-            var scores_flat = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(scores_flat);
-            try mlx.check(mlx.mlx_reshape(&scores_flat, norm_scores, &[_]c_int{K}, 1, self.s));
-            const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(x_flat), std.heap.c_allocator);
-            const bank = moe_fp4.Bank;
-            if (try moe_fp4.decode(self.s, x_flat, bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s }, bank{ .w = mw.switch_up_w, .s = mw.switch_up_s }, bank{ .w = mw.switch_down_w, .s = mw.switch_down_s }, inds_u32, scores_flat, sigtab, .mxfp4, gate_qp.group_size)) |y| {
-                defer _ = mlx.mlx_array_free(y);
-                try mlx.check(mlx.mlx_reshape(out, y, &[_]c_int{ B, S, D }, 3, self.s));
-                reduced.* = true;
-                return true;
-            }
-        }
 
         // gate / up share the single token's hidden state, so one kernel can
         // do both dot products and the activation — three dispatches off the
@@ -31550,6 +31536,34 @@ pub const Transformer = struct {
             gqmv_engaged = true;
             log.info("[moe] gather-qmv kernel engaged: E_topk={d} inter={d} hidden={d} bits={d} gs={d}\n", .{ K, inter, hidden, gate_qp.bits, gate_qp.group_size });
         }
+        return true;
+    }
+
+    /// MXFP4 banks at decode and verify widths: `moe_fp4`'s two dispatches over
+    /// every token's own experts. Writes the weighted sum [B,S,D] into `out`;
+    /// false when the kernels decline.
+    fn moeFp4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights, group_size: u32) !bool {
+        const xs = mlx.getShape(expert_x);
+        const rows = xs[0] * xs[1];
+        const ks = mlx.getShape(inds);
+        const k = ks[ks.len - 1];
+        var x2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x2);
+        try mlx.check(mlx.mlx_reshape(&x2, expert_x, &.{ rows, xs[2] }, 2, self.s));
+        var ind2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ind2);
+        try mlx.check(mlx.mlx_reshape(&ind2, inds, &.{ rows, k }, 2, self.s));
+        var ind_u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ind_u);
+        try mlx.check(mlx.mlx_astype(&ind_u, ind2, .uint32, self.s));
+        var sc2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc2);
+        try mlx.check(mlx.mlx_reshape(&sc2, norm_scores, &.{ rows, k }, 2, self.s));
+        const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(expert_x), std.heap.c_allocator);
+        const Bank = moe_fp4.Bank;
+        const y = (try moe_fp4.decode(self.s, x2, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s }, ind_u, sc2, sigtab, .mxfp4, group_size)) orelse return false;
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_reshape(out, y, &.{ xs[0], xs[1], xs[2] }, 3, self.s));
         return true;
     }
 
@@ -31812,7 +31826,12 @@ pub const Transformer = struct {
         var moe_reduced = false;
         var cost_arm: u8 = 4;
 
-        if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
+        if (B * S <= moe_fp4.MAX_ROWS and gate_qp.mode == .mxfp4 and up_qp.mode == .mxfp4 and down_qp.mode == .mxfp4 and
+            try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size))
+        {
+            moe_reduced = true;
+            cost_arm = 1;
+        } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
             try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
