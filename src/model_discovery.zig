@@ -54,6 +54,8 @@ const supported_model_types = [_][]const u8{
     "muse_glimmer_text",
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
+    "mimo_v2", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout)
+    "mimo_v2_flash", // MiMo-V2-Flash, and TensorFold's label for V2.6 packs
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations

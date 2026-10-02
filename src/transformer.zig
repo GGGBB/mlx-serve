@@ -25382,7 +25382,8 @@ pub const Transformer = struct {
         const is_laguna = std.mem.eql(u8, cfg.model_type, "laguna");
         const is_inkling = cfg.isInkling();
         const is_mla = cfg.isMla();
-        const is_gpt_oss = std.mem.eql(u8, cfg.model_type, "gpt_oss");
+        // gpt_oss and MiMo share the sink attention arm (per-layer geometry).
+        const is_sink_attn = std.mem.eql(u8, cfg.model_type, "gpt_oss") or cfg.isMimo();
 
         // PLD spec-decode: thread the per-position SSM capture flag down to the
         // GatedDeltaNet layers (which don't take the ctx). Reset on exit so it
@@ -25445,7 +25446,7 @@ pub const Transformer = struct {
         var local_decode_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(local_decode_mask);
 
-        if ((is_gemma4 or is_laguna or is_gpt_oss) and cfg.has_sliding_window) {
+        if ((is_gemma4 or is_laguna or is_sink_attn) and cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
             const sliding = slidingViewFor(cfg, total_kv, seq_len);
@@ -25518,8 +25519,8 @@ pub const Transformer = struct {
                     break :blk r.out;
                 } else if (is_mla)
                     try self.mlaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill)
-                else if (is_gpt_oss)
-                    try self.gptOssAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
+                else if (is_sink_attn)
+                    try self.sinkAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
                 else if (is_laguna)
                     try self.lagunaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
                 else if (is_gemma4)
@@ -28215,7 +28216,7 @@ pub const Transformer = struct {
         return out;
     }
 
-    /// gpt_oss attention. Plain GQA (64/8 at hd 64 on the 20B) with four
+    /// gpt_oss / MiMo attention. Plain GQA (64/8 at hd 64 on the 20B) with four
     /// departures from `gatedFullAttnWith`, which is why it is its own arm:
     ///
     ///   1. LEARNED PER-HEAD SINKS. `fa.sinks` rides into mlx's fused SDPA as
@@ -28226,16 +28227,16 @@ pub const Transformer = struct {
     ///   3. ADDITIVE q/k/v/o biases.
     ///   4. NO QK norm.
     ///
-    /// RoPE is ONE configuration for every layer — sliding and full alike take
-    /// the same YaRN-scaled freqs at the same theta. That is the reference's
-    /// shape (a single `initialize_rope` shared by all blocks) and it is why
-    /// there is no `is_full` branch on the rope here, unlike laguna.
+    /// gpt_oss RoPE is ONE configuration for every layer (its sliding theta is
+    /// the global one, YaRN for both). MiMo reads every geometry per layer:
+    /// global 4 / sliding 8 KV heads, K 192 / V 128, RoPE on 64 channels, two
+    /// thetas, sinks on the sliding layers only, V scaled before caching.
     ///
     /// The fused quantized-KV attention path is deliberately NOT wired: those
     /// kernels are ours and take no sink argument, so engaging them would drop
     /// the sinks silently. Under `--kv-quant` this arm reads the dequantized
     /// `DenseKVView` that `cache.update` already returns.
-    fn gptOssAttnWith(
+    fn sinkAttnWith(
         self: *Transformer,
         ctx: *ForwardCtx,
         x: mlx.mlx_array,
@@ -28250,20 +28251,23 @@ pub const Transformer = struct {
     ) !mlx.mlx_array {
         const cfg = &self.config;
         const is_full = cfg.isGlobalLayer(layer);
-        const h_count: c_int = @intCast(cfg.num_attention_heads);
-        const kv_h: c_int = @intCast(cfg.num_key_value_heads);
-        const hd: c_int = @intCast(cfg.head_dim);
+        const h_count: c_int = @intCast(cfg.layerNumHeads(layer));
+        const kv_h: c_int = @intCast(cfg.layerKVHeads(layer));
+        const hd: c_int = @intCast(cfg.layerHeadDim(layer));
+        const vd: c_int = @intCast(cfg.layerVHeadDim(layer));
+        const rope_dims: c_int = @intCast(cfg.layerRopeDims(layer));
         const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
         const q_shape = [_]c_int{ batch, seq_len, h_count, hd };
         const kv_shape = [_]c_int{ batch, seq_len, kv_h, hd };
-        const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
+        const v_shape = [_]c_int{ batch, seq_len, kv_h, vd };
+        const flat_shape = [_]c_int{ batch, seq_len, h_count * vd };
         const perm = [_]c_int{ 0, 2, 1, 3 };
         const perm_back = [_]c_int{ 0, 2, 1, 3 };
         const decode_shape = batch == 1 and !is_prefill;
 
         const use_yarn = self.rope_freqs_yarn != null;
         const rope_base = mlx.mlx_optional_float{
-            .value = cfg.rope_theta,
+            .value = if (is_full) cfg.rope_theta else cfg.rope_local_base_freq,
             .has_value = !use_yarn, // precomputed yarn freqs override the base
         };
         const rope_freqs: mlx.mlx_array = if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null };
@@ -28298,8 +28302,8 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(q_rope);
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
-        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, hd, false, rope_base, 1.0, offset, rope_freqs, self.s));
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, hd, false, rope_base, 1.0, offset, rope_freqs, self.s));
+        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
 
         // YaRN mscale on the rotated dims (full rotary here, so the whole
         // head). Cast to q/k's dtype first — an f32 table would promote the
@@ -28321,10 +28325,19 @@ pub const Transformer = struct {
 
         var v_r = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(v_r);
-        try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, self.s));
+        try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &v_shape, 4, self.s));
         var v_t = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(v_t);
         try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+        // MiMo-V2.6 caches V scaled (`attention_value_scale`), in V's own dtype.
+        if (cfg.attention_value_scale != 1.0) {
+            const vs = try scalarOf(cfg.attention_value_scale, mlx.mlx_array_dtype(v_t), self.s);
+            defer _ = mlx.mlx_array_free(vs);
+            var scaled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&scaled, v_t, vs, self.s));
+            _ = mlx.mlx_array_free(v_t);
+            v_t = scaled;
+        }
 
         // Sliding layers read only the tail their queries can reach, and the
         // width is a property of the whole BLOCK: `window + q_len - 1`,
@@ -32654,6 +32667,9 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_bailing = std.mem.eql(u8, config.model_type, "bailing_hybrid");
     const is_qwen4 = config.isQwen4();
     const is_gpt_oss = std.mem.eql(u8, config.model_type, "gpt_oss");
+    const is_mimo = config.isMimo();
+    // Attention projections that may ship dense bf16 beside quantized experts.
+    const probe_attn_scales = is_laguna or is_mimo;
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -33042,7 +33058,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             // geometry); absent → bf16 (maybeTransposeForBf16). Other archs keep
             // mandating scales (config.quant_bits) so a genuinely-missing scale
             // still errors loudly. getLayerBias already tolerates absence.
-            const k_s = if (is_laguna)
+            const k_s = if (probe_attn_scales)
                 (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.scales") orelse mlx.mlx_array_new())
             else
                 try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
@@ -33056,7 +33072,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             lw.attn = .{
                 .full = .{
                     .q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
-                    .q_s = if (is_laguna)
+                    .q_s = if (probe_attn_scales)
                         (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array_new())
                     else
                         try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
@@ -33068,7 +33084,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                     .v_s = v_s,
                     .v_b = v_b,
                     .o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
-                    .o_s = if (is_laguna)
+                    .o_s = if (probe_attn_scales)
                         (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array_new())
                     else
                         try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
@@ -33130,12 +33146,13 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 // via getLayerBias. Reading either name for the other is a
                 // shape error at best and silently wrong output at worst, so
                 // the two suffixes stay spelled out in full at every site.
-                if (is_gpt_oss) {
+                if (is_gpt_oss or is_mimo) {
                     fa.q_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.bias") orelse .{ .ctx = null };
                     fa.k_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.bias") orelse .{ .ctx = null };
                     fa.v_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.bias") orelse .{ .ctx = null };
                     fa.o_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.bias") orelse .{ .ctx = null };
-                    fa.sinks = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.sinks") orelse .{ .ctx = null };
+                    fa.sinks = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.sinks") orelse
+                        getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.attention_sink_bias") orelse .{ .ctx = null };
                 }
                 // Row-exact archs on NAX: one lane matmul serves q|k|v at every
                 // width (a column's bits follow the joined shape, the same at 1 row and 16).
@@ -33399,7 +33416,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                     }
                 }
             }
-        } else if (layer_is_moe and is_laguna) {
+        } else if (layer_is_moe and (is_laguna or is_mimo)) {
             // Laguna: qwen3_moe WEIGHT NAMING (mlp.gate router bf16 — or the
             // HF-native mlp.gate.proj on oQ builds, resolved by probe,
             // mlp.switch_mlp.* nvfp4 experts, mlp.shared_expert.* bf16 shared)
@@ -33459,6 +33476,15 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
+            }
+            // MiMo routes in f32 (the reference's `F.linear` on f32 inputs and weights);
+            // a dense bf16 router widens exactly, once.
+            if (is_mimo and lw.mlp.moe.router_s.ctx == null and mlx.mlx_array_dtype(lw.mlp.moe.router_w) != .float32) {
+                var f = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&f, lw.mlp.moe.router_w, .float32, s));
+                try mlx.check(mlx.mlx_array_eval(f));
+                try owned_bf16.append(allocator, f);
+                lw.mlp.moe.router_w = f;
             }
         } else if (layer_is_moe and is_hy3) {
             // Hy3 (hy_v3): stacked experts (already [E, out, packed] in MLX
@@ -70487,4 +70513,75 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
             }
         }
     }
+}
+
+test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2.py (MIMO_V2_MODEL, MIMO_V2_FIXTURE)" {
+    // A tiny random MiMo stored like the release (tests/dump_mimo_v2_fixtures.py), packed by
+    // tests/convert_mimo_v2.py --bits 16; logits from the checkpoint's own code in f32.
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    const fixture_path = std.c.getenv("MIMO_V2_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+
+    var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
+    defer fx.deinit();
+    const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
+    try mlx.check(mlx.mlx_array_eval(ids_arr));
+    const T: c_int = @intCast(mlx.mlx_array_size(ids_arr));
+    const v: usize = @intCast(config.vocab_size);
+    const ref = try qwen4ReadF32(allocator, fx.get("logits_full") orelse return error.MissingFixtureTensor, s);
+    defer allocator.free(ref);
+
+    const Run = struct {
+        fn rows(x: *Transformer, ids: mlx.mlx_array, from: c_int, to: c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+            var part = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(part);
+            try mlx.check(mlx.mlx_slice(&part, ids, &.{from}, 1, &.{to}, 1, &.{1}, 1, st));
+            var batched = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(batched);
+            try mlx.check(mlx.mlx_reshape(&batched, part, &.{ 1, to - from }, 2, st));
+            return x.forward(batched);
+        }
+    };
+
+    // [a] the whole prompt in one forward: every row, sliding window included.
+    const full = try Run.rows(&xfm, ids_arr, 0, T, s);
+    defer _ = mlx.mlx_array_free(full);
+    const ours_full = try qwen4ReadF32(allocator, full, s);
+    defer allocator.free(ours_full);
+    const a = qwen4CompareRows(ours_full, ref, @intCast(T), v);
+    std.debug.print("[mimo fixture] one-shot {d} rows: min cos {d:.5}, argmax {d}/{d}\n", .{ a.rows, a.min_cos, a.argmax_agree, a.rows });
+    try testing.expect(a.min_cos > 0.995 and a.argmax_agree == a.rows);
+
+    // [b] a chunked prefill split across the window, then single-token decode steps.
+    try xfm.resetCache();
+    const t_pre: c_int = T - 6;
+    const chunks = [_][2]c_int{ .{ 0, 13 }, .{ 13, t_pre } };
+    for (chunks) |c| {
+        const out = try Run.rows(&xfm, ids_arr, c[0], c[1], s);
+        _ = mlx.mlx_array_free(out);
+    }
+    var worst: f64 = 1.0;
+    var agree: usize = 0;
+    var t = t_pre;
+    while (t < T) : (t += 1) {
+        const out = try Run.rows(&xfm, ids_arr, t, t + 1, s);
+        defer _ = mlx.mlx_array_free(out);
+        const row = try qwen4ReadF32(allocator, out, s);
+        defer allocator.free(row);
+        const r = qwen4CompareRows(row, ref[@as(usize, @intCast(t)) * v ..], 1, v);
+        worst = @min(worst, r.min_cos);
+        agree += r.argmax_agree;
+    }
+    std.debug.print("[mimo fixture] chunked prefill + {d} decode steps: min cos {d:.5}, argmax {d}/{d}\n", .{ T - t_pre, worst, agree, T - t_pre });
+    try testing.expect(worst > 0.995 and agree == @as(usize, @intCast(T - t_pre)));
 }

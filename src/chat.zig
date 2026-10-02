@@ -614,9 +614,11 @@ fn renderChatTemplate(
     // form so the model still sees the tool context.
     const tpl = chat_config.chat_template;
     const tpl_has_tools = std.mem.indexOf(u8, tpl, "tools") != null;
-    const tpl_has_tool_role = templateReferencesToolRole(tpl);
+    const has_tool_content = messagesHaveToolContent(msgs);
+    const tpl_has_tool_role = templateReferencesToolRole(tpl) or
+        (has_tool_content and try templateRendersToolTurn(allocator, tpl));
     const needs_inject_tools = tools_json != null and !tpl_has_tools;
-    const needs_rewrite_tool_role = !tpl_has_tool_role and messagesHaveToolContent(msgs);
+    const needs_rewrite_tool_role = !tpl_has_tool_role and has_tool_content;
 
     var fallback_arena: ?std.heap.ArenaAllocator = null;
     defer if (fallback_arena) |*a| a.deinit();
@@ -816,6 +818,20 @@ fn templateReferencesToolRole(tpl: []const u8) bool {
         if (std.mem.indexOf(u8, tpl, p) != null) return true;
     }
     return false;
+}
+
+/// A template that renders tool CALLS but names no 'tool' role (MiMo's generic
+/// `<|im_start|>{{ role }}` header) was trained on tool turns: probe-render one
+/// and keep it native when its content survives.
+fn templateRendersToolTurn(allocator: std.mem.Allocator, tpl: []const u8) !bool {
+    if (std.mem.indexOf(u8, tpl, "tool_calls") == null) return false;
+    const marker = "__mlx_serve_tool_turn_probe__";
+    const tpl_z = try allocator.dupeSentinel(u8, tpl, 0);
+    defer allocator.free(tpl_z);
+    var len: usize = 0;
+    const out = jinja_c.jinja_render_chat(tpl_z.ptr, "[{\"role\":\"tool\",\"content\":\"" ++ marker ++ "\"}]", null, "{}", 0, &len) orelse return false;
+    defer jinja_c.jinja_str_free(out);
+    return std.mem.indexOf(u8, out[0..len], marker) != null;
 }
 
 /// True if any message has `role: "tool"` or an assistant message with tool_calls.
@@ -9534,6 +9550,31 @@ test "appendJsonString escapes ALL control characters (2026-06-11 ESC-byte regre
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, buf.items, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings(&input, parsed.value.string);
+}
+
+test "renderChatTemplate: a tool-aware template with a generic role header renders tool turns natively" {
+    // MiMo's template names no 'tool' literal: every non-assistant turn is
+    // `<|im_start|>{{ role }}`. It renders tool CALLS, so tool results are its
+    // own turns; a template that renders no tool calls keeps the rewrite.
+    const a = testing.allocator;
+    const generic = "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}" ++
+        "{%- if m.tool_calls is defined and m.tool_calls -%}{%- for tc in m.tool_calls -%}<tool_call>{{ tc.function.name }}</tool_call>{%- endfor -%}{%- endif -%}<|im_end|>{%- endfor -%}";
+    const calls = [_]ToolCall{.{ .id = "c1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Weather?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "18C", .tool_call_id = "c1" },
+    };
+    var config = ChatConfig{ .chat_template = generic, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+    const native = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(native);
+    try testing.expect(std.mem.indexOf(u8, native, "<|im_start|>tool\n18C<|im_end|>") != null);
+    try testing.expect(std.mem.indexOf(u8, native, "<tool_response>") == null);
+
+    config.chat_template = "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{%- endfor -%}";
+    const plain = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "<|im_start|>user\n<tool_response>\n18C\n</tool_response>") != null);
 }
 
 test "renderChatTemplate: tool result with raw ANSI escapes still renders via Jinja" {

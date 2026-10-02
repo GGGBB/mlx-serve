@@ -848,3 +848,19 @@ has tools and otherwise pass the text through.
 Fix: the non-stream split keeps markup when the request has no tools (chat,
 messages, responses), matching the stream and the other engines.
 Guard: `tests/test_no_tools_markup_passthrough.sh`.
+
+## Tool results were rewritten into user turns on a generic role header (MiMo, 2026-10-02)
+
+MiMo-V2.6's template renders every non-assistant turn as
+`<|im_start|>{{ message.role }}`, so it never spells `'tool'`. Our literal
+check read that as "no tool role" and rewrote each tool result into a user
+turn wrapped in `<tool_response>`, a format the model was not trained on.
+
+Cause: `templateReferencesToolRole` looked for the `'tool'` string only.
+
+Fix: a template that renders assistant `tool_calls` but names no tool role is
+probe-rendered with one tool message (`templateRendersToolTurn`); when its
+content survives, tool turns render natively. Templates without tool-call
+support keep the rewrite.
+Guard: `renderChatTemplate: a tool-aware template with a generic role header
+renders tool turns natively` in `chat.zig`.

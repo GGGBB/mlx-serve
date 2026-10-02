@@ -596,6 +596,8 @@ pub const ModelConfig = struct {
 
     // Gemma 4: dual head dimensions and KV sharing
     global_head_dim: u32 = 0, // 0 = same as head_dim
+    v_head_dim: u32 = 0, // 0 = same as the layer's head_dim (MiMo: K 192 / V 128)
+    attention_value_scale: f32 = 1.0, // V multiplied before caching (MiMo-V2.6: 0.707)
     num_global_key_value_heads: u32 = 0, // 0 = same as num_key_value_heads
     num_kv_shared_layers: u32 = 0,
     final_logit_softcapping: f32 = 0.0, // 0 = disabled
@@ -723,6 +725,17 @@ pub const ModelConfig = struct {
         return self.num_attention_heads;
     }
 
+    /// The cached V width of a layer (MiMo stores K 192 / V 128).
+    pub fn layerVHeadDim(self: ModelConfig, layer_idx: u32) u32 {
+        return if (self.v_head_dim > 0) self.v_head_dim else self.layerHeadDim(layer_idx);
+    }
+
+    /// Leading channels of a head that RoPE rotates: `int(head_dim * partial)`.
+    pub fn layerRopeDims(self: ModelConfig, layer_idx: u32) u32 {
+        const partial = if (self.isGlobalLayer(layer_idx)) self.partial_rotary_factor_global else self.partial_rotary_factor;
+        return @intFromFloat(@as(f32, @floatFromInt(self.layerHeadDim(layer_idx))) * partial);
+    }
+
     /// Get effective num_kv_heads for a layer.
     pub fn layerKVHeads(self: ModelConfig, layer_idx: u32) u32 {
         if (self.num_global_key_value_heads > 0 and self.isGlobalLayer(layer_idx)) {
@@ -815,6 +828,16 @@ pub const ModelConfig = struct {
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        // An arch that declares its own V width (MiMo) also varies KV heads per
+        // layer type: billed layer by layer.
+        if (self.v_head_dim > 0) {
+            var sum: u64 = 0;
+            for (0..self.num_hidden_layers) |i| {
+                const li: u32 = @intCast(i);
+                sum += @as(u64, self.layerKVHeads(li)) * (@as(u64, self.layerHeadDim(li)) + self.layerVHeadDim(li)) * 2;
+            }
+            return sum;
+        }
         const widths: u64 = if (self.isMla())
             @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
         else
@@ -946,6 +969,10 @@ pub const ModelConfig = struct {
     pub fn draftVocab(self: *const ModelConfig) c_int {
         if (self.rowExactDecode() and std.mem.startsWith(u8, self.model_type, "qwen3_5") and self.vocab_size >= 248320) return 98304;
         return 0;
+    }
+
+    pub fn isMimo(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1232,6 +1259,8 @@ pub const ModelConfig = struct {
         // without reasoning ("17 - 9 = 8" where the thinking arm works the
         // word problem and answers "9 sheep are left").
         if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
+        // mimo_v2: the template thinks unless told `enable_thinking` false.
+        if (self.isMimo()) return true;
         // k2_horizon: the template opens a think marker on every assistant
         // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
         if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
@@ -1875,6 +1904,16 @@ fn mergeObjects(a: std.mem.Allocator, dst: *std.json.ObjectMap, src: std.json.Ob
         // Keys and values are arena-owned by the override document, which
         // outlives this merge.
         try dst.put(a, e.key_ptr.*, e.value_ptr.*);
+    }
+}
+
+/// The MiMo release (FP8 trunk, per-expert MXFP4 bytes) is not a pack; mlx packs
+/// carry an mlx-style quantization_config with no `quant_method`.
+fn refuseUnconvertedMimo(cfg_obj: std.json.ObjectMap) !void {
+    const qc = jsonField(cfg_obj, "quantization_config") orelse return;
+    if (qc == .object and jsonField(qc.object, "quant_method") != null) {
+        log.err("mimo_v2: this is the original release; convert it first with tests/convert_mimo_v2.py\n", .{});
+        return error.UnconvertedMimoCheckpoint;
     }
 }
 
@@ -2666,6 +2705,81 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
         }
         config.ensureGptOssTerminators();
+    } else if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "mimo_v2_flash")) {
+        // Xiaomi MiMo-V2.6-Flash (309B-A15B) in the mlx-lm layout (tests/convert_mimo_v2.py,
+        // the community packs); `mimo_v2_flash` is MiMo-V2-Flash and TensorFold's V2.6 label.
+        // gpt_oss-shaped attention (learned sinks, 128-token sliding window) with
+        // per-layer-type geometry: global layers 4 KV heads at theta 1e7, sliding
+        // layers 8 KV heads at theta 1e4 with sinks; K 192 / V 128, RoPE on the
+        // first int(192 * 0.334) = 64 channels. Experts: laguna's sigmoid routing
+        // with a selection-only bias and no shared expert; dense layers lead.
+        try refuseUnconvertedMimo(cfg_obj);
+        config.model_type = "mimo_v2";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.has_attn_sinks = true;
+        config.moe_sigmoid_router = true;
+        if (jsonField(cfg_obj, "layernorm_epsilon")) |v| config.rms_norm_eps = try jsonFloat(v);
+        if (jsonField(cfg_obj, "attention_value_scale")) |v| {
+            if (v != .null) config.attention_value_scale = try jsonFloat(v);
+        }
+        if (jsonField(cfg_obj, "n_routed_experts")) |v| config.num_experts = try jsonU32(v);
+        if (jsonField(cfg_obj, "norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (jsonField(cfg_obj, "routed_scaling_factor")) |v| {
+            if (v != .null) config.router_scaling_factor = try jsonFloat(v);
+        }
+        if (jsonField(cfg_obj, "n_group")) |v| config.moe_n_group = try jsonU32(v);
+        if (jsonField(cfg_obj, "topk_group")) |v| config.moe_topk_group = try jsonU32(v);
+        if (jsonField(cfg_obj, "n_shared_experts")) |v| {
+            if (v == .integer and v.integer != 0) {
+                log.err("mimo_v2: n_shared_experts {d} not supported\n", .{v.integer});
+                return error.UnsupportedMimoConfig;
+            }
+        }
+
+        // Pattern 0 = global, 1 = sliding; the dense MLP layers lead the stack.
+        const pattern = try jsonValue(.array, jsonField(cfg_obj, "hybrid_layer_pattern") orelse return error.UnsupportedMimoConfig);
+        const freq = try jsonValue(.array, jsonField(cfg_obj, "moe_layer_freq") orelse return error.UnsupportedMimoConfig);
+        if (pattern.items.len != config.num_hidden_layers or freq.items.len != config.num_hidden_layers or config.num_hidden_layers > 128) {
+            log.err("mimo_v2: hybrid_layer_pattern/moe_layer_freq must list all {d} layers\n", .{config.num_hidden_layers});
+            return error.UnsupportedMimoConfig;
+        }
+        config.has_explicit_layer_types = true;
+        for (pattern.items, freq.items, 0..) |p, f, i| {
+            config.layer_is_global[i] = (try jsonU32(p)) == 0;
+            const moe = (try jsonU32(f)) != 0;
+            if (!moe and config.first_k_dense_replace != i) {
+                log.err("mimo_v2: dense layer {d} after a MoE layer is not supported\n", .{i});
+                return error.UnsupportedMimoConfig;
+            }
+            if (!moe) config.first_k_dense_replace += 1;
+        }
+
+        // Root KV heads / theta are the GLOBAL layers'; `swa_*` the sliding ones.
+        config.num_global_key_value_heads = config.num_key_value_heads;
+        if (jsonField(cfg_obj, "swa_num_key_value_heads")) |v| config.num_key_value_heads = try jsonU32(v);
+        if (jsonField(cfg_obj, "swa_rope_theta")) |v| config.rope_local_base_freq = try jsonFloat(v);
+        if (jsonField(cfg_obj, "v_head_dim")) |v| config.v_head_dim = try jsonU32(v);
+        const same = .{ .{ "swa_head_dim", config.head_dim }, .{ "swa_v_head_dim", config.v_head_dim }, .{ "swa_num_attention_heads", config.num_attention_heads } };
+        inline for (same) |kv| {
+            if (jsonField(cfg_obj, kv[0])) |v| {
+                if ((try jsonU32(v)) != kv[1]) {
+                    log.err("mimo_v2: {s} differs from the global layers' (not supported)\n", .{kv[0]});
+                    return error.UnsupportedMimoConfig;
+                }
+            }
+        }
+        config.partial_rotary_factor_global = config.partial_rotary_factor;
+        config.query_pre_attn_scalar = config.head_dim;
+        config.rope_scaling_factor = 1.0;
+        // The MiMo-ViT tower is not wired: the generic vision_config block must not arm SigLIP.
+        config.has_vision = false;
     } else if (std.mem.eql(u8, model_type, "hy_v3")) {
         // Tencent Hunyuan 3 (Hy3, 295B-A21B MoE; July 2026). Pure
         // full-attention MoE that rides the qwen3_moe forward arms: GQA with
@@ -4921,6 +5035,89 @@ test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softpl
     try testing.expectEqual(@as(usize, 2), eos.len);
     try testing.expectEqual(@as(u32, 2), eos[0]);
     try testing.expectEqual(@as(u32, 24), eos[1]);
+}
+
+/// MiMo-V2.6-Flash in the mlx-lm layout (`tests/convert_mimo_v2.py`, mlx-community's
+/// mxfp4-q8), layers trimmed to 6.
+const mimo_v2_pack_json =
+    \\{
+    \\  "model_type": "mimo_v2",
+    \\  "add_full_attention_sink_bias": false, "add_swa_attention_sink_bias": true,
+    \\  "attention_projection_layout": "fused_qkv", "attention_value_scale": 0.707,
+    \\  "eos_token_id": 151645, "head_dim": 192, "hidden_size": 4096,
+    \\  "hybrid_layer_pattern": [0, 1, 1, 1, 1, 0],
+    \\  "intermediate_size": 16384, "layernorm_epsilon": 1e-06,
+    \\  "max_position_embeddings": 1048576, "moe_intermediate_size": 2048,
+    \\  "moe_layer_freq": [0, 1, 1, 1, 1, 1],
+    \\  "n_group": 1, "n_routed_experts": 256, "n_shared_experts": null, "norm_topk_prob": true,
+    \\  "num_attention_heads": 64, "num_experts_per_tok": 8, "num_hidden_layers": 6,
+    \\  "num_key_value_heads": 4, "num_nextn_predict_layers": 3, "partial_rotary_factor": 0.334,
+    \\  "rope_parameters": {"partial_rotary_factor": 0.334, "rope_theta": 10000000.0, "rope_type": "default"},
+    \\  "rope_theta": 10000000.0, "routed_scaling_factor": null, "scoring_func": "sigmoid",
+    \\  "sliding_window": 128, "swa_head_dim": 192, "swa_num_attention_heads": 64,
+    \\  "swa_num_key_value_heads": 8, "swa_rope_theta": 10000.0, "swa_v_head_dim": 128,
+    \\  "tie_word_embeddings": false, "topk_group": 1, "topk_method": "noaux_tc",
+    \\  "v_head_dim": 128, "vocab_size": 152576,
+    \\  "quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"},
+    \\  "quantization_config": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    \\}
+;
+
+test "ModelConfig: mimo_v2 pack config parse" {
+    const config = try parseConfigFromJson(testing.allocator, mimo_v2_pack_json);
+    try testing.expectEqualStrings("mimo_v2", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expect(!config.norm_has_offset and !config.scale_embeddings and !config.has_pre_ff_norm and !config.has_qk_norm);
+    try testing.expectEqual(QuantMode.mxfp4, config.quant_mode);
+    // Experts: sigmoid scores, selection-only bias, renormalized top-8; layer 0 dense.
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 2048), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 1), config.first_k_dense_replace);
+    try testing.expect(config.moe_sigmoid_router and config.moe_route_norm);
+    try testing.expectEqual(@as(f32, 1.0), config.router_scaling_factor);
+    // Pattern 0 = global (4 KV heads, theta 1e7), 1 = sliding (8 KV heads, theta 1e4, sinks).
+    try testing.expect(config.isGlobalLayer(0) and !config.isGlobalLayer(1) and config.isGlobalLayer(5));
+    try testing.expectEqual(@as(u32, 4), config.layerKVHeads(0));
+    try testing.expectEqual(@as(u32, 8), config.layerKVHeads(1));
+    try testing.expectEqual(@as(u32, 128), config.sliding_window);
+    try testing.expect(config.has_attn_sinks);
+    try testing.expectEqual(@as(f32, 1e7), config.rope_theta);
+    try testing.expectEqual(@as(f32, 1e4), config.rope_local_base_freq);
+    // K 192 / V 128; rope covers int(192 * 0.334) = 64 dims; scale on the 192-wide key.
+    try testing.expectEqual(@as(u32, 192), config.layerHeadDim(1));
+    try testing.expectEqual(@as(u32, 128), config.layerVHeadDim(1));
+    try testing.expectEqual(@as(u32, 64), config.layerRopeDims(0));
+    try testing.expectEqual(@as(u32, 64), config.layerRopeDims(1));
+    try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
+    // V is scaled before caching, at runtime, as mlx-lm does.
+    try testing.expectEqual(@as(f32, 0.707), config.attention_value_scale);
+    // KV per token: each layer at its own heads and K+V widths, bf16.
+    try testing.expectEqual(@as(u64, (2 * 4 + 4 * 8) * (192 + 128) * 2), config.kvBytesPerToken());
+}
+
+test "ModelConfig: mimo_v2 source release is refused with the converter's name" {
+    // The release stores FP8 + per-expert MXFP4 (`quant_method: fp8`); mlx packs
+    // carry an mlx-style quantization_config and load.
+    const src = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json,
+        \\"quantization_config": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    ,
+        \\"quantization_config": {"quant_method": "fp8", "store_dtype": "mxfp4"}
+    );
+    defer testing.allocator.free(src);
+    try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, src));
+}
+
+test "ModelConfig: mimo_v2_flash (MiMo-V2-Flash, TensorFold/Vontra V2.6 packs) parses as mimo_v2" {
+    const flash = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json, "\"model_type\": \"mimo_v2\"", "\"model_type\": \"mimo_v2_flash\"");
+    defer testing.allocator.free(flash);
+    const config = try parseConfigFromJson(testing.allocator, flash);
+    try testing.expect(config.isMimo());
+    try testing.expectEqual(@as(f32, 0.707), config.attention_value_scale);
+    // MiMo-V2-Flash itself declares no V scale.
+    const v2 = try std.mem.replaceOwned(u8, testing.allocator, flash, "\"attention_value_scale\": 0.707,", "");
+    defer testing.allocator.free(v2);
+    try testing.expectEqual(@as(f32, 1.0), (try parseConfigFromJson(testing.allocator, v2)).attention_value_scale);
 }
 
 test "ModelConfig: gpt_oss (OpenAI gpt-oss-20b) config parse" {
