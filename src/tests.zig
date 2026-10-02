@@ -31,6 +31,7 @@ test {
     _ = @import("lane_qmm.zig");
     _ = @import("lane_attn.zig");
     _ = @import("add_norm.zig");
+    _ = @import("moe_fp4.zig");
     _ = @import("gdn_decode.zig");
     _ = @import("row_attn.zig");
     _ = @import("keyed_sample.zig");

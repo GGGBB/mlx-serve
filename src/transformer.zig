@@ -2338,9 +2338,9 @@ const ATTN256_KERNEL_HEADER =
 const ATTN256_KERNEL_SOURCE =
     \\constexpr int BQ = 64;
     \\constexpr int BK = 32;
-    \\constexpr int BD = 256;
+    \\// BDK = q/k head width, BDV = v head width (256/256, or MiMo's 192/128).
     \\constexpr int LDK = BK + 8;
-    \\constexpr int LDV = BD + 8;
+    \\constexpr int LDV = BDV + 8;
     \\constexpr int NT = 256;
     \\
     \\const int qL = q_shape[2];
@@ -2378,12 +2378,11 @@ const ATTN256_KERNEL_SOURCE =
     \\    + (long)(tqx * BQ) * q_strides[2];
     \\const device T* Kp = k + bb * k_strides[0] + (hq / gqa) * k_strides[1];
     \\const device T* Vp = v + bb * v_strides[0] + (hq / gqa) * v_strides[1];
-    \\device T* Op = out + (((long)bb * Hq + hq) * (long)qL + (long)(tqx * BQ)) * BD;
+    \\device T* Op = out + (((long)bb * Hq + hq) * (long)qL + (long)(tqx * BQ)) * BDV;
     \\
-    \\// K^T tile [BD][LDK] (20.5 KB) is strictly larger than the V tile
-    \\// [BK][LDV] (16.9 KB) — share one buffer, steel-style (barriers separate
-    \\// the K reads from the V staging).
-    \\threadgroup T KVs[LDK * BD];
+    \\// The K^T tile [BDK][LDK] and the V tile [BK][LDV] share one buffer,
+    \\// steel-style (barriers separate the K reads from the V staging).
+    \\threadgroup T KVs[LDK * BDK > BK * LDV ? LDK * BDK : BK * LDV];
     \\threadgroup T* Ks = KVs;
     \\threadgroup T* Vs = KVs;
     \\
@@ -2401,27 +2400,33 @@ const ATTN256_KERNEL_SOURCE =
     \\// vec2 load is 4B-aligned for any row whose stride is even (structural:
     \\// q rows stride 256). Rows past the ragged tail read zero — their
     \\// outputs are discarded by the store guard.
-    \\float2 Qfrag[BD / 8];
+    \\float2 Qfrag[BDK / 8];
     \\{
     \\  const int qr = tm + sm;
     \\  if (qr < q_rows) {
     \\    const device T* Qrow = Qp + (long)qr * q_strides[2];
-    \\    for (int dd = 0; dd < BD / 8; ++dd) {
+    \\    for (int dd = 0; dd < BDK / 8; ++dd) {
     \\      const vec<T, 2> p = *((const device vec<T, 2>*)(Qrow + dd * 8 + sn));
     \\      Qfrag[dd] = float2(float(p.x), float(p.y));
     \\    }
     \\  } else {
-    \\    for (int dd = 0; dd < BD / 8; ++dd) Qfrag[dd] = float2(0.0f);
+    \\    for (int dd = 0; dd < BDK / 8; ++dd) Qfrag[dd] = float2(0.0f);
     \\  }
     \\}
     \\
-    \\float2 Ofrag[BD / 8];
-    \\for (int i = 0; i < BD / 8; ++i) Ofrag[i] = float2(0.0f);
+    \\float2 Ofrag[BDV / 8];
+    \\for (int i = 0; i < BDV / 8; ++i) Ofrag[i] = float2(0.0f);
     \\// Init max FINITE (not -inf) so the rescale factor exp2(old-new) can
     \\// never be exp2(nan); masked scores use true -INFINITY so a row whose
     \\// first blocks are fully banded out contributes exp2(-inf)=0, not 1.
     \\float max_score = -3.0e38f;
     \\float sum_score = 0.0f;
+    \\// A learned per-head sink is one more softmax column with no value row:
+    \\// it seeds the running max and sum (exp2(0) = 1), never O.
+    \\if (SINK) {
+    \\  max_score = float(sinks[hq]) * 1.44269504088896340736f;
+    \\  sum_score = 1.0f;
+    \\}
     \\
     \\// Resume carried softmax state from the previous kv chunk. Rows past
     \\// the ragged q tail never carry (their outputs are discarded anyway).
@@ -2435,8 +2440,8 @@ const ATTN256_KERNEL_SOURCE =
     \\    const long crow = (((long)bb * Hq + hq) * (long)qL + (long)(tqx * BQ + qr));
     \\    max_score = m_in[crow];
     \\    sum_score = l_in[crow];
-    \\    const long obase = crow * (long)BD;
-    \\    for (int dd = 0; dd < BD / 8; ++dd) {
+    \\    const long obase = crow * (long)BDV;
+    \\    for (int dd = 0; dd < BDV / 8; ++dd) {
     \\      Ofrag[dd] = float2(o_in[obase + dd * 8 + sn], o_in[obase + dd * 8 + sn + 1]);
     \\    }
     \\  }
@@ -2466,9 +2471,9 @@ const ATTN256_KERNEL_SOURCE =
     \\  // Stage K transposed (Ks[d][kk]): uint4 global loads (8 bf16 each),
     \\  // scalar transposed scatter into smem.
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
-    \\    const int r = i >> 5;
-    \\    const int c8 = i & 31;
+    \\  for (int i = tix; i < BK * (BDK / 8); i += NT) {
+    \\    const int r = i / (BDK / 8);
+    \\    const int c8 = i % (BDK / 8);
     \\    uint4 w = uint4(0);
     \\    if (r < rows_k) {
     \\      w = *((const device uint4*)(Kp + (long)(c0 + r) * k_strides[2]) + c8);
@@ -2489,7 +2494,7 @@ const ATTN256_KERNEL_SOURCE =
     \\  // S = Q @ K^T for this simdgroup's 8 query rows.
     \\  float2 Sfrag[BK / 8];
     \\  for (int i = 0; i < BK / 8; ++i) Sfrag[i] = float2(0.0f);
-    \\  for (int dd = 0; dd < BD / 8; ++dd) {
+    \\  for (int dd = 0; dd < BDK / 8; ++dd) {
     \\    const float2 qf = Qfrag[dd];
     \\    const int kbase = Ks_off + dd * 8 * LDK;
     \\    const float2 kf0 = float2(float(Ks[kbase]), float(Ks[kbase + 1]));
@@ -2526,9 +2531,9 @@ const ATTN256_KERNEL_SOURCE =
     \\
     \\  // Stage V (same smem as K — K reads are done): uint4 on both sides.
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
-    \\    const int r = i >> 5;
-    \\    const int c8 = i & 31;
+    \\  for (int i = tix; i < BK * (BDV / 8); i += NT) {
+    \\    const int r = i / (BDV / 8);
+    \\    const int c8 = i % (BDV / 8);
     \\    uint4 w = uint4(0);
     \\    if (r < rows_k) {
     \\      w = *((const device uint4*)(Vp + (long)(c0 + r) * v_strides[2]) + c8);
@@ -2551,12 +2556,12 @@ const ATTN256_KERNEL_SOURCE =
     \\  const float rowsum = msv_row_sum(Sfrag[0]) + msv_row_sum(Sfrag[1])
     \\      + msv_row_sum(Sfrag[2]) + msv_row_sum(Sfrag[3]);
     \\  sum_score = sum_score * factor + rowsum;
-    \\  for (int i = 0; i < BD / 8; ++i) Ofrag[i] *= factor;
+    \\  for (int i = 0; i < BDV / 8; ++i) Ofrag[i] *= factor;
     \\
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\
     \\  // O += P @ V.
-    \\  for (int id = 0; id < BD / 8; ++id) {
+    \\  for (int id = 0; id < BDV / 8; ++id) {
     \\    const int vbase = Vs_off + id * 8;
     \\    const float2 vf0 = float2(float(Vs[vbase]), float(Vs[vbase + 1]));
     \\    const float2 vf1 = float2(float(Vs[vbase + 8 * LDV]),
@@ -2579,8 +2584,8 @@ const ATTN256_KERNEL_SOURCE =
     \\if (local_row < q_rows) {
     \\  if (is_final) {
     \\    const float inv = 1.0f / sum_score;
-    \\    device T* Optr = Op + (long)local_row * BD + sn;
-    \\    for (int id = 0; id < BD / 8; ++id) {
+    \\    device T* Optr = Op + (long)local_row * BDV + sn;
+    \\    for (int id = 0; id < BDV / 8; ++id) {
     \\      Optr[id * 8] = T(Ofrag[id].x * inv);
     \\      Optr[id * 8 + 1] = T(Ofrag[id].y * inv);
     \\    }
@@ -2588,8 +2593,8 @@ const ATTN256_KERNEL_SOURCE =
     \\    const long crow = (((long)bb * Hq + hq) * (long)qL + (long)(tqx * BQ + local_row));
     \\    m_out[crow] = max_score;
     \\    l_out[crow] = sum_score;
-    \\    device float* Orow = o_out + crow * (long)BD;
-    \\    for (int id = 0; id < BD / 8; ++id) {
+    \\    device float* Orow = o_out + crow * (long)BDV;
+    \\    for (int id = 0; id < BDV / 8; ++id) {
     \\      Orow[id * 8 + sn] = Ofrag[id].x;
     \\      Orow[id * 8 + sn + 1] = Ofrag[id].y;
     \\    }
@@ -2601,7 +2606,7 @@ var attn256_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
 fn getAttn256Kernel() !mlx.mlx_fast_metal_kernel {
     if (attn256_kernel_cached) |kk| return kk;
-    const input_names = [_][*:0]const u8{ "q", "k", "v", "scl", "win", "kr", "phase", "m_in", "l_in", "o_in", "mask", "skip" };
+    const input_names = [_][*:0]const u8{ "q", "k", "v", "scl", "win", "kr", "phase", "m_in", "l_in", "o_in", "mask", "skip", "sinks" };
     const output_names = [_][*:0]const u8{ "out", "m_out", "l_out", "o_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -2764,7 +2769,16 @@ pub fn fusedSdpa256Prefill(
         // causal arm yields to the stock fused kernel on NAX.
         if (naxSdpaPreferred()) return null;
     }
-    return fusedSdpa256Impl(s, q, k, v, scale, window, null);
+    return fusedSdpa256Impl(s, q, k, v, scale, window, null, null);
+}
+
+/// The same kernel for the sink-attention arm (gpt_oss / MiMo): any of its head
+/// shapes (MiMo's q/k 192, v 128), the layer's learned sinks, causal or banded.
+/// MLX has no fused kernel at 192/128, so this one serves on NAX too. Null when
+/// it declines (gpt_oss's hd 64 keeps MLX's).
+pub fn fusedSinkAttnPrefill(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int, sinks: ?mlx.mlx_array) !?mlx.mlx_array {
+    if (!fused256Enabled()) return null;
+    return fusedSdpa256Impl(s, q, k, v, scale, window, null, sinks);
 }
 
 var qsa_fused_env_cached: ?bool = null;
@@ -2808,7 +2822,7 @@ pub fn fusedSdpa256Masked(
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     if (ms[0] != qs[0] or ms[1] != 1 or ms[2] != qs[2] or ms[3] != ks[2]) return null;
-    const out = try fusedSdpa256Impl(s, q, k, v, scale, 0, mask);
+    const out = try fusedSdpa256Impl(s, q, k, v, scale, 0, mask, null);
     if (out != null and !qsa_fused_logged) {
         qsa_fused_logged = true;
         log.info("[qsa-fused] engaged: msv_attn_p256 mask arm qL={d} kL={d} Hq={d} Hkv={d} (MLX_SERVE_QSA_FUSED=0 restores stock sdpa)\n", .{ qs[2], ks[2], qs[1], ks[1] });
@@ -7333,12 +7347,16 @@ fn fusedSdpa256Impl(
     scale: f32,
     window: c_int,
     mask: ?mlx.mlx_array,
+    /// Learned per-head softmax sinks [Hq] (gpt_oss / MiMo), or null.
+    sinks: ?mlx.mlx_array,
 ) !?mlx.mlx_array {
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     const vs = mlx.getShape(v);
-    if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
+    // q/k 256 with v 256, or MiMo's q/k 192 with v 128.
+    if (qs[3] != ks[3] or !((qs[3] == 256 and vs[3] == 256) or (qs[3] == 192 and vs[3] == 128))) return null;
+    const bdv: c_int = vs[3];
     // Short sequences (< 16: decode AND spec-decode VERIFY forwards) belong
     // to MLX's sdpa_vector, which covers hd 256 natively and beats a 64-row
     // prefill tile walking the whole KV for a few-row query — dispatching
@@ -7417,14 +7435,14 @@ fn fusedSdpa256Impl(
         const config = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         if (final) {
-            const o_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+            const o_shape = [_]c_int{ qs[0], qs[1], qs[2], bdv };
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, attn_dt));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, .float32));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, .float32));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, .float32));
         } else {
             const ml_shape = [_]c_int{ qs[0], qs[1], qs[2] };
-            const oc_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+            const oc_shape = [_]c_int{ qs[0], qs[1], qs[2], bdv };
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, attn_dt));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
@@ -7438,6 +7456,9 @@ fn fusedSdpa256Impl(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 8, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", attn_dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "QSA", if (mask != null) 1 else 0));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BDK", qs[3]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BDV", bdv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SINK", if (sinks != null) 1 else 0));
 
         const inputs_arr = [_]mlx.mlx_array{
             q,                                k,
@@ -7446,6 +7467,7 @@ fn fusedSdpa256Impl(
             phase,                            if (has_carry) m_prev else dummy,
             if (has_carry) l_prev else dummy, if (has_carry) o_prev else dummy,
             if (mask) |m| m else dummy_b,     if (mask != null) skip else dummy_b,
+            sinks orelse dummy,
         };
         const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
         defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -7677,6 +7699,7 @@ fn totalMemBytes() u64 {
 
 const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
+const moe_fp4 = @import("moe_fp4.zig");
 const Weights = model_mod.Weights;
 
 // ── KV Cache (standard attention) ──
@@ -28357,7 +28380,15 @@ pub const Transformer = struct {
 
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
-        if (is_full) {
+        const sinks: ?mlx.mlx_array = if (fa.sinks.ctx != null) fa.sinks else null;
+        const fused: ?mlx.mlx_array = if (is_prefill and seq_len >= FUSED256_MIN_Q_LEN)
+            try fusedSinkAttnPrefill(self.s, q_rope, full_k, full_v, attn_scale, if (is_full) 0 else @intCast(cfg.sliding_window), sinks)
+        else
+            null;
+        if (fused) |f| {
+            _ = mlx.mlx_array_free(attn_out);
+            attn_out = f;
+        } else if (is_full) {
             const mode: [*:0]const u8 = if (is_prefill) "causal" else "";
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, mode, none_mask, fa.sinks, false, self.s));
         } else {
@@ -31391,6 +31422,21 @@ pub const Transformer = struct {
         const dshape = [_]c_int{D};
         try mlx.check(mlx.mlx_reshape(&x_flat, expert_x, &dshape, 1, self.s));
 
+        // MXFP4 banks: the two-dispatch fp4 decode (row-group register reuse).
+        if (gate_qp.mode == .mxfp4 and up_qp.mode == .mxfp4 and down_qp.mode == .mxfp4) {
+            var scores_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(scores_flat);
+            try mlx.check(mlx.mlx_reshape(&scores_flat, norm_scores, &[_]c_int{K}, 1, self.s));
+            const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(x_flat), std.heap.c_allocator);
+            const bank = moe_fp4.Bank;
+            if (try moe_fp4.decode(self.s, x_flat, bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s }, bank{ .w = mw.switch_up_w, .s = mw.switch_up_s }, bank{ .w = mw.switch_down_w, .s = mw.switch_down_s }, inds_u32, scores_flat, sigtab, .mxfp4, gate_qp.group_size)) |y| {
+                defer _ = mlx.mlx_array_free(y);
+                try mlx.check(mlx.mlx_reshape(out, y, &[_]c_int{ B, S, D }, 3, self.s));
+                reduced.* = true;
+                return true;
+            }
+        }
+
         // gate / up share the single token's hidden state, so one kernel can
         // do both dot products and the activation — three dispatches off the
         // chain into down_proj. Falls back to the split form on any geometry,
@@ -31839,7 +31885,7 @@ pub const Transformer = struct {
             const gate_experts = mlx.getShape(mw.switch_gate_w)[0];
             const row_block = total_inds >= 16 and gate_experts > 0 and @divTrunc(total_inds, gate_experts) >= 4;
             if (input_view == null and !self.verifyFeatureEnabled(.routing, skip_shared, B, S) and
-                row_block and nax_available and gate_qp.mode == .affine and up_qp.mode == .affine)
+                row_block and nax_available and gate_qp.mode == up_qp.mode and (gate_qp.mode == .affine or gate_qp.mode == .mxfp4))
             {
                 var x_tok = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(x_tok);
@@ -31852,7 +31898,7 @@ pub const Transformer = struct {
                     gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
                 {
                     const sigtab = try @import("hc_prefill.zig").sigmoidTable(self.s);
-                    if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, gate_qp.bits, gate_qp.group_size, nax_available, self.s)) |act3| {
+                    if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, gate_qp.bits, gate_qp.group_size, gate_qp.mode == .mxfp4, nax_available, self.s)) |act3| {
                         // The kernel writes [M, 1, n]; the down gather below takes [M, n] like the squeezed stock path.
                         defer _ = mlx.mlx_array_free(act3);
                         var act = mlx.mlx_array_new();
@@ -31863,8 +31909,8 @@ pub const Transformer = struct {
                     }
                 }
                 if (fused_act == null) {
-                    mapped_gate = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, sorted_inds, gate_qp.bits, gate_qp.group_size, nax_available, self.s);
-                    mapped_up = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, up_qp.bits, up_qp.group_size, nax_available, self.s);
+                    mapped_gate = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode == .mxfp4, nax_available, self.s);
+                    mapped_up = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode == .mxfp4, nax_available, self.s);
                     if (mapped_gate == null or mapped_up == null) {
                         if (mapped_gate) |value| _ = mlx.mlx_array_free(value);
                         if (mapped_up) |value| _ = mlx.mlx_array_free(value);
@@ -38689,7 +38735,7 @@ fn sigmoidTableFor(s: mlx.mlx_stream, dt: mlx.mlx_dtype) !mlx.mlx_array {
     return if (dt == .bfloat16) @import("hc_prefill.zig").sigmoidTable(s) else swigluSigTable(s, dt, std.heap.c_allocator);
 }
 
-fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
+pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
     const slot: usize = switch (dt) {
         .bfloat16 => 0,
         .float16 => 1,
@@ -39491,10 +39537,7 @@ const GQMV_AFFINE_HEADER =
     \\}
 ;
 
-const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++
-    \\inline float mlxserve_e2m1(uint c) {
-    \\  return float(as_type<half>(ushort(((c & 0x7u) << 9) | ((c & 0x8u) << 12))));
-    \\}
+const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++
     \\inline float mlxserve_e4m3(uint b) {
     \\  return float(as_type<half>(ushort(((b & 0x7Fu) << 7) | ((b & 0x80u) << 8))));
     \\}
@@ -41564,8 +41607,8 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
         // correctly.
         try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_idx, rhs_idx, false, s));
     } else {
-        if (sorted and lhs_idx.ctx == null and mode == .affine) {
-            if (try gather_qmm_nax.sortedGather(x, w, sc, bi, rhs_idx, bits, group_size, verifyQmmNaxAvailable(), s)) |out| {
+        if (sorted and lhs_idx.ctx == null and (mode == .affine or mode == .mxfp4)) {
+            if (try gather_qmm_nax.sortedGather(x, w, sc, bi, rhs_idx, bits, group_size, mode == .mxfp4, verifyQmmNaxAvailable(), s)) |out| {
                 _ = mlx.mlx_array_free(res.*);
                 res.* = out;
                 return;
@@ -59475,6 +59518,55 @@ test "fusedSdpa256Prefill: sliding-band parity vs composed 'array' mask (Gemma l
 
     const max_diff = try attn256MaxDiff(fused, ref, s);
     try std.testing.expect(max_diff < 0.02);
+}
+
+test "fusedSinkAttnPrefill: q/k 192, v 128 with sinks matches MLX sdpa (causal and band, with a cache prefix)" {
+    // MiMo's attention: K 192 / V 128, GQA 8, a learned sink per head. The
+    // reference is MLX's composed sdpa with the same sinks and an explicit mask.
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x5191);
+    const rnd = prng.random();
+    fused256_override = true;
+    defer fused256_override = null;
+    const Hq: c_int = 16;
+    const Hk: c_int = 2;
+    const qL: c_int = 96;
+    for ([_]c_int{ 96, 200 }) |kL| for ([_]c_int{ 0, 40 }) |sw| {
+        const q = try attn256RandBf16(rnd, &.{ 1, Hq, qL, 192 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k = try attn256RandBf16(rnd, &.{ 1, Hk, kL, 192 }, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &.{ 1, Hk, kL, 128 }, s);
+        defer _ = mlx.mlx_array_free(v);
+        const sinks = try attn256RandBf16Scaled(rnd, &.{Hq}, 4.0, s);
+        defer _ = mlx.mlx_array_free(sinks);
+        const scale: f32 = 1.0 / @sqrt(192.0);
+
+        const mask_data = try std.testing.allocator.alloc(f32, @intCast(qL * kL));
+        defer std.testing.allocator.free(mask_data);
+        for (0..@intCast(qL)) |r| for (0..@intCast(kL)) |c| {
+            const row_abs: c_int = kL - qL + @as(c_int, @intCast(r));
+            const col: c_int = @intCast(c);
+            const masked = col > row_abs or (sw > 0 and row_abs - col >= sw);
+            mask_data[r * @as(usize, @intCast(kL)) + c] = if (masked) -std.math.inf(f32) else 0.0;
+        };
+        const mask_f32 = mlx.mlx_array_new_data(mask_data.ptr, &[_]c_int{ 1, 1, qL, kL }, 4, .float32);
+        defer _ = mlx.mlx_array_free(mask_f32);
+        var mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask);
+        try mlx.check(mlx.mlx_astype(&mask, mask_f32, .bfloat16, s));
+
+        const fused = (try fusedSinkAttnPrefill(s, q, k, v, scale, sw, sinks)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(fused);
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, k, v, scale, "array", mask, sinks, false, s));
+        const max_diff = try attn256MaxDiff(fused, ref, s);
+        std.testing.expect(max_diff < 0.02) catch |e| {
+            std.debug.print("\n[sink-attn] kL={d} sw={d} max diff {d:.4}\n", .{ kL, sw, max_diff });
+            return e;
+        };
+    };
 }
 
 test "fusedSdpa256Prefill: declines cleanly outside its envelope" {

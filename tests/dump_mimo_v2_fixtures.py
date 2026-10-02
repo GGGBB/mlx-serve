@@ -36,7 +36,7 @@ CONFIG = {
     "attention_bias": False, "attention_chunk_size": 128, "attention_dropout": 0.0,
     "attention_projection_layout": "fused_qkv", "attention_value_scale": 0.707,
     "bos_token_id": None, "eos_token_id": 1, "pad_token_id": 0,
-    "head_dim": 32, "v_head_dim": 16, "swa_head_dim": 32, "swa_v_head_dim": 16,
+    "head_dim": 192, "v_head_dim": 128, "swa_head_dim": 192, "swa_v_head_dim": 128,
     "hidden_act": "silu", "hidden_size": 128, "intermediate_size": 256,
     "hybrid_layer_pattern": [0, 1, 1, 0], "moe_layer_freq": [0, 1, 1, 1],
     "layernorm_epsilon": 1e-6, "max_position_embeddings": 4096,
