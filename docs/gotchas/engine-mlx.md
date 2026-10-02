@@ -5416,3 +5416,10 @@ raw BF16 rows do not depend on quantization group size`.
   slot's cached keys already carry their positions. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping
   branch of `qsaMask`, the gather's early return) and the raw pad-waste bill for such slots are gone.
 - Guard: `qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions`.
+
+### A per-round buffer sized by one drafter's cap overflows when another feeds the round
+
+MiMo's MTP history stash kept the round's committed ids in `[MAX_DEPTH + 1]u32` (9), but prompt-lookup rounds ride the same stash and commit up to `mtp_lookup.MAX_DRAFT_STRONG` (14) drafts. The first whole-file edit that engaged lookup wrote past the array; ReleaseFast has no bounds check, so the write landed in the generator's `ForwardCtx` and the next verify spliced a garbage `vision_embeddings` handle (`spliceVisionRows`, SIGSEGV at a two-u32 address). A ReleaseSafe build named the line at once (`index 9, len 9`).
+
+Fix: `MAX_ROUND_DRAFTS` = the max over every round producer, used by the stash and the merged history. Guard: `tests/test_mimo_v2.sh` [9] (a whole-file edit that engages lookup). Tell: a segfault on a field nothing writes, at an address made of small integers — rebuild ReleaseSafe and replay.
+

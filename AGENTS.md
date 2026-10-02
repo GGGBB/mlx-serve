@@ -368,6 +368,7 @@ Spec decode:
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).
 - **The token budget is a PRE-COMMIT invariant in every block decoder**; blocks publish through ONE `+= 1` loop.
 - **A spec path that refuses a KV scheme must be gated at LOAD, or implemented**: `compactRows` refused quantized KV mid-decode, so a draft tree under `--kv-quant 8` 500'd the second request. Guard: smoke `drafter_kv8`.
+- **A per-round buffer takes the max over EVERY round producer** (`generate.MAX_ROUND_DRAFTS`: head chain AND prompt lookup): a stash sized by `MAX_DEPTH` overflowed on a 14-draft lookup round and corrupted `ForwardCtx` (ReleaseFast, no bounds check). A segfault on a field nothing writes ⇒ replay on ReleaseSafe.
 - **A committed argmax is a `CommittedArgmax`** from `verifyArgmax` only (masks reserved ids); acceptance-test argmaxes are exempt.
 - **No KV snapshots across verify**: rollback = scalar anchors + per-position SSM capture + offset-only `truncate`. A multi-token forward is not a prefill (`prefillEvalCadenceApplies`, seq ≥ 32).
 - **Dispatch discipline**: all four surfaces × stream/non-stream wire `use_*` via ONE `server.requestSpecModes`; priority DFlash > MTP > gemma drafter > PLD; MTP default = `defaultEnableMtp` (any loaded head, MoE included); logprobs>0 + grammar disable spec; tools disable NOTHING; engagement COUNTS in tests.
