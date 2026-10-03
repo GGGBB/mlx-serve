@@ -481,6 +481,16 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 --------------------------------------------------------------------------------
+Fast-Quadric-Mesh-Simplification
+https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification
+Copyright (c) 2015-2019 Spacerat and contributors
+Licensed under the MIT License (see lib/fqms/LICENSE).
+
+`Simplify.h` at 65df07dc, vendored unmodified under `lib/fqms/` with a C shim
+and compiled into the mlx-serve binary: the quadric decimation the Hunyuan3D
+texture stage runs before its UV unwrap.
+
+--------------------------------------------------------------------------------
 stb_image / stb_image_write
 https://github.com/nothings/stb
 Copyright (c) 2017 Sean Barrett

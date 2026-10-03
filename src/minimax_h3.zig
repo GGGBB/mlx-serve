@@ -4411,7 +4411,7 @@ fn generateOne(
                 sc_consec += 1;
                 sc_skipped += 1;
                 if (progress) |p| {
-                    if (p.cancelled()) return error.Cancelled;
+                    if (p.boundary()) return error.Cancelled;
                     p.emit("Generating", @intCast(i + 1), req.steps);
                 }
                 log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
@@ -4453,7 +4453,7 @@ fn generateOne(
             // pre-Euler noisy latent. Cached-velocity steps already continued
             // above without a preview. A failed JPEG never fails the job.
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 tryEmitH3Preview(p, allocator, "Generating", @intCast(i + 1), req.steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
             }
 
@@ -4496,7 +4496,7 @@ fn generateOne(
             try mlx.check(mlx.mlx_array_eval(video_x));
             try mlx.check(mlx.mlx_array_eval(audio_x));
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
             }
             // Every denoise loop owes a periodic cache clear: MLX's pool is
             // unbounded and these shapes repeat, so without it the process

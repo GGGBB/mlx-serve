@@ -1461,7 +1461,7 @@ pub fn denoise(dit: *Dit, allocator: std.mem.Allocator, cond: mlx.mlx_array, ste
         const ds = sigmas[i + 1] - sigmas[i];
         if (ds == 0.0) continue; // the appended trailing σ — a no-op step
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("denoise", @intCast(i + 1), steps);
         }
         const xh = try astype(x, .float16, s);
@@ -1904,7 +1904,7 @@ pub fn decodeVolume(vae: *VaeDecoder, allocator: std.mem.Allocator, latent_set: 
         @memcpy(grid[start .. start + count], data[0..count]);
         start += count;
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("volume", ci + 1, n_chunks);
         }
     }
@@ -1969,7 +1969,7 @@ pub fn fillGridHierarchical(
             evaluated += count;
             start += count;
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit("volume", ci + 1, cchunks);
             }
         }
@@ -2096,7 +2096,7 @@ pub fn fillGridHierarchical(
         evaluated += count;
         start += count;
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("volume", cchunks + ri + 1, cchunks + rchunks);
         }
     }
@@ -2198,7 +2198,7 @@ pub const Engine = struct {
         defer _ = mlx.mlx_array_free(cond);
         _ = mlx.mlx_array_eval(cond);
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("encode", 1, 1);
         }
 
@@ -2216,7 +2216,8 @@ pub const Engine = struct {
         if (progress) |p| p.emit("mesh", 0, 1);
         const n: usize = res + 1;
         const mc_scale = 2.0 * VOLUME_BOUND / @as(f32, @floatFromInt(res + 1));
-        const mesh = try mc.extract(alloc, grid, .{ n, n, n }, opts.mc_level, .{ mc_scale, mc_scale, mc_scale }, .{ -VOLUME_BOUND, -VOLUME_BOUND, -VOLUME_BOUND });
+        // Pure CPU over the host grid (zero MLX): a worker runs it while chat keeps this thread.
+        const mesh = try sse.offload(mc.extract, .{ alloc, grid, [3]usize{ n, n, n }, opts.mc_level, [3]f32{ mc_scale, mc_scale, mc_scale }, [3]f32{ -VOLUME_BOUND, -VOLUME_BOUND, -VOLUME_BOUND } });
         if (progress) |p| p.emit("mesh", 1, 1);
         return mesh;
     }
@@ -2225,7 +2226,7 @@ pub const Engine = struct {
     pub fn generateGlb(self: *Engine, alloc: std.mem.Allocator, image_rgba: []const u8, w: u32, h: u32, opts: MeshOpts, progress: ?sse.Progress) ![]u8 {
         var mesh = try self.generateMeshRaw(alloc, image_rgba, w, h, opts, progress);
         defer mesh.deinit(alloc);
-        return glb.writeGlb(alloc, &mesh);
+        return sse.offload(glb.writeGlb, .{ alloc, &mesh });
     }
 };
 

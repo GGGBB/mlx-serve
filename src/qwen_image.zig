@@ -2188,7 +2188,7 @@ pub const Engine = struct {
             var neg_cache: ?PrefixCache = if (use_prefix_cache and neg_geo != null) try PrefixCache.init(allocator, self.dit.blocks.len, &neg_geo.?, s) else null;
             defer if (neg_cache) |*c| c.deinit();
             for (start..n_steps) |i| {
-                if (progress) |p| if (p.cancelled()) return error.Cancelled;
+                if (progress) |p| if (p.boundary()) return error.Cancelled;
                 var v = try self.dit.forwardCached(img, cond.pos, sigmas[i], &geo, if (pos_cache) |*c| c else null);
                 defer free(v);
                 if (cond.neg) |neg| {
@@ -2413,7 +2413,7 @@ pub const Engine = struct {
         // 6. Euler denoise: the packed stream is [refs (constant clean) |
         //    target]; only the target rows step.
         for (0..n_steps) |i| {
-            if (progress) |p| if (p.cancelled()) return error.Cancelled;
+            if (progress) |p| if (p.boundary()) return error.Cancelled;
             const model_input = try concat(&.{ ref_latents, target }, 1, s);
             defer free(model_input);
             var v = try self.dit.forwardEdit(model_input, cond.hidden, mask_pos, sigmas[i], &geo);

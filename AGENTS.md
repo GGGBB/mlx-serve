@@ -52,7 +52,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `tts.zig` | Qwen3-TTS incl. ECAPA-TDNN voice clone |
 | `kokoro.zig` / `kokoro_g2p.zig` | Kokoro-82M TTS + text→IPA G2P (no espeak — GPLv3) |
 | `laya.zig` | Laya typed decisions (`POST /v1/decisions`): mmBERT/ModernBERT encoder + decision head, prompt layout and output JSON mirror `laya_mlx`; `.decision` modality slot |
-| `marching_cubes.zig` / `glb.zig` / `uvwrap.zig` / `rasterize.zig` / `texinpaint.zig` | Pure-Zig mesh/GLB/xatlas/rasterizer/inpaint (zero MLX, hermetic tests) |
+| `marching_cubes.zig` / `glb.zig` / `uvwrap.zig` / `mesh_simplify.zig` / `rasterize.zig` / `texinpaint.zig` | Pure-Zig mesh/GLB/xatlas/FQMS decimation/rasterizer/inpaint (zero MLX, hermetic tests) |
 | `preview.zig` / `latent_rgb.zig` / `jpeg.zig` | Opt-in per-step video previews (#208): published latent→RGB map per backend (GENERATED — `tests/dump_latent_rgb_factors.py`), temporal pick + filmstrip, bilinear resize, baseline JPEG. Zero MLX; `zig build preview-test` is the Linux-runnable graph |
 | `responses.zig` | Responses API pure data: parser, envelope, `ResponseStore`, compaction |
 | `ws.zig` | RFC 6455 framing (server-side) |
@@ -112,7 +112,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 - KISS, DRY, YAGNI; simple is not easy: the elegant solution, minimal and fast code, no speculative abstractions or knobs.
 - Tests at the bottom of each source file; shell integration tests in `tests/`. Env levers only for paths with two arms worth comparing (lossy/tradeoff), never for an obvious win/fix.
 - Commit messages and PR bodies carry no `Co-Authored-By` or generated-by line.
-- Inference thread is the SOLE mlx caller (even frees) — media gen posts to `gen_queue`, never a gpu mutex. A long gen blocks chat decode (accepted).
+- Inference thread is the SOLE mlx caller (even frees) — media gen posts to `gen_queue`, never a gpu mutex. Chat runs between gen steps (`Progress.boundary`), CPU-only stages on a worker (`gen_sse.offload`), the job's peak billed to admission (`gen_reserve_bytes`).
 - Concurrent requests batch-decode on pure-attention archs + the qwen3_5 family incl. `qwen3_5_moe` and `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue, not a decode gate. The per-slot verdict is a `BatchVerdict` reason: `[batched] slot serial: <reason>` once per slot, `/props` `batching`, `/v1/models` `batched_decode`, `mlx_serve:decode_serial_total{reason}`. Slots entering a batch mid-generation drain lazy pipeline state first.
 - A batched group past 1024 KV tokens attends PER SLOT (`perSlotBatchedAttn`: own view, no pad/stack/array mask; causal + quantized-KV kernels eligible). Below that, and on qwen4's QSA reads, the STACKED arm is capped by PADDING WASTE (`groupKeepCount`, `MAX_PAD_WASTE` 1.5, must stay < 2.0); longest slots fall to serial.
 - A batched-decode guard that only runs at N=1 pins a shape that never ships: `MLX_SERVE_FORCE_BATCHED=1` at one slot still has `batch == 1` inside the forward (decode-attn-quant + fused QK-norm gates key on it). `tests/test_batched_equivalence.sh` runs a real two-stream arm; both kernels log `[batched] ... engaged (slots=N)`.
@@ -162,7 +162,7 @@ Models with `vision_config` but no vision weights disable vision. Embedded-engin
 
 ## Unified media generation
 
-One server, one registry — image/audio/video/3D coexist with chat. Engine slots are MODALITY-named unions on `LoadedModel`; new backend = one union arm + impl file. Gen runs on the inference thread via `gen_queue`; app flow load→generate→unload; headless starts idle. `model_discovery.isMediaModelType` and `gen.modalityFromType` are documented duplication — keep in sync. Downloads → `~/.mlx-serve/models` (Swift + Zig).
+One server, one registry — image/audio/video/3D coexist with chat. Engine slots are MODALITY-named unions on `LoadedModel`; new backend = one union arm + impl file. App flow load→generate→unload; headless starts idle. `model_discovery.isMediaModelType` and `gen.modalityFromType` are documented duplication — keep in sync. Downloads → `~/.mlx-serve/models` (Swift + Zig).
 
 - `POST /v1/images/edits` = OpenAI multipart translated by `gen.openaiEditFormToJson` into the `mode:"edit"` JSON body; unhonored fields = NAMED 400.
 - LoRAs are STACKED, ONE grammar across image/LTX/H3: `lora_paths`+`lora_scales` (cap 8, `gen.parseLoraFields`), summed at forward — never merged. Resident backends reconcile via `setLoras`; H3 pre-validates (`lora.validatePath`), Turbo = file 0.

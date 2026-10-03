@@ -2659,6 +2659,10 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     if (want_stream) try conn.writeAll(sse.headers);
 
     const wav = synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[audio] synthesis cancelled — client disconnected\n", .{});
+            return;
+        }
         log.err("[audio] synthesis failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "synthesis failed");

@@ -109,6 +109,7 @@ test {
     _ = @import("acestep.zig");
     _ = @import("music3.zig");
     _ = @import("uvwrap.zig");
+    _ = @import("mesh_simplify.zig");
     _ = @import("hunyuan3d_paint.zig");
     _ = @import("hunyuan3d_paint_unet.zig");
     _ = @import("rasterize.zig");

@@ -2420,3 +2420,19 @@ Guards: `resolveRequestModelId: a path names its own entry, never the default mo
 ## A stop string spanning tokens leaked its first bytes on every stream
 
 Defect: `stop: [", 12"]` streamed `…11, 1` where the non-stream reply ended `…11`, on chat, completions, messages and responses. Cause: each streaming loop sent a token as it decoded and the cut could trim only the ARRIVING token, never bytes already sent. Fix: `StopStream` holds a tail that could still begin a stop string until the next token decides it, and flushes it as one last token when generation ends without a match. Guard: `StopStream` unit test (every token split of the text) + `tests/test_api_edges.sh` stream == non-stream on all four surfaces.
+
+## A media job held the inference thread for its whole life (2026-10-03)
+
+Defect: a pi session on GLM-5.3 showed "Operation aborted" on every turn for 10+ minutes while
+its own asset script ran a textured Hunyuan3D job on the same server. Cause: `runGenRequests`
+ran the job to completion on the inference thread, so no chat request was admitted, prefilled
+or decoded until it returned, CPU-only stages (marching cubes, xatlas, bake, PNG/GLB) included.
+Fix: the loop body is `chatPass(.main)`; every backend's per-step poll is `Progress.boundary()`,
+which runs `chatPass(.yield)` for as long as the step took (`GenYield`, equal share) before the
+cancel check; a pure-CPU stage runs on a worker via `gen_sse.offload` while the inference thread
+serves chat; the job's estimated peak is billed to chat admission (`gen_reserve_bytes`), since a
+chat prefill taking a later denoise step's memory is an uncatchable Metal OOM. Chat's decode clocks reset at
+each boundary and at job end (`invalidateDecodeClocks`), or a media step folds into the round-cost table
+as one slow spec round. Loads still run whole.
+Guard: `tests/test_gen_chat_interleave.sh` (chat before gen, same image bytes, `[gen-yield] engaged`,
+cancel frees the server, chat during the mesh job), `admissionFits`, the `offload`/`boundary` tests.
