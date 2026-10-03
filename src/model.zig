@@ -827,14 +827,43 @@ pub const ModelConfig = struct {
         return self.longCtxGated();
     }
 
+    /// Rows a sliding layer keeps past its window on an arch that caches only the window
+    /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
+    pub const SLIDING_RING_SLACK: u32 = 2048;
+
+    /// Sliding layers cache a bounded ring of rows, as mlx-lm's `RotatingKVCache`, not every token.
+    pub fn slidingRing(self: *const ModelConfig) bool {
+        return self.isMimo();
+    }
+
+    pub fn slidingKeepRows(self: *const ModelConfig) u32 {
+        return self.sliding_window + SLIDING_RING_SLACK;
+    }
+
+    /// Dense bytes of ONE row across every ring layer (0 off `slidingRing`).
+    pub fn slidingRowBytes(self: *const ModelConfig) u64 {
+        if (!self.slidingRing()) return 0;
+        var sum: u64 = 0;
+        for (0..self.num_hidden_layers) |i| {
+            const li: u32 = @intCast(i);
+            if (!self.isGlobalLayer(li)) sum += self.layerKvRowBytes(li);
+        }
+        return sum;
+    }
+
+    fn layerKvRowBytes(self: *const ModelConfig, li: u32) u64 {
+        return @as(u64, self.layerKVHeads(li)) * (@as(u64, self.layerHeadDim(li)) + self.layerVHeadDim(li)) * 2;
+    }
+
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
         // An arch that declares its own V width (MiMo) also varies KV heads per
-        // layer type: billed layer by layer.
+        // layer type: billed layer by layer. Ring layers are a fixed per-slot term.
         if (self.v_head_dim > 0) {
             var sum: u64 = 0;
             for (0..self.num_hidden_layers) |i| {
                 const li: u32 = @intCast(i);
-                sum += @as(u64, self.layerKVHeads(li)) * (@as(u64, self.layerHeadDim(li)) + self.layerVHeadDim(li)) * 2;
+                if (self.slidingRing() and !self.isGlobalLayer(li)) continue;
+                sum += self.layerKvRowBytes(li);
             }
             return sum;
         }
@@ -1087,6 +1116,8 @@ pub const ModelConfig = struct {
     /// Says nothing about MoE/hybrid archs that merely share the same
     /// forward — those stay serial, by name, in both callers.
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
+        // MiMo: attention + row-generic MoE with no per-slot recurrent state to merge.
+        if (self.isMimo()) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
@@ -1213,7 +1244,10 @@ pub const ModelConfig = struct {
     /// an arch under the `<= 128` "fused SDPA covers it" early-out, so the
     /// score budget that exists for exactly this materializing path never
     /// applies. A new arch scoring wider than it stores adds its arm here.
+    /// 0 = no score tensor at all: MiMo's prefill attention is always a fused
+    /// kernel (`fusedSinkAttnPrefill`), whatever its width.
     pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
+        if (self.isMimo()) return 0;
         if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }
@@ -5092,8 +5126,10 @@ test "ModelConfig: mimo_v2 pack config parse" {
     try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
     // V is scaled before caching, at runtime, as mlx-lm does.
     try testing.expectEqual(@as(f32, 0.707), config.attention_value_scale);
-    // KV per token: each layer at its own heads and K+V widths, bf16.
-    try testing.expectEqual(@as(u64, (2 * 4 + 4 * 8) * (192 + 128) * 2), config.kvBytesPerToken());
+    // KV per token: the global layers only; a sliding layer holds a bounded ring of rows.
+    try testing.expectEqual(@as(u64, 2 * 4 * (192 + 128) * 2), config.kvBytesPerToken());
+    try testing.expectEqual(@as(u64, 4 * 8 * (192 + 128) * 2), config.slidingRowBytes());
+    try testing.expectEqual(@as(u32, 128 + ModelConfig.SLIDING_RING_SLACK), config.slidingKeepRows());
 }
 
 test "ModelConfig: mimo_v2 source release is refused with the converter's name" {

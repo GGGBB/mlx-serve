@@ -43,6 +43,9 @@ const KVCache = transformer_mod.KVCache;
 /// `serve()` runs. Per-request reads happen on the same thread that did the
 /// CLI parse, so no atomicity needed.
 pub var prefill_chunk_override: usize = 8192;
+/// Default chunk of an arch that builds no prefill score tensor (score width 0):
+/// only its MoE gather transient grows with the chunk, and the guard bills that.
+pub const WIDE_PREFILL_CHUNK: usize = 16384;
 
 /// Set by `--prefill-chunk` in main.zig. An operator-chosen width outranks the
 /// per-model chunk the memory sizer pins (`ModelConfig.pinned_prefill_chunk`);
@@ -225,10 +228,11 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     // the widest chunk whose one-off transient reserve still leaves this box a
     // real KV budget. It NARROWS, never raises, and an explicit
     // `--prefill-chunk` outranks it — the operator asked for a width.
+    const launch: usize = if (head_dim == 0 and !prefill_chunk_explicit) WIDE_PREFILL_CHUNK else prefill_chunk_override;
     const base: usize = if (prefill_chunk_explicit or pinned_chunk == 0)
-        prefill_chunk_override
+        launch
     else
-        @min(prefill_chunk_override, pinned_chunk);
+        @min(launch, pinned_chunk);
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
@@ -1242,23 +1246,19 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
-/// Tokens of KV capacity this prefill reserves up front (#353): removes the grow transient a
-/// long prefill pays, at the price of allocating generation headroom early. Gated on
-/// `longCtxGated`; every other arch keeps proportional growth (`reserve_tokens` stays 0).
-/// `MLX_SERVE_KV_RESERVE=0` turns it off inside the gate. `server.prefillRequestTerms` bills it.
+/// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
+/// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
+/// cache; generation headroom is pre-bought only under `longCtxGated`. `MLX_SERVE_KV_RESERVE=0`
+/// turns it off.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
     max_tokens: u64,
     chunk: u64,
 ) u64 {
-    if (!config.longCtxGated()) return 0;
-    return transformer_mod.KVCache.reservedTokens(
-        seq,
-        max_tokens,
-        chunk,
-        config.max_position_embeddings,
-    );
+    const prompt = if (seq > chunk) seq +| chunk else 0;
+    if (!config.longCtxGated()) return prompt;
+    return @max(prompt, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
 }
 
 /// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
@@ -16217,6 +16217,31 @@ test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE cap
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false, false, false));
 }
 
+test "boundedPrefillChunk: MiMo builds no prefill score tensor, so its chunk never shrinks with the prompt" {
+    const cfg: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .head_dim = 192, .num_attention_heads = 64, .has_sliding_window = true };
+    try testing.expectEqual(@as(u32, 0), cfg.prefillScoreHeadDim());
+    for ([_]usize{ 8192, 32768, 262_144 }) |ctx| try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, cfg.prefillScoreHeadDim(), 64, ctx, true, true, false));
+    try testing.expect(transformer_mod.prefillHeadDimFused(cfg.prefillScoreHeadDim()));
+}
+
+test "effectivePrefillChunk: an arch with no prefill score tensor defaults to the wide chunk, still under the pin and an explicit width" {
+    const saved = .{ prefill_chunk_override, prefill_chunk_explicit };
+    defer {
+        prefill_chunk_override = saved[0];
+        prefill_chunk_explicit = saved[1];
+    }
+    prefill_chunk_override = 8192;
+    prefill_chunk_explicit = false;
+    try testing.expectEqual(WIDE_PREFILL_CHUNK, effectivePrefillChunk(0, 64, 32768, true, true, false, 0));
+    try testing.expectEqual(WIDE_PREFILL_CHUNK, effectivePrefillChunk(0, 64, 32768, true, true, false, WIDE_PREFILL_CHUNK));
+    try testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(0, 64, 32768, true, true, false, 8192));
+    // Every other arch keeps the launch width.
+    try testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(128, 32, 32768, false, false, false, WIDE_PREFILL_CHUNK));
+    prefill_chunk_override = 4096;
+    prefill_chunk_explicit = true;
+    try testing.expectEqual(@as(usize, 4096), effectivePrefillChunk(0, 64, 32768, true, true, false, WIDE_PREFILL_CHUNK));
+}
+
 test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 rung, an ungated one caps at 4096" {
     std.debug.assert(transformer_mod.fused256_override == null);
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, true, true));
@@ -20176,9 +20201,8 @@ test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first
     try testing.expectEqual(@as(u8, 1), t.serial_probes[b]);
 }
 
-test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; every other arch keeps proportional growth" {
-    // The reservation pre-buys prompt + generation headroom + slack past 32k; a pure cost on an
-    // arch nobody measured, so it is gated.
+test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-buys generation headroom" {
+    // Headroom is a pure cost on an arch nobody measured, so it is gated; the prompt is written anyway.
     const t = std.testing;
     const chunk: u64 = 4096;
     const seq: u64 = 200_000;
@@ -20192,10 +20216,11 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     );
     try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk) > seq);
 
-    // Every other arch: zero, which leaves `nextCapacityReserved` == `nextCapacity`.
-    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama" }) |mt| {
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mimo_v2" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
-        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+        try t.expectEqual(seq + chunk, reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+        // One chunk never grows mid-prefill: nothing to reserve.
+        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, chunk, max_tokens, chunk));
     }
 
     var cache = try KVC.init(t.allocator, 4);

@@ -116,6 +116,13 @@ Used in mlx-serve (`src/transformer.zig`):
   * The segmented sorted NAX gather_qmm tile scan and affine matmul schedules,
     with row-mapped inputs and paired gate/up SwiGLU epilogue, ported from
     `omlx/patches/m5_gather_qmm_nax.py` at d6b2b92.
+  * The tensor-unit (NAX) prefill attention at q/k 192, v 128 with key-range
+    passes and the head-dim split (`src/nax_attention.zig`,
+    `src/kernels/nax_attention.metal`), and the NAX tile primitives
+    (`src/kernels/nax_tiles.metal`), ported from `omlx/utils/nax_attention.py`
+    and `omlx/custom_kernels/nax_tiles.py` at 5dcfe243. Both are MLX's own
+    steel NAX attention and tile code (Copyright (c) 2024-25 Apple Inc., MIT);
+    the sliding-window bound is ours.
     
 Used in mlx-serve (`lib/ane/`, `src/ane.zig`):
 

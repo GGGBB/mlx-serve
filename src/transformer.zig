@@ -2776,8 +2776,11 @@ pub fn fusedSdpa256Prefill(
 /// shapes (MiMo's q/k 192, v 128), the layer's learned sinks, causal or banded.
 /// MLX has no fused kernel at 192/128, so this one serves on NAX too. Null when
 /// it declines (gpt_oss's hd 64 keeps MLX's).
+/// No kill switch: MiMo bills no prefill score tensor (`prefillScoreHeadDim` 0),
+/// so a composed fallback here would be an unbilled one.
 pub fn fusedSinkAttnPrefill(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int, sinks: ?mlx.mlx_array) !?mlx.mlx_array {
-    if (!fused256Enabled()) return null;
+    // On NAX the tensor-unit kernel runs 192/128; ours takes everything else.
+    if (try @import("nax_attention.zig").attention(s, q, k, v, scale, window, sinks)) |out| return out;
     return fusedSdpa256Impl(s, q, k, v, scale, window, null, sinks);
 }
 
@@ -7732,6 +7735,13 @@ pub const KVCacheEntry = struct {
 
     offset: usize, // logical token count (may be < buffer capacity)
     initialized: bool,
+    /// Absolute position of buffer row 0: a sliding ring (`KVCache.updateSliding`) drops the
+    /// rows behind its window, so buffer row i holds token `base + i`.
+    base: usize = 0,
+    /// Rows a sliding ring keeps behind its write head, and the window every restore must still
+    /// cover. 0 = a full buffer that never drops a row.
+    keep: usize = 0,
+    window: usize = 0,
     shared_view: bool = false,
     /// Rows the restored snapshot had written; only read while `shared_view`.
     shared_rows: usize = 0,
@@ -7901,6 +7911,8 @@ var row_axis_verify_logged: bool = false;
 var verify_fail_after_flush: ?usize = null;
 var verify_fault_after_ple_row: ?usize = null;
 pub var deferred_ple_group_syncs: u64 = 0;
+/// Test seam: the full-buffer reference arm of the sliding-ring equivalence test.
+var sliding_ring_off_for_test = false;
 /// Slots one batched forward carries (twin of `scheduler.MAX_BATCH_GROUP`).
 const MAX_BATCH_ROWS = 32;
 var std_batched_logged: bool = false; // one-shot log guard
@@ -7912,7 +7924,8 @@ pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) 
     // and then fell through to the explicit-mask path anyway — gemma got
     // nothing from the trim at all.
     const band = fused256Enabled() and cfg.head_dim == 256 and seq_len >= FUSED256_MIN_Q_LEN;
-    const width: usize = if (band or !slidingBlockTrimEnabled()) 1 else SLIDING_TRIM_UNBOUNDED;
+    // A sliding ring holds only the tail, so it always trims.
+    const width: usize = if (band or (!slidingBlockTrimEnabled() and !cfg.slidingRing())) 1 else SLIDING_TRIM_UNBOUNDED;
     const span: u32 = if (cfg.has_sliding_window)
         slidingTailSpan(cfg.sliding_window, @intCast(seq_len), width)
     else
@@ -8015,6 +8028,9 @@ pub const KVCache = struct {
             built = i + 1;
             out[i].offset = src.offset;
             out[i].initialized = src.initialized;
+            out[i].base = src.base;
+            out[i].keep = src.keep;
+            out[i].window = src.window;
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&out[i].keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&out[i].values, src.values));
@@ -8039,6 +8055,9 @@ pub const KVCache = struct {
             dst.* = newEmptyKVEntry();
             dst.offset = src.offset;
             dst.initialized = src.initialized;
+            dst.base = src.base;
+            dst.keep = src.keep;
+            dst.window = src.window;
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&dst.keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&dst.values, src.values));
@@ -8049,7 +8068,7 @@ pub const KVCache = struct {
                     try mlx.check(mlx.mlx_array_set(&dst.values_biases, src.values_biases));
                 }
                 dst.shared_view = true;
-                dst.shared_rows = src.offset;
+                dst.shared_rows = src.offset - src.base;
             }
         }
         self.step = snap.step;
@@ -8360,53 +8379,51 @@ pub const KVCache = struct {
         const sc_last = sc_shape[3];
         const vsc_last = vsc_shape[3];
 
-        const oversized = self.restoredOversized(entry, new_len);
-        const will_grow = !entry.initialized or oversized or entry.offset + new_len > bufferCapacity(entry.keys);
+        const grow = self.planGrow(entry, new_len);
         if (entry.shared_view) {
-            if (entry.initialized and !will_grow) try cowAffineBuffers(s, entry);
+            if (entry.initialized and grow == null) try cowAffineBuffers(s, entry);
             entry.shared_view = false;
         }
 
         // 4. Grow buffers if needed (6 of them, in lockstep on the seq axis).
-        if (will_grow) {
-            const needed = entry.offset + new_len;
-            const cur_cap = if (oversized) entry.offset else if (entry.initialized) bufferCapacity(entry.keys) else 0;
-            const new_cap: c_int = @intCast(self.nextCapacityReserved(cur_cap, needed));
+        if (grow) |g| {
             kv_cap_buf_grows += 1;
-            try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
-            try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
+            try growQuantBuf(s, &entry.keys, g, B, heads, q_last, .uint32);
+            try growQuantBuf(s, &entry.values, g, B, heads, vq_last, .uint32);
             // Scales keep the dtype the quantizer emitted (the activation dtype): a
             // bf16 buffer under an f16 model widens every later layer to f32.
             const ksc_dt = mlx.mlx_array_dtype(new_kq.scales);
             const vsc_dt = mlx.mlx_array_dtype(new_vq.scales);
-            try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
-            try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
-            try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
-            try growQuantBuf(s, &entry.values_biases, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
+            try growQuantBuf(s, &entry.keys_scales, g, B, heads, sc_last, ksc_dt);
+            try growQuantBuf(s, &entry.keys_biases, g, B, heads, sc_last, ksc_dt);
+            try growQuantBuf(s, &entry.values_scales, g, B, heads, vsc_last, vsc_dt);
+            try growQuantBuf(s, &entry.values_biases, g, B, heads, vsc_last, vsc_dt);
+            entry.base += g.drop;
             entry.initialized = true;
         }
 
         // 5. slice_update each buffer at offset.
-        try writeAtOffset(s, &entry.keys, entry.offset, new_kq.q);
-        try writeAtOffset(s, &entry.values, entry.offset, new_vq.q);
-        try writeAtOffset(s, &entry.keys_scales, entry.offset, new_kq.scales);
-        try writeAtOffset(s, &entry.keys_biases, entry.offset, new_kq.biases);
-        try writeAtOffset(s, &entry.values_scales, entry.offset, new_vq.scales);
-        try writeAtOffset(s, &entry.values_biases, entry.offset, new_vq.biases);
+        const at = entry.offset - entry.base;
+        try writeAtOffset(s, &entry.keys, at, new_kq.q);
+        try writeAtOffset(s, &entry.values, at, new_vq.q);
+        try writeAtOffset(s, &entry.keys_scales, at, new_kq.scales);
+        try writeAtOffset(s, &entry.keys_biases, at, new_kq.biases);
+        try writeAtOffset(s, &entry.values_scales, at, new_vq.scales);
+        try writeAtOffset(s, &entry.values_biases, at, new_vq.biases);
 
         // 6. Update offset / step.
         entry.offset += new_len;
         if (layer == 0) self.step += new_len;
 
         // 7. Build views for all 6 buffers.
-        const total: c_int = @intCast(entry.offset);
+        const total: c_int = @intCast(entry.offset - entry.base);
         // `max_seq` is the TAIL SPAN this forward needs, not the raw window:
         // the caller sizes it with `slidingTailSpan` so a block-wide verify
         // gets `window + q_len - 1` and decode still gets `window`. 0 = keep
         // the whole cache. Honored at EVERY width — the old `new_len == 1`
         // gate is what silently made every spec verify read the full cache on
         // sliding layers.
-        const view_start: c_int = if (max_seq > 0 and entry.offset > max_seq)
+        const view_start: c_int = if (max_seq > 0 and total > max_seq)
             total - @as(c_int, @intCast(max_seq))
         else
             0;
@@ -8418,11 +8435,39 @@ pub const KVCache = struct {
         try buildSliceView(s, &entry.value_biases_view, entry.values_biases, total, view_start);
     }
 
+    /// `update` for a layer that attends only its last `window` keys: the buffer keeps the newest
+    /// `keep` rows (>= window) and drops the rest on its next grow, so it stays near keep + one
+    /// chunk however long the sequence runs. Positions stay absolute (`offset`, `step`).
+    pub fn updateSliding(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32, window: u32, keep: u32) !DenseKVView {
+        std.debug.assert(keep >= window and max_seq <= keep + @as(u32, @intCast(mlx.getShape(new_k)[2])));
+        const e = &self.entries[layer];
+        e.keep = keep;
+        e.window = window;
+        return self.update(layer, new_k, new_v, s, max_seq);
+    }
+
+    /// A grow: the capacity to allocate, and which of the current rows move into it.
+    const Grow = struct { cap: c_int, drop: usize, kept: usize };
+
+    /// The grow a write of `new_len` rows needs, or null. A sliding ring carries only its newest
+    /// `keep` rows across and ignores the request's reservation, which sizes a full buffer.
+    fn planGrow(self: *const KVCache, entry: *const KVCacheEntry, new_len: usize) ?Grow {
+        const rows = entry.offset - entry.base;
+        const oversized = self.restoredOversized(entry, new_len);
+        if (entry.initialized and !oversized and rows + new_len <= bufferCapacity(entry.keys)) return null;
+        const drop: usize = if (entry.initialized and entry.keep > 0 and rows > entry.keep) rows - entry.keep else 0;
+        const kept: usize = if (entry.initialized) rows - drop else 0;
+        const cur_cap = if (oversized) rows else if (entry.initialized) bufferCapacity(entry.keys) else 0;
+        const cap = if (entry.keep > 0) nextCapacity(cur_cap, kept + new_len) else self.nextCapacityReserved(cur_cap, kept + new_len);
+        return .{ .cap = @intCast(cap), .drop = drop, .kept = kept };
+    }
+
     /// A restore that kept only a short prefix of a longer entry regrows from that prefix instead
     /// of copying the whole buffer: a "hi" session restored from an 80k one kept the 80k capacity.
     fn restoredOversized(self: *const KVCache, entry: *const KVCacheEntry, new_len: usize) bool {
         if (!entry.initialized or !entry.shared_view) return false;
-        return entry.shared_rows > self.nextCapacityReserved(entry.offset, entry.offset + new_len);
+        const rows = entry.offset - entry.base;
+        return entry.shared_rows > self.nextCapacityReserved(rows, rows + new_len);
     }
 
     fn cowAffineBuffers(s: mlx.mlx_stream, entry: *KVCacheEntry) !void {
@@ -8462,10 +8507,9 @@ pub const KVCache = struct {
         const new_len: usize = @intCast(new_shape[2]);
         const v_head_dim = mlx.getShape(new_v)[3];
 
-        const oversized = self.restoredOversized(entry, new_len);
-        const will_grow = !entry.initialized or oversized or entry.offset + new_len > bufferCapacity(entry.keys);
+        const grow = self.planGrow(entry, new_len);
         if (entry.shared_view) {
-            if (entry.initialized and !will_grow) {
+            if (entry.initialized and grow == null) {
                 const k_owned = try materializedOwnedCopy(s, entry.keys);
                 _ = mlx.mlx_array_free(entry.keys);
                 entry.keys = k_owned;
@@ -8477,24 +8521,18 @@ pub const KVCache = struct {
         }
 
         // 3. Grow buffer if needed
-        if (will_grow) {
-            const B = new_shape[0];
-            const heads = new_shape[1];
-            const head_dim = new_shape[3];
+        if (grow) |g| {
             const dtype = mlx.mlx_array_dtype(new_k);
-            const needed = entry.offset + new_len;
-            const cur_cap = if (oversized) entry.offset else if (entry.initialized) bufferCapacity(entry.keys) else 0;
-            const new_cap: c_int = @intCast(self.nextCapacityReserved(cur_cap, needed));
             kv_cap_buf_grows += 1;
-            const initialized = entry.initialized;
-            try growQuantBuf(s, &entry.keys, initialized, entry.offset, new_cap, B, heads, head_dim, dtype);
-            try growQuantBuf(s, &entry.values, initialized, entry.offset, new_cap, B, heads, v_head_dim, dtype);
+            try growQuantBuf(s, &entry.keys, g, new_shape[0], new_shape[1], new_shape[3], dtype);
+            try growQuantBuf(s, &entry.values, g, new_shape[0], new_shape[1], v_head_dim, dtype);
+            entry.base += g.drop;
             entry.initialized = true;
         }
 
         // 4. slice_update — write new_k/new_v into buffer at offset
-        try writeAtOffset(s, &entry.keys, entry.offset, new_k);
-        try writeAtOffset(s, &entry.values, entry.offset, new_v);
+        try writeAtOffset(s, &entry.keys, entry.offset - entry.base, new_k);
+        try writeAtOffset(s, &entry.values, entry.offset - entry.base, new_v);
 
         // 5. Update offset and absolute step
         entry.offset += new_len;
@@ -8503,14 +8541,14 @@ pub const KVCache = struct {
         // 6. Create views for attention.
         //    Skip slicing when the view covers the entire buffer — just reference it directly.
         //    This saves 2 C API calls per layer per token (84 calls/token for 42-layer models).
-        const total: c_int = @intCast(entry.offset);
+        const total: c_int = @intCast(entry.offset - entry.base);
         // `max_seq` is the TAIL SPAN this forward needs, not the raw window:
         // the caller sizes it with `slidingTailSpan` so a block-wide verify
         // gets `window + q_len - 1` and decode still gets `window`. 0 = keep
         // the whole cache. Honored at EVERY width — the old `new_len == 1`
         // gate is what silently made every spec verify read the full cache on
         // sliding layers.
-        const view_start: c_int = if (max_seq > 0 and entry.offset > max_seq)
+        const view_start: c_int = if (max_seq > 0 and total > max_seq)
             total - @as(c_int, @intCast(max_seq))
         else
             0;
@@ -8594,7 +8632,8 @@ pub const KVCache = struct {
     /// layers, since the credit must be provable for every buffer the prefill writes.
     pub fn residentCapacityTokens(self: *const KVCache) usize {
         var fold = CapacityFold{};
-        for (self.entries) |*e| fold.add(if (e.initialized) bufferCapacity(e.keys) else null);
+        // A sliding ring is billed as a fixed per-slot term, never by its capacity.
+        for (self.entries) |*e| fold.add(if (e.initialized and e.keep == 0) bufferCapacity(e.keys) else null);
         return fold.result();
     }
 
@@ -8602,19 +8641,20 @@ pub const KVCache = struct {
     /// buffer's last dim and dtype: six calls per `updateAffine` (3 buffers ×
     /// K and V) and two per `updateDense`. Every caller passes the width of
     /// the operand it is writing, which is what lets K and V differ.
-    fn growQuantBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, initialized: bool, offset: usize, new_cap: c_int, B: c_int, heads: c_int, last_dim: c_int, dtype: mlx.mlx_dtype) !void {
-        const buf_shape = [_]c_int{ B, heads, new_cap, last_dim };
-        if (initialized and offset > 0) {
+    fn growQuantBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, g: Grow, B: c_int, heads: c_int, last_dim: c_int, dtype: mlx.mlx_dtype) !void {
+        const buf_shape = [_]c_int{ B, heads, g.cap, last_dim };
+        if (g.kept > 0) {
             var new_buf = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(new_buf);
             try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
-            const off_c: c_int = @intCast(offset);
+            const off_c: c_int = @intCast(g.kept);
+            const drop_c: c_int = @intCast(g.drop);
             const su_start = [_]c_int{ 0, 0, 0, 0 };
             const su_stop = [_]c_int{ B, heads, off_c, last_dim };
             const su_strides = [_]c_int{ 1, 1, 1, 1 };
             var old_data = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(old_data);
-            try mlx.check(mlx.mlx_slice(&old_data, buf.*, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+            try mlx.check(mlx.mlx_slice(&old_data, buf.*, &[_]c_int{ 0, 0, drop_c, 0 }, 4, &[_]c_int{ B, heads, drop_c + off_c, last_dim }, 4, &su_strides, 4, s));
             var updated = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(updated);
             try mlx.check(mlx.mlx_slice_update(&updated, new_buf, old_data, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
@@ -8717,11 +8757,12 @@ pub const KVCache = struct {
         if (rows.len == 0) return;
         var idx_buf: [64]i32 = undefined;
         if (rows.len > idx_buf.len) return error.SpecTreeUnsupported;
-        for (rows, 0..) |r, i| idx_buf[i] = @intCast(base + r);
-        const idx = mlx.mlx_array_new_data(&idx_buf, &[_]c_int{@intCast(rows.len)}, 1, .int32);
-        defer _ = mlx.mlx_array_free(idx);
         for (self.entries) |*entry| {
             if (!entry.initialized) continue;
+            // Row indices are absolute; a sliding ring's buffer starts at `base`.
+            for (rows, 0..) |r, i| idx_buf[i] = @intCast(base + r - entry.base);
+            const idx = mlx.mlx_array_new_data(&idx_buf, &[_]c_int{@intCast(rows.len)}, 1, .int32);
+            defer _ = mlx.mlx_array_free(idx);
             // A quantized row's scales and biases move with it (groups run along head_dim).
             const bufs = [_]*mlx.mlx_array{ &entry.keys, &entry.values, &entry.keys_scales, &entry.keys_biases, &entry.values_scales, &entry.values_biases };
             for (bufs[0..if (self.config.scheme == .off) 2 else bufs.len]) |buf| {
@@ -8729,7 +8770,7 @@ pub const KVCache = struct {
                 var picked = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(picked);
                 try mlx.check(mlx.mlx_take_axis(&picked, buf.*, idx, 2, s));
-                const lo: c_int = @intCast(base + 1);
+                const lo: c_int = @intCast(base + 1 - entry.base);
                 const hi: c_int = lo + @as(c_int, @intCast(rows.len));
                 var moved = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_slice_update(&moved, buf.*, picked, &[_]c_int{ 0, 0, lo, 0 }, 4, &[_]c_int{ sh[0], sh[1], hi, sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
@@ -8742,6 +8783,10 @@ pub const KVCache = struct {
     }
 
     pub fn truncate(self: *KVCache, len: usize, s: mlx.mlx_stream) !void {
+        // A sliding ring cannot rewind past the rows it dropped: refuse before touching any entry.
+        for (self.entries) |*entry| {
+            if (entry.initialized and len > 0 and len < entry.offset and len < entry.base + entry.window) return error.SlidingRowsDropped;
+        }
         self.step = len;
         for (self.entries) |*entry| {
             if (!entry.initialized) continue;
@@ -8780,6 +8825,7 @@ pub const KVCache = struct {
                 }
                 entry.initialized = false;
                 entry.offset = 0;
+                entry.base = 0;
                 continue;
             }
 
@@ -8791,7 +8837,7 @@ pub const KVCache = struct {
             // against its OWN shape — an MLA cache's V is narrower than its K.
             const shape = mlx.getShape(entry.keys);
             if (shape.len < 4) continue;
-            const seq_end: c_int = @intCast(len);
+            const seq_end: c_int = @intCast(len - entry.base);
             const v_start = [_]c_int{ 0, 0, 0, 0 };
             const v_stop = [_]c_int{ shape[0], shape[1], seq_end, shape[3] };
             const v_strides = [_]c_int{ 1, 1, 1, 1 };
@@ -8832,6 +8878,16 @@ pub const KVCacheSnapshot = struct {
         self.allocator.free(self.entries);
     }
 
+    /// Shortest length this snapshot restores to: a sliding ring must still hold the window
+    /// behind it. 0 when no ring has dropped a row.
+    pub fn ringFloor(self: *const KVCacheSnapshot) usize {
+        var floor: usize = 0;
+        for (self.entries) |e| {
+            if (e.initialized and e.base > 0) floor = @max(floor, e.base + e.window);
+        }
+        return floor;
+    }
+
     /// Give up every array handle this snapshot holds, leaving it empty but deinit-able. The
     /// second half of restore by move: `KVCache.restore` binds through `mlx_array_set`, so the
     /// snapshot's second reference made `is_donatable()` fail and the first `writeAtOffset`
@@ -8865,8 +8921,12 @@ pub const KVCacheSnapshot = struct {
             built = i + 1;
             out[i].initialized = src.initialized;
             out[i].offset = @min(src.offset, len);
+            out[i].base = src.base;
+            out[i].keep = src.keep;
+            out[i].window = src.window;
+            if (src.initialized and out[i].offset < src.offset and out[i].offset < src.base + src.window) return error.SlidingRowsDropped;
             if (src.initialized) {
-                const keep = out[i].offset;
+                const keep = out[i].offset - src.base;
                 out[i].keys = try trimRowsOwned(src.keys, keep, s);
                 out[i].values = try trimRowsOwned(src.values, keep, s);
                 if (self.config.scheme != .off) {
@@ -19771,6 +19831,7 @@ pub const Transformer = struct {
     /// Pure cadence pick for the prefill layer loops (standard/MoE/hybrid).
     fn prefillEvalCadence(
         default_cadence: u32,
+        score_head_dim: u32,
         head_dim: u32,
         n_heads: u32,
         kv_heads: u32,
@@ -19778,9 +19839,13 @@ pub const Transformer = struct {
         total_kv: u64,
         kv_dequant: bool,
     ) u32 {
-        const scores: u64 = if (!prefillHeadDimFused(head_dim)) @as(u64, n_heads) * chunk_len * total_kv * 2 else 0;
+        const scores: u64 = if (score_head_dim > 0 and !prefillHeadDimFused(score_head_dim)) @as(u64, n_heads) * chunk_len * total_kv * 2 else 0;
         const dequant: u64 = if (kv_dequant) 2 * total_kv * @as(u64, kv_heads) * @as(u64, head_dim) * 2 else 0;
         return if (scores + dequant > PREFILL_EVAL_TRANSIENT_BUDGET) 1 else default_cadence;
+    }
+
+    fn prefillEvalCadenceFor(default_cadence: u32, cfg: *const ModelConfig, chunk_len: u64, total_kv: u64, kv_dequant: bool) u32 {
+        return prefillEvalCadence(default_cadence, cfg.prefillScoreHeadDim(), cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads, chunk_len, total_kv, kv_dequant);
     }
 
     /// Default forward context, routing through the Transformer's own state.
@@ -20727,6 +20792,7 @@ pub const Transformer = struct {
         // quantized cache's dense rebuild) — see prefillEvalCadence.
         const std_eval_cadence = prefillEvalCadence(
             EVAL_EVERY_N_LAYERS,
+            @max(hd, ghd),
             @max(hd, ghd),
             h_count,
             @max(kv_h, gkv_h),
@@ -21906,9 +21972,16 @@ pub const Transformer = struct {
             for (ml, 0..) |*lw, l| kinds_buf[l] = .{ .linear = lw.is_linear, .ple = lw.ple != null };
             break :blk kinds_buf;
         };
-        const bind = try ssmBindTickState(self.allocator, self.s, &self.ssm_group, ctxs, kinds, persist);
-        const merged = bind.merged;
-        defer if (bind.owned) {
+        // A trunk with no recurrent layer (MiMo) has no per-slot state to bind.
+        const stateless = !self.hasRecurrentLayers();
+        var merged: []SSMCacheEntry = &.{};
+        var merged_owned = false;
+        if (!stateless) {
+            const bind = try ssmBindTickState(self.allocator, self.s, &self.ssm_group, ctxs, kinds, persist);
+            merged = bind.merged;
+            merged_owned = bind.owned;
+        }
+        defer if (merged_owned) {
             for (merged) |*m| ssmFreeMergedLayer(m);
             self.allocator.free(merged);
         };
@@ -21921,7 +21994,7 @@ pub const Transformer = struct {
         var bctx: ForwardCtx = .{
             .cache = ctxs[0].cache,
             .moe_seq_offset = &scratch_offset,
-            .ssm_entries = merged,
+            .ssm_entries = if (stateless) null else merged,
             .capture_hidden = hidden_last,
             .capture_hidden_all = hidden_all,
             .capture_ssm_seq = capture_ssm,
@@ -21946,6 +22019,7 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(logits);
         }
         try self.flushDeferredPle(&bctx);
+        if (stateless) return logits;
 
         if (persist) {
             if (capture_ssm) {
@@ -22040,8 +22114,17 @@ pub const Transformer = struct {
     /// already carry initialized state for every linear layer — that is true
     /// after any prefill, and false for a slot that has not run one, whose
     /// zero-state would otherwise be merged at the wrong width.
+    /// Does a slot of this trunk carry per-layer recurrent state (GDN, PLE window)
+    /// the batched path merges? MiMo's attention + MoE trunk carries none.
+    pub fn hasRecurrentLayers(self: *const Transformer) bool {
+        const ml = self.moe_layers orelse return false;
+        for (ml) |*lw| if (lw.is_linear or lw.ple != null) return true;
+        return false;
+    }
+
     pub fn batchedGdnReady(self: *const Transformer, ctxs: []const *ForwardCtx) bool {
         const ml = self.moe_layers orelse return false;
+        if (!self.hasRecurrentLayers()) return true;
         for (ctxs) |c| {
             const entries = c.ssm_entries orelse return false;
             if (entries.len != ml.len) return false;
@@ -25268,11 +25351,9 @@ pub const Transformer = struct {
             .linear => |la| la.qkv_w,
         });
 
-        const eval_cadence = prefillEvalCadence(
+        const eval_cadence = prefillEvalCadenceFor(
             PREFILL_EVAL_CADENCE_DEFAULT,
-            cfg.head_dim,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
+            cfg,
             @intCast(seq_len),
             @as(u64, @intCast(offset)) + @as(u64, @intCast(seq_len)),
             ctx.cache.config.scheme != .off,
@@ -25493,11 +25574,9 @@ pub const Transformer = struct {
         // Eval cadence: drop to per-layer when this chunk's score/dequant
         // transients are large (unfused head_dim > 128 at long ctx, or a
         // quantized cache's dense rebuild) — see prefillEvalCadence.
-        const moe_eval_cadence = prefillEvalCadence(
+        const moe_eval_cadence = prefillEvalCadenceFor(
             PREFILL_EVAL_CADENCE_DEFAULT,
-            cfg.head_dim,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
+            cfg,
             @intCast(seq_len),
             @as(u64, @intCast(offset)) + @as(u64, @intCast(seq_len)),
             ctx.cache.config.scheme != .off,
@@ -26221,11 +26300,9 @@ pub const Transformer = struct {
         // transients are large — see prefillEvalCadence. LFM2/Nemotron-H ride
         // fused head dims, but a quantized KV cache's dense rebuild (and a
         // future head_dim-256 hybrid like qwen3_next) still counts.
-        const hybrid_eval_cadence = prefillEvalCadence(
+        const hybrid_eval_cadence = prefillEvalCadenceFor(
             PREFILL_EVAL_CADENCE_DEFAULT,
-            cfg.head_dim,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
+            cfg,
             @intCast(seq_len),
             @as(u64, @intCast(offset)) + @as(u64, @intCast(seq_len)),
             ctx.cache.config.scheme != .off,
@@ -28297,7 +28374,6 @@ pub const Transformer = struct {
         const v_shape = [_]c_int{ batch, seq_len, kv_h, vd };
         const flat_shape = [_]c_int{ batch, seq_len, h_count * vd };
         const perm = [_]c_int{ 0, 2, 1, 3 };
-        const perm_back = [_]c_int{ 0, 2, 1, 3 };
         // MiMo's verify windows read the decode copies its serial steps read.
         const decode_shape = batch == 1 and (!is_prefill or (cfg.isMimo() and seq_len <= dec_attn.MAX_ROWS));
 
@@ -28338,8 +28414,14 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(q_rope);
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
-        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+        if (ctx.batch_rope_offsets) |off_arr| {
+            // Batched decode: every slot sits at its own position.
+            try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, rope_dims, false, rope_base, 1.0, off_arr, rope_freqs, self.s));
+            try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, rope_base, 1.0, off_arr, rope_freqs, self.s));
+        } else {
+            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+        }
 
         // YaRN mscale on the rotated dims (full rotary here, so the whole
         // head). Cast to q/k's dtype first — an f32 table would promote the
@@ -28384,15 +28466,77 @@ pub const Transformer = struct {
         // than a bad answer. `cfg.sliding_window` here reads correct at
         // q_len == 1 (span == window) and kills the process on the first
         // spec-verify block or prefill chunk past the window.
+        if (ctx.batch_slots) |slots| {
+            const attn_b = try self.sinkAttnSlots(slots, q_rope, k_rope, v_t, fa, layer, seq_len, attn_scale);
+            defer _ = mlx.mlx_array_free(attn_b);
+            return self.sinkAttnOut(attn_b, fa, &flat_shape, decode_shape, layer);
+        }
         const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
         const max_kv: u32 = if (is_full) 0 else sliding.span;
-        var kv_view = try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
+        var kv_view = try self.sinkCacheUpdate(ctx.cache, layer, k_rope, v_t, max_kv);
         defer kv_view.deinit();
-        const full_k = kv_view.k;
-        const full_v = kv_view.v;
-
-        var attn_out = mlx.mlx_array_new();
+        const attn_out = try self.sinkAttnCore(q_rope, kv_view.k, kv_view.v, fa, layer, offset, seq_len, sliding.kv_len, attn_scale, local_prefill_mask, local_decode_mask);
         defer _ = mlx.mlx_array_free(attn_out);
+        return self.sinkAttnOut(attn_out, fa, &flat_shape, decode_shape, layer);
+    }
+
+    /// Each batched slot's attention over its own cache: the slot's row of the
+    /// stacked q/k/v, appended at the slot's own length and read through its own
+    /// sliding view. Returns `[N, H, S, V]`.
+    /// MiMo's sliding layers cache a ring of their newest rows (`ModelConfig.slidingRing`).
+    fn sinkCacheUpdate(self: *Transformer, cache: *KVCache, layer: u32, k: mlx.mlx_array, v: mlx.mlx_array, max_kv: u32) !DenseKVView {
+        const cfg = &self.config;
+        if (max_kv == 0 or !cfg.slidingRing() or sliding_ring_off_for_test) return cache.update(layer, k, v, self.s, max_kv);
+        return cache.updateSliding(layer, k, v, self.s, max_kv, cfg.sliding_window, cfg.slidingKeepRows());
+    }
+
+    fn sinkAttnSlots(self: *Transformer, slots: []const *ForwardCtx, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, fa: *const FullAttnWeights, layer: u32, seq_len: c_int, attn_scale: f32) !mlx.mlx_array {
+        const is_full = self.config.isGlobalLayer(layer);
+        var outs: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
+        var n: usize = 0;
+        defer for (outs[0..n]) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        for (slots, 0..) |slot, i| {
+            var rows: [3]mlx.mlx_array = undefined;
+            for (&rows, [_]mlx.mlx_array{ q, k, v }) |*dst, src| {
+                const sh = mlx.getShape(src);
+                dst.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice(dst, src, &.{ @intCast(i), 0, 0, 0 }, 4, &.{ @intCast(i + 1), sh[1], sh[2], sh[3] }, 4, &.{ 1, 1, 1, 1 }, 4, self.s));
+            }
+            defer for (rows) |r| {
+                _ = mlx.mlx_array_free(r);
+            };
+            const offset: c_int = @intCast(slot.cache.seqLen(layer));
+            const sliding = slidingViewFor(&self.config, offset + seq_len, seq_len);
+            var view = try self.sinkCacheUpdate(slot.cache, layer, rows[1], rows[2], if (is_full) 0 else sliding.span);
+            defer view.deinit();
+            var prefill_mask = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(prefill_mask);
+            // A slot's decode view is exactly its window, so no decode mask is needed.
+            outs[n] = try self.sinkAttnCore(rows[0], view.k, view.v, fa, layer, offset, seq_len, sliding.kv_len, attn_scale, &prefill_mask, .{ .ctx = null });
+            n += 1;
+        }
+        const vec = mlx.mlx_vector_array_new_data(&outs, n);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, self.s));
+        return out;
+    }
+
+    /// Attention of `q` [B, H, S, 192] over one cache view at its own `offset`
+    /// (keys before this block): fused kernels where they serve, MLX's SDPA with
+    /// the sinks, causal at S > 1 and banded to the window on sliding layers.
+    /// `prefill_mask` is built on first use and kept by the caller.
+    fn sinkAttnCore(self: *Transformer, q_rope: mlx.mlx_array, full_k: mlx.mlx_array, full_v: mlx.mlx_array, fa: *const FullAttnWeights, layer: u32, offset: c_int, seq_len: c_int, view_kv_len: c_int, attn_scale: f32, local_prefill_mask: *mlx.mlx_array, local_decode_mask: mlx.mlx_array) !mlx.mlx_array {
+        const cfg = &self.config;
+        const is_full = cfg.isGlobalLayer(layer);
+        const is_prefill = seq_len > 1;
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
+        var attn_out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(attn_out);
         const sinks: ?mlx.mlx_array = if (fa.sinks.ctx != null) fa.sinks else null;
         const fused: ?mlx.mlx_array = if (is_prefill and seq_len >= FUSED256_MIN_Q_LEN)
             try fusedSinkAttnPrefill(self.s, q_rope, full_k, full_v, attn_scale, if (is_full) 0 else @intCast(cfg.sliding_window), sinks)
@@ -28414,24 +28558,27 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, fa.sinks, false, self.s));
             } else if (is_prefill) {
                 if (local_prefill_mask.ctx == null) {
-                    // Built at the TRIMMED width, matching the view above.
-                    local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
+                    // Built at the TRIMMED width, matching the view.
+                    local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, view_kv_len, sw);
                 }
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, fa.sinks, false, self.s));
-            } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
+            } else if (total_kv <= sw or local_decode_mask.ctx == null) {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, fa.sinks, false, self.s));
             } else {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, fa.sinks, false, self.s));
             }
         }
+        return attn_out;
+    }
 
-        // [B,H,S,D] → [B,S,H*D] → o_proj (+ additive bias).
+    /// [B,H,S,D] → [B,S,H*D] → o_proj (+ additive bias).
+    fn sinkAttnOut(self: *Transformer, attn_out: mlx.mlx_array, fa: *const FullAttnWeights, flat_shape: *const [3]c_int, decode_shape: bool, layer: u32) !mlx.mlx_array {
         var attn_t = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_t);
-        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm_back, 4, self.s));
+        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &[_]c_int{ 0, 2, 1, 3 }, 4, self.s));
         var attn_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_flat);
-        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, flat_shape, 3, self.s));
         return self.attnProjBias(attn_flat, fa.o_w, fa.o_s, fa.o_b, fa.o_bias, decode_shape, layer);
     }
 
@@ -31863,7 +32010,8 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(flat_inds);
             try mlx.check(mlx.mlx_reshape(&flat_inds, inds, &flat_shape, 1, self.s));
 
-            const route_pack = if (self.verifyFeatureEnabled(.routing, skip_shared, B, S)) try verifyRoutePack(self.s, flat_inds, K) else null;
+            const verify_route = self.verifyFeatureEnabled(.routing, skip_shared, B, S);
+            const route_pack = if (verify_route) try verifyRoutePack(self.s, flat_inds, K) else try moePrefillRoutePack(self.s, flat_inds, K, @intCast(cfg.num_experts));
             var inv_order = if (route_pack) |value| value.inverse else mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(inv_order);
             var sorted_inds = if (route_pack) |value| value.sorted else mlx.mlx_array_new();
@@ -31879,7 +32027,7 @@ pub const Transformer = struct {
                 const k_arr = mlx.mlx_array_new_int(K);
                 defer _ = mlx.mlx_array_free(k_arr);
                 try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
-            } else {
+            } else if (verify_route) {
                 mtp_verify_kernel_calls[2] +%= 1;
                 const Once = struct {
                     var logged = false;
@@ -31887,6 +32035,14 @@ pub const Transformer = struct {
                 if (!Once.logged) {
                     Once.logged = true;
                     log.info("[mtp-verify] fused verifier route packing engaged\n", .{});
+                }
+            } else {
+                const Once = struct {
+                    var logged = false;
+                };
+                if (!Once.logged) {
+                    Once.logged = true;
+                    log.info("[moe] prefill counting-sort route packing engaged (assignments={d})\n", .{total_inds});
                 }
             }
 
@@ -42130,18 +42286,18 @@ fn verifyExpertReuse(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: 
     return out;
 }
 
-// Match the eight bf16 partial sums used by MLX col_reduce_small for top-10.
+// Match the eight bf16 partial sums used by MLX col_reduce_small (top-k rows, hidden H).
 const VERIFY_EXPERT_REDUCE_SOURCE =
     \\uint p = thread_position_in_grid.x;
-    \\uint row = p / 2560;
-    \\uint col = p % 2560;
+    \\uint row = p / H;
+    \\uint col = p % H;
     \\T partial[8];
     \\#pragma unroll
     \\for (uint i = 0; i < 8; ++i) partial[i] = T(0);
     \\#pragma unroll
-    \\for (uint e = 0; e < 10; ++e) {
-    \\  uint at = row * 10 + e;
-    \\  T product = down[size_t(inverse[at]) * 2560 + col] * scores[at];
+    \\for (uint e = 0; e < TOPK; ++e) {
+    \\  uint at = row * TOPK + e;
+    \\  T product = down[size_t(inverse[at]) * H + col] * scores[at];
     \\  partial[e % 8] = product + partial[e % 8];
     \\}
     \\T total = partial[0];
@@ -42150,7 +42306,7 @@ const VERIFY_EXPERT_REDUCE_SOURCE =
     \\y[p] = total;
 ;
 var verify_expert_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const ExpertReduceCfgs = QsaCfgCache([2]c_int, 1);
+const ExpertReduceCfgs = QsaCfgCache([3]c_int, 1);
 var verify_expert_reduce_cfgs = ExpertReduceCfgs{};
 var prefill_expert_reduce_cfgs = ExpertReduceCfgs{};
 
@@ -42178,10 +42334,14 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
     const ds = mlx.getShape(down);
     const ss = mlx.getShape(scores);
     const ix = mlx.getShape(inverse);
-    if (ds.len != 2 or ds[1] != 2560 or ss.len != 3 or ss[2] != 10 or ix.len != 1) return null;
+    // The partial-sum layout reproduces MLX's tree only at these (top_k, hidden) pairs.
+    if (ds.len != 2 or ss.len != 3 or ix.len != 1) return null;
+    const topk = ss[2];
+    const hidden = ds[1];
+    if (!((topk == 10 and hidden == 2560) or (topk == 8 and hidden == 4096))) return null;
     const batch = ss[0];
     const tokens = ss[1];
-    if (batch < 1 or tokens < 1 or batch * tokens < 2 or ds[0] != batch * tokens * 10 or ix[0] != ds[0]) return null;
+    if (batch < 1 or tokens < 1 or batch * tokens < 2 or ds[0] != batch * tokens * topk or ix[0] != ds[0]) return null;
     const kernel = blk: {
         if (verify_expert_reduce_kernel) |value| break :blk value;
         const ins = [_][*:0]const u8{ "down", "inverse", "scores" };
@@ -42195,15 +42355,17 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
         verify_expert_reduce_kernel = value;
         break :blk value;
     };
-    const key = [2]c_int{ batch, tokens };
+    const key = [3]c_int{ batch, tokens, topk };
     const cfg = blk: {
         if (cfgs.get(key)) |hit| break :blk hit[0];
         const value = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(value);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ batch, tokens, 2560 }, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, batch * tokens * 2560, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ batch, tokens, hidden }, 3, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, batch * tokens * hidden, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(value, 256, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(value, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(value, "TOPK", topk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(value, "H", hidden));
         cfgs.put(key, .{value});
         break :blk value;
     };
@@ -42407,6 +42569,129 @@ fn verifyRoutePack(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !?Verify
         @field(result, name) = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(&@field(result, name), ov, i));
     }
+    return result;
+}
+
+// A stable counting sort of routed expert ids for prefill widths, in three
+// dispatches over 256-id blocks: per-block histograms, one scan to (expert,
+// block) offsets, and a scatter that ranks ties by position within the block.
+const PREFILL_ROUTE_BLOCK: c_int = 256;
+const PREFILL_ROUTE_HIST_SOURCE =
+    \\threadgroup atomic_uint hist[E];
+    \\const uint lane = thread_index_in_threadgroup;
+    \\const uint block = threadgroup_position_in_grid.x;
+    \\for (uint e = lane; e < E; e += 256) atomic_store_explicit(&hist[e], 0u, memory_order_relaxed);
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\const uint i = block * 256 + lane;
+    \\if (i < uint(ids_shape[0]) && ids[i] < E) atomic_fetch_add_explicit(&hist[ids[i]], 1u, memory_order_relaxed);
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\for (uint e = lane; e < E; e += 256) counts[block * E + e] = atomic_load_explicit(&hist[e], memory_order_relaxed);
+;
+const PREFILL_ROUTE_SCAN_SOURCE =
+    \\threadgroup uint totals[E];
+    \\const uint lane = thread_index_in_threadgroup;
+    \\const uint nb = uint(counts_shape[0]) / E;
+    \\for (uint e = lane; e < E; e += 256) {
+    \\  uint total = 0;
+    \\  for (uint b = 0; b < nb; ++b) total += counts[b * E + e];
+    \\  totals[e] = total;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\for (uint e = lane; e < E; e += 256) {
+    \\  uint run = 0;
+    \\  for (uint j = 0; j < e; ++j) run += totals[j];
+    \\  for (uint b = 0; b < nb; ++b) {
+    \\    offsets[b * E + e] = run;
+    \\    run += counts[b * E + e];
+    \\  }
+    \\}
+;
+const PREFILL_ROUTE_SCATTER_SOURCE =
+    \\threadgroup uint keys[256];
+    \\const uint lane = thread_index_in_threadgroup;
+    \\const uint block = threadgroup_position_in_grid.x;
+    \\const uint i = block * 256 + lane;
+    \\const bool live = i < uint(ids_shape[0]);
+    \\const uint key = live ? ids[i] : 0xffffffffu;
+    \\keys[lane] = key;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (!live || key >= E) return;
+    \\uint rank = 0;
+    \\for (uint j = 0; j < lane; ++j) rank += uint(keys[j] == key);
+    \\const uint pos = offsets[block * E + key] + rank;
+    \\inverse[i] = pos;
+    \\sorted[pos] = key;
+    \\lhs[pos] = i / TOPK;
+;
+var prefill_route_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
+var prefill_route_configs = QsaCfgCache([3]c_int, 3){};
+
+fn prefillRouteKernel(slot: usize, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
+    if (prefill_route_kernels[slot]) |kernel| return kernel;
+    const iv = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const kernel = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, "", true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    prefill_route_kernels[slot] = kernel;
+    return kernel;
+}
+
+fn prefillRouteApply(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, cfg: mlx.mlx_fast_metal_kernel_config, outs: []const *mlx.mlx_array) !void {
+    const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, s));
+    for (outs, 0..) |out, i| try mlx.check(mlx.mlx_vector_array_get(out, ov, i));
+}
+
+/// `verifyRoutePack`'s outputs at prefill widths, where its all-pairs rank is
+/// quadratic. Ties keep input order, which is what MLX's argsort does.
+fn moePrefillRoutePack(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int, experts: c_int) !?VerifyRoutePack {
+    if (!mlx.streamIsGpu(s) or ids.ctx == null or mlx.mlx_array_dtype(ids) != .uint32) return null;
+    if (top_k < 1 or experts < 1 or experts > 1024) return null;
+    const shape = mlx.getShape(ids);
+    // Verify widths (<= 32 tokens) keep verifyRoutePack's own gates.
+    if (shape.len != 1 or @mod(shape[0], top_k) != 0 or @divTrunc(shape[0], top_k) <= 32) return null;
+    const n = shape[0];
+    const blocks = @divTrunc(n + PREFILL_ROUTE_BLOCK - 1, PREFILL_ROUTE_BLOCK);
+    const hist = try prefillRouteKernel(0, "prefill_route_hist", &.{"ids"}, &.{"counts"}, PREFILL_ROUTE_HIST_SOURCE);
+    const scan = try prefillRouteKernel(1, "prefill_route_scan", &.{"counts"}, &.{"offsets"}, PREFILL_ROUTE_SCAN_SOURCE);
+    const scatter = try prefillRouteKernel(2, "prefill_route_scatter", &.{ "ids", "offsets" }, &.{ "inverse", "sorted", "lhs" }, PREFILL_ROUTE_SCATTER_SOURCE);
+    const cfgs = blk: {
+        const key = [3]c_int{ n, top_k, experts };
+        if (prefill_route_configs.get(key)) |hit| break :blk hit;
+        var made: [3]mlx.mlx_fast_metal_kernel_config = undefined;
+        var built: usize = 0;
+        errdefer for (made[0..built]) |cfg| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        };
+        const table = [_]c_int{blocks * experts};
+        for (&made, 0..) |*cfg, i| {
+            cfg.* = mlx.mlx_fast_metal_kernel_config_new();
+            built += 1;
+            if (i < 2) {
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg.*, &table, 1, .uint32));
+            } else for (0..3) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg.*, shape.ptr, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg.*, if (i == 1) 256 else blocks * PREFILL_ROUTE_BLOCK, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg.*, 256, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg.*, "E", experts));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg.*, "TOPK", top_k));
+        }
+        prefill_route_configs.put(key, made);
+        break :blk made;
+    };
+    var counts = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(counts);
+    try prefillRouteApply(s, hist, &.{ids}, cfgs[0], &.{&counts});
+    var offsets = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(offsets);
+    try prefillRouteApply(s, scan, &.{counts}, cfgs[1], &.{&offsets});
+    var result: VerifyRoutePack = .{ .inverse = mlx.mlx_array_new(), .sorted = mlx.mlx_array_new(), .lhs = mlx.mlx_array_new() };
+    errdefer result.deinit();
+    try prefillRouteApply(s, scatter, &.{ ids, offsets }, cfgs[2], &.{ &result.inverse, &result.sorted, &result.lhs });
     return result;
 }
 
@@ -56394,13 +56679,24 @@ test "prefillEvalCadence: small transients keep the coarse cadence" {
     defer fused256_override = null;
     // 26B geometry, short prompt: 16 heads x 2048 chunk x 2048 kv x 2B = 128 MB
     // of unfused scores — well inside the budget, keep today's cadence.
-    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 2048, 2048, false));
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 2048, 2048, false));
     // The LIVE-measured no-regression point: a 5,140-token agent prompt
     // (845 MB scores) must keep cadence 4 — flipping it cost a measured 4.5%
     // prefill for zero memory benefit (peak 18.1 GB both ways).
-    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 5140, 5140, false));
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 5140, 5140, false));
     // Fused head dim + dense KV: no transient at all, keep even the 48 default.
-    try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 500_000, false));
+    try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 128, 8, 8, 8192, 500_000, false));
+}
+
+test "prefillEvalCadenceFor: MiMo bills no score tensor, so a long chunk keeps the coarse cadence" {
+    const t = std.testing;
+    fused256_override = false;
+    defer fused256_override = null;
+    const mimo: ModelConfig = .{ .model_type = "mimo_v2", .head_dim = 192, .num_attention_heads = 64, .num_key_value_heads = 8 };
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadenceFor(4, &mimo, 8192, 32768, false));
+    // An unfused wide head still drops to per-layer evals.
+    const wide: ModelConfig = .{ .model_type = "qwen3_5", .head_dim = 256, .num_attention_heads = 64, .num_key_value_heads = 8 };
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadenceFor(4, &wide, 8192, 32768, false));
 }
 
 test "prefillEvalCadence: fused hd-256 kernel drops the score term" {
@@ -56410,8 +56706,8 @@ test "prefillEvalCadence: fused hd-256 kernel drops the score term" {
     // hd 128. The dequant term must still fire under --kv-quant.
     fused256_override = true;
     defer fused256_override = null;
-    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 102_448, false));
-    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 400_000, true));
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 8192, 102_448, false));
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 8192, 400_000, true));
 }
 
 test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
@@ -56421,12 +56717,12 @@ test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
     // 16 heads x 8192 chunk x 16384 kv x 2B = 4 GiB > 2 GiB budget: bounds a
     // ~13 GB windowed transient to ~4 GB. (8192 chunk x 8192 kv sits exactly
     // ON the 2 GiB budget and deliberately keeps the coarse cadence.)
-    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 16384, false));
-    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 8192, false));
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 8192, 16384, false));
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 8192, 8192, false));
     // The capped 1024 chunk at 102K ctx still materializes 3.4 GB — the chunk
     // cap (generate.zig) does NOT restore the coarse cadence at long context.
     // (Live: this cadence measured peak 27.0 GB and +14% prefill vs baseline.)
-    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 1024, 102_448, false));
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 1024, 102_448, false));
 }
 
 test "decodeAsyncLadderStride: ships OFF (measured negative); auto/<n> opt in" {
@@ -56467,9 +56763,9 @@ test "prefillEvalCadence: quantized-KV dequant forces eval-per-layer even at fus
     const t = std.testing;
     // hd 128 is fused (zero scores) but denseView rebuilds the FULL cache per
     // layer under --kv-quant: 2 x 600K x 8 x 128 x 2B = 2.46 GB > 2 GiB.
-    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 600_000, true));
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(48, 128, 128, 8, 8, 8192, 600_000, true));
     // Same shape with dense fp16 KV: nothing to dequantize, keep coarse.
-    try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 600_000, false));
+    try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 128, 8, 8, 8192, 600_000, false));
 }
 
 // ── fused hd-256 prefill attention parity ──
@@ -64119,6 +64415,171 @@ fn qwen4CompareRows(a: []const f32, b: []const f32, rows: usize, v: usize) Qwen4
     return r;
 }
 
+test "mimo_v2 sliding ring: a chunked prefill past the kept rows, then decode, matches the full-buffer cache bit for bit (MIMO_V2_MODEL)" {
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(config.slidingRing());
+
+    const n_prompt: usize = 3 * config.slidingKeepRows();
+    const ids = try allocator.alloc(i32, n_prompt + 24);
+    defer allocator.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast((i * 7919 + 13) % config.vocab_size);
+    const chunk: usize = 1000;
+
+    var logits: [2]std.ArrayList(mlx.mlx_array) = .{ .empty, .empty };
+    defer for (&logits) |*l| {
+        for (l.items) |a| _ = mlx.mlx_array_free(a);
+        l.deinit(allocator);
+    };
+    var ring_rows: usize = 0;
+    for ([_]bool{ true, false }, 0..) |ring_off, arm| {
+        sliding_ring_off_for_test = ring_off;
+        defer sliding_ring_off_for_test = false;
+        var cache = try KVCache.init(allocator, config.num_hidden_layers);
+        defer cache.deinit();
+        var off: usize = 0;
+        var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+        var at: usize = 0;
+        while (at < ids.len) {
+            const n = if (at < n_prompt) @min(chunk, n_prompt - at) else 1;
+            const arr = mlx.mlx_array_new_data(ids[at..].ptr, &[_]c_int{ 1, @intCast(n) }, 2, .int32);
+            defer _ = mlx.mlx_array_free(arr);
+            const out = try xfm.forwardWith(&ctx, arr);
+            try mlx.check(mlx.mlx_array_eval(out));
+            try logits[arm].append(allocator, out);
+            at += n;
+        }
+        if (!ring_off) {
+            for (cache.entries, 0..) |e, li| {
+                if (!config.isGlobalLayer(@intCast(li))) ring_rows = @max(ring_rows, KVCache.bufferCapacity(e.keys));
+            }
+        }
+    }
+    try testing.expect(ring_rows < n_prompt);
+    for (logits[0].items, logits[1].items) |a, b| try testing.expect(try qsaArraysAllEqual(a, b, s));
+}
+
+test "mimo_v2 batched decode: a slot in a two-slot tick tracks the fp32 reference as well as serial decode does (MIMO_V2_MODEL, MIMO_V2_FIXTURE)" {
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    const fixture_path = std.c.getenv("MIMO_V2_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.supportsBatchedGdnDecode());
+
+    var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
+    defer fx.deinit();
+    const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
+    try mlx.check(mlx.mlx_array_eval(ids_arr));
+    const T: usize = mlx.mlx_array_size(ids_arr);
+    const ids = (mlx.mlx_array_data_int32(ids_arr) orelse return error.Unreadable)[0..T];
+    const v: usize = @intCast(config.vocab_size);
+    const ref = try qwen4ReadF32(allocator, fx.get("logits_full") orelse return error.MissingFixtureTensor, s);
+    defer allocator.free(ref);
+
+    // A MiMo slot owns a KV cache and a position, no recurrent state.
+    const Slot = struct {
+        cache: KVCache,
+        off: usize = 0,
+        ctx: ForwardCtx = undefined,
+        fn init(sl: *@This(), n_layers: u32) !void {
+            const cache = try KVCache.init(testing.allocator, n_layers);
+            sl.* = .{ .cache = cache };
+            sl.ctx = .{ .cache = &sl.cache, .moe_seq_offset = &sl.off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+        }
+        fn forward(sl: *@This(), x: *Transformer, toks: []const i32) !mlx.mlx_array {
+            const arr = mlx.mlx_array_new_data(toks.ptr, &[_]c_int{ 1, @intCast(toks.len) }, 2, .int32);
+            defer _ = mlx.mlx_array_free(arr);
+            return x.forwardWith(&sl.ctx, arr);
+        }
+    };
+    // Prompts of different length, decoded past the 8-token window. Slot A
+    // decodes the fixture's own sequence, so every step has a reference row.
+    const pa: usize = T / 2;
+    const pb: usize = pa - 3;
+    const K: usize = T - pa;
+    const a_ids = ids[0 .. pa + K];
+    const b_ids = ids[3 .. 3 + pb + K];
+    var slots: [4]Slot = undefined; // serial A, serial B, batched A, batched B
+    for (&slots) |*sl| try sl.init(config.num_hidden_layers);
+    defer for (&slots) |*sl| sl.cache.deinit();
+    for (&slots, [_][]const i32{ a_ids[0..pa], b_ids[0..pb], a_ids[0..pa], b_ids[0..pb] }) |*sl, p| _ = mlx.mlx_array_free(try sl.forward(&xfm, p));
+
+    var cos_serial: f64 = 1.0;
+    var cos_batched: f64 = 1.0;
+    var misses: usize = 0;
+    for (0..K) |k| {
+        const ta = a_ids[pa + k];
+        const tb = b_ids[pb + k];
+        const la = try slots[0].forward(&xfm, &.{ta});
+        defer _ = mlx.mlx_array_free(la);
+        const lb = try slots[1].forward(&xfm, &.{tb});
+        defer _ = mlx.mlx_array_free(lb);
+        const ctxs = [_]*ForwardCtx{ &slots[2].ctx, &slots[3].ctx };
+        const offs = [_]u32{ @intCast(slots[2].off), @intCast(slots[3].off) };
+        try testing.expect(xfm.batchedGdnReady(&ctxs));
+        const out = try xfm.forwardMoeBatchedDecode(&.{ @intCast(ta), @intCast(tb) }, &ctxs, &offs, null);
+        defer {
+            for (out) |o| _ = mlx.mlx_array_free(o);
+            allocator.free(out);
+        }
+        // The scheduler advances each slot's own position after the tick.
+        slots[2].off += 1;
+        slots[3].off += 1;
+        const r = ref[(pa + k) * v ..][0..v];
+        const sv = try qwen4ReadF32(allocator, la, s);
+        defer allocator.free(sv);
+        const bv = try qwen4ReadF32(allocator, out[0], s);
+        defer allocator.free(bv);
+        cos_serial = @min(cos_serial, qwen4CompareRows(sv, r, 1, v).min_cos);
+        cos_batched = @min(cos_batched, qwen4CompareRows(bv, r, 1, v).min_cos);
+        misses += mimoDecidedMisses(bv, r, 1, v);
+    }
+    std.debug.print("[mimo batched] {d} ticks: min cos vs fp32, serial {d:.5} batched {d:.5}; batched decided misses {d}\n", .{ K, cos_serial, cos_batched, misses });
+    try testing.expect(cos_batched > cos_serial - 0.001 and misses == 0);
+}
+
+/// A bf16 forward against the fp32 reference carries up to ~0.5 of logit error on
+/// the tiny MiMo, so only a row whose reference top-2 margin clears that decides its argmax.
+const MIMO_DECIDED_MARGIN: f32 = 0.5;
+
+/// Rows whose argmax differs from the reference where its margin decides it;
+/// near-tied flips are printed, never counted.
+fn mimoDecidedMisses(ours: []const f32, ref: []const f32, rows: usize, v: usize) usize {
+    var misses: usize = 0;
+    for (0..rows) |i| {
+        const o = ours[i * v ..][0..v];
+        const r = ref[i * v ..][0..v];
+        const io_ = std.mem.indexOfMax(f32, o);
+        const ir = std.mem.indexOfMax(f32, r);
+        if (io_ == ir) continue;
+        var second: f32 = -std.math.inf(f32);
+        for (r, 0..) |x, j| {
+            if (j != ir) second = @max(second, x);
+        }
+        const gap = r[ir] - second;
+        if (gap >= MIMO_DECIDED_MARGIN) misses += 1;
+        std.debug.print("[mimo fixture] row {d}: argmax {d} vs reference {d} (reference margin {d:.3}{s})\n", .{ i, io_, ir, gap, if (gap >= MIMO_DECIDED_MARGIN) "" else ", a near tie" });
+    }
+    return misses;
+}
+
 /// One per-request slot for the qwen4 batched-vs-serial test.
 const Qwen4TestSlot = struct {
     cache: KVCache,
@@ -65455,7 +65916,7 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
     try mlx.check(mlx.mlx_zeros(&warm, &old_shape, 4, .float32, s));
     try mlx.check(mlx.mlx_array_eval(warm));
     const c0 = mlx.op_count.load(.monotonic);
-    try KVCache.growQuantBuf(s, &warm, false, 0, new_cap, B, heads, last_dim, .float32);
+    try KVCache.growQuantBuf(s, &warm, .{ .cap = new_cap, .drop = 0, .kept = 0 }, B, heads, last_dim, .float32);
     const n_ops = mlx.op_count.load(.monotonic) - c0;
     try mlx.check(mlx.mlx_array_eval(warm));
     try testing.expectEqual(@as(c_int, new_cap), mlx.getShape(warm)[2]);
@@ -65469,7 +65930,7 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
         try mlx.check(mlx.mlx_zeros(&buf, &old_shape, 4, .float32, s));
         try mlx.check(mlx.mlx_array_eval(buf));
         mlx.fault.arm(k);
-        const r = KVCache.growQuantBuf(s, &buf, false, 0, new_cap, B, heads, last_dim, .float32);
+        const r = KVCache.growQuantBuf(s, &buf, .{ .cap = new_cap, .drop = 0, .kept = 0 }, B, heads, last_dim, .float32);
         const did = mlx.fault.didFire();
         mlx.fault.disarm();
         if (r) |_| {
@@ -69549,7 +70010,7 @@ fn expertReduceReference(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.ml
     try mlx.check(mlx.mlx_take_axis(&unsorted, down, inverse, 0, s));
     var rows = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rows);
-    try mlx.check(mlx.mlx_reshape(&rows, unsorted, &.{ batch, tokens, 10, 2560 }, 4, s));
+    try mlx.check(mlx.mlx_reshape(&rows, unsorted, &.{ batch, tokens, mlx.getShape(scores)[2], mlx.getShape(down)[1] }, 4, s));
     var expanded = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(expanded);
     try mlx.check(mlx.mlx_expand_dims(&expanded, scores, -1, s));
@@ -69617,11 +70078,12 @@ test "prefill expert reduction is bit-identical to unsort multiply and sum" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5EED_3A11);
-    for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
-        const count = shape[0] * shape[1] * 10;
-        const down = try testRandWeightBf16(prng.random(), &.{ count, 2560 }, s);
+    // (top_k, hidden): the qwen3.6 35B and MiMo-V2.6 geometries.
+    for ([_][2]c_int{ .{ 10, 2560 }, .{ 8, 4096 } }) |kh| for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
+        const count = shape[0] * shape[1] * kh[0];
+        const down = try testRandWeightBf16(prng.random(), &.{ count, kh[1] }, s);
         defer _ = mlx.mlx_array_free(down);
-        const scores = try testRandUniformBf16(prng.random(), &.{ shape[0], shape[1], 10 }, 0.0, 1.0, s);
+        const scores = try testRandUniformBf16(prng.random(), &.{ shape[0], shape[1], kh[0] }, 0.0, 1.0, s);
         defer _ = mlx.mlx_array_free(scores);
         const perm = try testing.allocator.alloc(u32, @intCast(count));
         defer testing.allocator.free(perm);
@@ -69634,7 +70096,7 @@ test "prefill expert reduction is bit-identical to unsort multiply and sum" {
         const actual = (try moePrefillExpertReduce(s, down, inverse, scores)) orelse return error.ExpertReduceDeclined;
         defer _ = mlx.mlx_array_free(actual);
         try testing.expect(try bf16BitsEqual(expected, actual));
-    }
+    };
 }
 
 test "prefill expert reduction µbench (MLX_SERVE_MOE_WSUM_UBENCH=1)" {
@@ -69759,6 +70221,42 @@ test "verify route packing preserves stable order and row indices" {
             try testing.expect(try qsaArraysAllEqual(got.lhs, lhs, s));
         }
     }
+}
+
+test "prefill route packing equals the stable argsort, its inverse and the row indices" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x50A7);
+    for ([_]c_int{ 33, 1000, 8192 }) |tokens| for (0..3) |pattern| {
+        const count: usize = @intCast(tokens * 8);
+        const ids = try testing.allocator.alloc(u32, count);
+        defer testing.allocator.free(ids);
+        for (ids, 0..) |*id, i| id.* = switch (pattern) {
+            0 => prng.random().uintLessThan(u32, 256),
+            // Skewed: a few hot experts, as real routing is.
+            1 => if (prng.random().boolean()) prng.random().uintLessThan(u32, 4) else prng.random().uintLessThan(u32, 256),
+            else => @intCast(255 - (i % 3)),
+        };
+        const input = mlx.mlx_array_new_data(ids.ptr, &.{@intCast(count)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(input);
+        var got = (try moePrefillRoutePack(s, input, 8, 256)) orelse return error.RoutePackDeclined;
+        defer got.deinit();
+        var order = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(order);
+        var inverse = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(inverse);
+        var sorted = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sorted);
+        var lhs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lhs);
+        try mlx.check(mlx.mlx_argsort_axis(&order, input, 0, s));
+        try mlx.check(mlx.mlx_argsort_axis(&inverse, order, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&sorted, input, order, 0, s));
+        try mlx.check(mlx.mlx_floor_divide(&lhs, order, cachedScalarInt(8), s));
+        try testing.expect(try qsaArraysAllEqual(got.inverse, inverse, s));
+        try testing.expect(try qsaArraysAllEqual(got.sorted, sorted, s));
+        try testing.expect(try qsaArraysAllEqual(got.lhs, lhs, s));
+    };
 }
 
 test "verify indexed expert inputs preserve projections without activation copies" {
@@ -70738,7 +71236,7 @@ test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2
     defer allocator.free(ours_full);
     const a = qwen4CompareRows(ours_full, ref, @intCast(T), v);
     std.debug.print("[mimo fixture] one-shot {d} rows: min cos {d:.5}, argmax {d}/{d}\n", .{ a.rows, a.min_cos, a.argmax_agree, a.rows });
-    try testing.expect(a.min_cos > 0.995 and a.argmax_agree == a.rows);
+    try testing.expect(a.min_cos > 0.995 and mimoDecidedMisses(ours_full, ref, @intCast(T), v) == 0);
 
     // [b] a chunked prefill split across the window, then single-token decode steps.
     try xfm.resetCache();
@@ -70762,4 +71260,65 @@ test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2
     }
     std.debug.print("[mimo fixture] chunked prefill + {d} decode steps: min cos {d:.5}, argmax {d}/{d}\n", .{ T - t_pre, worst, agree, T - t_pre });
     try testing.expect(worst > 0.995 and agree == @as(usize, @intCast(T - t_pre)));
+}
+
+/// Bit equality of two strided views (cache slices are not row-contiguous).
+fn ringViewsEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !bool {
+    const ca = try materializedOwnedCopy(s, a);
+    defer _ = mlx.mlx_array_free(ca);
+    const cb = try materializedOwnedCopy(s, b);
+    defer _ = mlx.mlx_array_free(cb);
+    return bf16BitsEqual(ca, cb);
+}
+
+test "KVCache sliding ring: a sliding layer keeps its newest rows and serves the full buffer's window" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x51D1);
+    var full = try KVCache.init(testing.allocator, 1);
+    defer full.deinit();
+    var ring = try KVCache.init(testing.allocator, 1);
+    defer ring.deinit();
+    const window: u32 = 8;
+    const keep: u32 = 24;
+    // Prefill chunks, decode steps, a spec rollback (negative), more decode.
+    const plan = [_]i32{ 300, 300, 300, 300, 300, 300, 1, 1, 1, 1, 1, 1, 1, 1, -3, 1, 1, 1, -2, 1 };
+    for (plan) |n| {
+        if (n < 0) {
+            const len = full.entries[0].offset - @as(usize, @intCast(-n));
+            try full.truncate(len, s);
+            try ring.truncate(len, s);
+            continue;
+        }
+        const k = try testRandWeightBf16(prng.random(), &.{ 1, 2, n, 6 }, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try testRandWeightBf16(prng.random(), &.{ 1, 2, n, 4 }, s);
+        defer _ = mlx.mlx_array_free(v);
+        const span = window + @as(u32, @intCast(n)) - 1;
+        const vf = try full.update(0, k, v, s, span);
+        const vr = try ring.updateSliding(0, k, v, s, span, window, keep);
+        try testing.expect(try ringViewsEqual(s, vf.k, vr.k));
+        try testing.expect(try ringViewsEqual(s, vf.v, vr.v));
+        try testing.expectEqual(full.entries[0].offset, ring.entries[0].offset);
+        try testing.expect(KVCache.bufferCapacity(ring.entries[0].keys) <= 512);
+    }
+    try testing.expect(KVCache.bufferCapacity(full.entries[0].keys) >= 1800);
+
+    // A snapshot restores and continues bit-for-bit.
+    var snap = try ring.snapshot();
+    defer snap.deinit();
+    var back = try KVCache.init(testing.allocator, 1);
+    defer back.deinit();
+    try back.restore(&snap);
+    const k = try testRandWeightBf16(prng.random(), &.{ 1, 2, 1, 6 }, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try testRandWeightBf16(prng.random(), &.{ 1, 2, 1, 4 }, s);
+    defer _ = mlx.mlx_array_free(v);
+    const vf = try full.update(0, k, v, s, window);
+    const vb = try back.updateSliding(0, k, v, s, window, window, keep);
+    try testing.expect(try ringViewsEqual(s, vf.k, vb.k));
+    try testing.expect(try ringViewsEqual(s, vf.v, vb.v));
+
+    // A rollback past the rows the ring still holds is refused, not served.
+    try testing.expectError(error.SlidingRowsDropped, ring.truncate(100, s));
 }

@@ -7919,11 +7919,11 @@ fn slotMtpGroupable(slot: *const Slot) bool {
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.mtp.?.moduleOwned()) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
-    if (gen.ctx.ssm_entries == null) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
     if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedGdnDecode()) return false;
+    if (gen.ctx.ssm_entries == null and t.hasRecurrentLayers()) return false;
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
 }
 
@@ -8351,10 +8351,15 @@ var merged_verify_decline_logged: bool = false;
 
 fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
+    // A stateless trunk (MiMo) has no grouped verify: its MTP rounds run alone.
+    if (!t.hasRecurrentLayers()) return true;
     return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
 }
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
+    // Solo MTP rounds interleave one slot at a time, so any company decodes
+    // faster as plain batched ticks (MiMo: 91 vs ~80 tok/s at 2 slots).
+    if (slot.model.transformer) |t| if (!t.hasRecurrentLayers()) return 2;
     return if (mtpRoundsStaySolo(slot)) 3 else mtpCrowdThreshold();
 }
 

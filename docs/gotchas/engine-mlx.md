@@ -5423,3 +5423,11 @@ MiMo's MTP history stash kept the round's committed ids in `[MAX_DEPTH + 1]u32` 
 
 Fix: `MAX_ROUND_DRAFTS` = the max over every round producer, used by the stash and the merged history. Guard: `tests/test_mimo_v2.sh` [9] (a whole-file edit that engages lookup). Tell: a segfault on a field nothing writes, at an address made of small integers — rebuild ReleaseSafe and replay.
 
+## A full-buffer sliding layer caches every token it never reads
+
+MiMo-V2.6-Flash has 39 sliding-window (128) layers and 9 global ones. Our KV cache kept every token on the sliding layers too, so 87% of its 222 KB/token was rows attention never reads. The bill was honest about it, which is how it hurt: the app's `--ctx-size 1048576` billed 233 GB of context KV, the hot-cache clamp left 0 MB, and an 88k-token agent turn (a 20 GB entry anyway) re-prefilled its whole prompt every turn, ~38 s each; a 140k prompt failed admission.
+
+Fix: `ModelConfig.slidingRing` archs keep a ring of window + `SLIDING_RING_SLACK` rows per sliding layer (`KVCache.updateSliding`: a grow carries only the newest `keep` rows; `entry.base` maps buffer rows to absolute positions, so `offset`/`step` stay absolute), as mlx-lm's `RotatingKVCache`. Bills: global layers per token, rings once per slot (`slotFixedKvBytes`). A ring cannot rewind past its dropped rows: `truncate` and `trimmedCopy` refuse, the prefix cache restores only at matches above `ringFloor` (`ringRestores`), the SSD tier skips rings, and the hot-cache ask is one whole session (`ungatedHotCacheAsk`), since a ring entry is never trimmed.
+
+Guards: `KVCache sliding ring` (views bit-equal to a full buffer through chunks, decode, rollback, snapshot), `mimo_v2 sliding ring` (whole-forward logits bit-identical on the tiny pack), `prefix cache: a sliding ring restores only where…`, `DiskTier: a sliding ring is never persisted`.
+

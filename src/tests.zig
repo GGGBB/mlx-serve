@@ -34,6 +34,7 @@ test {
     _ = @import("moe_fp4.zig");
     _ = @import("mimo_mtp.zig");
     _ = @import("dec_attn.zig");
+    _ = @import("nax_attention.zig");
     _ = @import("gdn_decode.zig");
     _ = @import("row_attn.zig");
     _ = @import("keyed_sample.zig");
