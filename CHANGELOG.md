@@ -12,7 +12,11 @@
 ### Fixes
 - Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
 - Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
+- GLM-5.3, Llama 3, LFM2.5 and K2 prompts are now tokenized exactly as their reference tokenizer does on code: camelCase identifiers (`indexOf`, `UserDefaults`) and `//!` comments were split into extra tokens.
+- A streamed reply no longer sends the start of a stop string that spans several tokens before cutting at it; streamed and non-streamed replies now end on the same byte.
+- `frequency_penalty` now applies on `/v1/completions`, as it already did on chat.
 - The model browser lists GLM-5.3-Flash packs as supported.
+- `mlx-serve launch pi` offers pi's `xhigh` and `max` thinking levels, so a model's maximum effort (GLM-5.3's default) is reachable from pi.
 
 ---
 

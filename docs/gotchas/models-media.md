@@ -1994,3 +1994,7 @@ Cause: bare JSON union reads and unchecked integer narrowing or derived dimensio
 Fix: `parseConfigFromJson` checks consumed values and arithmetic. `jsonField` treats optional nulls as absent; explicit disables such as `sliding_window:null`, negative BOS sentinels and guarded skips keep their semantics. Discovery checks root types and metadata ranges. Tensor shapes need separate validation.
 
 Guard: `parseConfigFromJson rejects invalid field types and ranges`, `preserves optional nulls and skipped fields`, `accepts real checkpoint configs`; `config discovery tolerates invalid roots and oversized metadata`.
+
+## The plain Llama-3 pre-tokenizer was served with Muse's cased grammar
+
+Defect: GLM-5.3, Llama-3.2, LFM2.5 and K2 split camelCase (`UserDefaults` -> `User`+`Defaults`, `.indexOf` -> `.index`+`Of`) and `//!\n`, +0.3% tokens on code, every agent prompt off-distribution; LFM2.5 also split vocab words its merges never build (`_tokens`). Cause: the style detector keyed on the contraction group + `\p{N}{1,3}`, which the plain regex shares with Muse's cased one, and BPE `ignore_merges` was never read; `isDigit` was ASCII-only, so `4²` split. Fix: the cased grammar needs `\p{Lu}` in the regex (the plain one is `.gpt2` with 3-digit groups), `ignore_merges` emits a whole vocab word, `\p{N}` is a generated table. Guard: `tests/test_tokenizer_hf_parity.sh` (zero diff vs HF on code, per family).

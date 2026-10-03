@@ -3,7 +3,8 @@
 #
 # Bar: at temp 0, repeat/frequency/presence penalties change a looping reply
 # without logprobs, the same bytes as with them, streamed or not, and under a
-# json_schema; a penalized request never runs a PLD round (verify reads raw logits).
+# json_schema; frequency_penalty x is repeat_penalty 1+x on chat and /v1/completions; a
+# penalized request never runs a PLD round (verify reads raw logits).
 #
 #   PENALTY_TEST_MODEL=<dir> ./tests/test_repeat_penalty.sh [port]
 #
@@ -87,6 +88,19 @@ ts = [threading.Thread(target=lambda: duo.__setitem__("plain", chat("Tell a long
 for t in ts: t.start()
 for t in ts: t.join()
 ck("a penalized request beside a plain one keeps its solo bytes", duo.get("pen") == chat(repeat_penalty=2.0, max_tokens=240))
+
+def completion(**extra):
+    body = {"prompt": "apple apple apple apple apple apple", "temperature": 0, "max_tokens": 40, **extra}
+    req = urllib.request.Request(BASE + "/v1/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.load(r)["choices"][0]["text"]
+
+# frequency_penalty x is read as repeat_penalty 1 + x on every surface.
+for name, call in (("chat", chat), ("completions", completion)):
+    freq, rep = call(frequency_penalty=1.5), call(repeat_penalty=2.5)
+    ck(f"{name}: frequency_penalty 1.5 == repeat_penalty 2.5, and penalized", freq == rep and rep != call(),
+       f"freq={freq[:60]!r} rep={rep[:60]!r}")
 
 pj = "Write the word apple 40 times. Return JSON with a words array."
 j1 = chat(pj, response_format=SCHEMA, repeat_penalty=1.0)

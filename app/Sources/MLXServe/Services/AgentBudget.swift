@@ -114,6 +114,10 @@ struct AgentModelEntry: Equatable {
 /// config silently strands the user on the CLI's own defaults.
 enum AgentConfigs {
 
+    /// Off is an explicit "none"; pi offers xhigh/max only when the map names them.
+    /// Valid JSON and JS alike, so models.json and the extension share it.
+    static let piThinkingLevelMap = #"{"off": "none", "xhigh": "xhigh", "max": "max"}"#
+
     /// pi `models.json` — written to the dedicated `~/.mlx-serve/pi/` config
     /// dir (selected via `PI_CODING_AGENT_DIR`), never the user's real
     /// `~/.pi/agent`, so their own providers are never overwritten.
@@ -146,7 +150,7 @@ enum AgentConfigs {
               "models": [
                 {"id": "\(model)", "name": "mlx-\(model)", "input": ["text"],
                  "contextWindow": \(budget.context), "maxTokens": \(budget.output), "reasoning": true,
-                 "thinkingLevelMap": {"off": "none"}}
+                 "thinkingLevelMap": \(piThinkingLevelMap)}
               ]
             }
           }
@@ -241,7 +245,7 @@ enum AgentConfigs {
                   contextWindow: ctx,
                   maxTokens: maxTokens,
                   compat: COMPAT,
-                  thinkingLevelMap: { off: "none" },
+                  thinkingLevelMap: \(piThinkingLevelMap),
                 };
               });
           } catch {

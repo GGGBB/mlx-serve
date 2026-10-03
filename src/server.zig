@@ -8610,13 +8610,7 @@ fn handleChatCompletions(
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
-    const repeat_penalty: f32 = blk: {
-        const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-        if (rp > 0.0) break :blk rp;
-        // Also check frequency_penalty (OpenAI format: 0-2 range, mapped to 1.0 + fp)
-        const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-        break :blk if (fp > 0.0) 1.0 + fp else 1.0;
-    };
+    const repeat_penalty = requestRepeatPenalty(root);
 
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
@@ -9206,23 +9200,8 @@ fn handleCompletions(
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
-    const repeat_penalty: f32 = if (root.get("repeat_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => blk: {
-            break :blk if (root.get("frequency_penalty")) |fp| switch (fp) {
-                .float => |f| 1.0 + @as(f32, @floatCast(f)),
-                .integer => |i| 1.0 + @as(f32, @floatFromInt(i)),
-                else => 1.0,
-            } else 1.0;
-        },
-    } else 1.0;
-
-    const presence_penalty_c: f32 = if (root.get("presence_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(@min(@max(f, 0.0), 2.0)),
-        .integer => |i| @floatFromInt(@min(@max(i, 0), 2)),
-        else => 0.0,
-    } else 0.0;
+    const repeat_penalty = requestRepeatPenalty(root);
+    const presence_penalty_c = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -9524,6 +9503,8 @@ fn handleStreamingCompletion(
     try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     var stopped = false;
     var utf8_carry_c: [3]u8 = undefined;
@@ -9532,10 +9513,10 @@ fn handleStreamingCompletion(
 
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -9561,12 +9542,11 @@ fn handleStreamingCompletion(
             client_gone = true;
             break;
         }
-        try lps.note(token_id);
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded_c = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-
         // Handle incomplete UTF-8 sequences across token boundaries
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            try lps.note(token_id);
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded_c = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
             const with_carry = if (utf8_carry_c_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_c_len + raw_decoded_c.len);
                 @memcpy(combined[0..utf8_carry_c_len], utf8_carry_c[0..utf8_carry_c_len]);
@@ -9591,17 +9571,15 @@ fn handleStreamingCompletion(
                 break :blk trimmed;
             }
             break :blk with_carry;
-        };
+        } else try stop_stream.takeHeld(allocator);
         defer allocator.free(token_text);
 
         if (stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
-                stopped = true;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) break;
-                token_text = try allocator.realloc(token_text, cut.token_keep);
-            }
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, null);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop != null) stopped = true;
+            if (token_text.len == 0) continue;
         }
 
         const escaped = try jsonEscape(allocator, token_text);
@@ -9677,6 +9655,112 @@ fn stopSequenceCut(text: []const u8, token_len: usize, stops: []const []const u8
         best = .{ .index = idx, .token_keep = if (idx > emitted) idx - emitted else 0, .matched = stop_seq };
     }
     return best;
+}
+
+/// Bytes at the end of `text`, at most `fresh` of them, that could still begin a stop string.
+fn stopPrefixTail(text: []const u8, fresh: usize, stops: []const []const u8) usize {
+    var hold: usize = 0;
+    for (stops) |stop| {
+        var n = @min(stop.len -| 1, fresh);
+        while (n > hold) : (n -= 1) {
+            if (std.mem.endsWith(u8, text, stop[0..n])) {
+                hold = n;
+                break;
+            }
+        }
+    }
+    return hold;
+}
+
+/// Client stop strings on a stream: a tail that could still begin one is held until the next
+/// token decides it, so the stream sends exactly the bytes the finished reply keeps.
+const StopStream = struct {
+    held: std.ArrayList(u8) = .empty,
+    /// The held tail went out as the stream's last token.
+    flushed: bool = false,
+
+    const Fed = struct { send: []u8, stop: ?[]const u8 };
+
+    fn deinit(self: *StopStream, a: std.mem.Allocator) void {
+        self.held.deinit(a);
+    }
+
+    fn holding(self: *const StopStream) bool {
+        return self.held.items.len > 0 and !self.flushed;
+    }
+
+    /// The held tail as one last token, once generation ended without a match.
+    fn takeHeld(self: *StopStream, a: std.mem.Allocator) ![]u8 {
+        self.flushed = true;
+        const out = try a.dupe(u8, self.held.items);
+        self.held.clearRetainingCapacity();
+        return out;
+    }
+
+    /// Appends `token` to `buf` (the text sent so far) and returns what may go out now: up to
+    /// a stop match (judged answer-only like `answerStopCut` when `answer_opened` is set), else
+    /// everything but a tail that could still begin a stop string. The caller owns `send`.
+    fn feed(self: *StopStream, a: std.mem.Allocator, buf: *std.ArrayList(u8), token: []const u8, stops: []const []const u8, answer_opened: ?bool) !Fed {
+        const sent = buf.items.len;
+        try buf.appendSlice(a, self.held.items);
+        self.held.clearRetainingCapacity();
+        try buf.appendSlice(a, token);
+        const fresh = buf.items.len - sent;
+        const cut = if (answer_opened) |o| answerStopCut(buf.items, fresh, stops, o) else stopSequenceCut(buf.items, fresh, stops);
+        var end = buf.items.len;
+        if (cut) |c| {
+            end = @max(c.index, sent);
+        } else if (!self.flushed) {
+            end -= stopPrefixTail(buf.items, fresh, stops);
+            try self.held.appendSlice(a, buf.items[end..]);
+        }
+        const send = try a.dupe(u8, buf.items[sent..end]);
+        buf.shrinkRetainingCapacity(end);
+        return .{ .send = send, .stop = if (cut) |c| c.matched else null };
+    }
+};
+
+/// The text a stream of `text` split at `i` and `j` sends through a `StopStream`, and whether it stopped.
+fn stopStreamReplay(a: std.mem.Allocator, text: []const u8, i: usize, j: usize, stops: []const []const u8) !struct { sent: []u8, stopped: bool } {
+    var ss: StopStream = .{};
+    defer ss.deinit(a);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for ([_][]const u8{ text[0..i], text[i..j], text[j..] }) |token| {
+        const fed = try ss.feed(a, &buf, token, stops, null);
+        defer a.free(fed.send);
+        try out.appendSlice(a, fed.send);
+        if (fed.stop != null) return .{ .sent = try out.toOwnedSlice(a), .stopped = true };
+    }
+    if (ss.holding()) {
+        const tail = try ss.takeHeld(a);
+        defer a.free(tail);
+        const fed = try ss.feed(a, &buf, tail, stops, null);
+        defer a.free(fed.send);
+        try out.appendSlice(a, fed.send);
+    }
+    return .{ .sent = try out.toOwnedSlice(a), .stopped = false };
+}
+
+test "StopStream: at every token split, a stream sends what the finished reply keeps" {
+    const a = std.testing.allocator;
+    const Case = struct { text: []const u8, stop: []const u8, want: []const u8, stopped: bool };
+    const cases = [_]Case{
+        .{ .text = "9, 10, 11, 12, 13", .stop = ", 12", .want = "9, 10, 11", .stopped = true },
+        .{ .text = "28, 29, 30", .stop = ", 30x", .want = "28, 29, 30", .stopped = false },
+        .{ .text = "a, b, a", .stop = "a, c", .want = "a, b, a", .stopped = false },
+    };
+    for (cases) |c| {
+        const stops = [_][]const u8{c.stop};
+        for (0..c.text.len + 1) |i| for (i..c.text.len + 1) |j| {
+            const r = try stopStreamReplay(a, c.text, i, j, &stops);
+            defer a.free(r.sent);
+            try std.testing.expectEqualStrings(c.want, r.sent);
+            try std.testing.expectEqual(c.stopped, r.stopped);
+        };
+    }
 }
 
 /// `stopSequenceCut` for a chat surface: a stop string ends the answer, never the reasoning.
@@ -10772,6 +10856,8 @@ fn handleStreamingGeneration(
 
     // Buffer for stop sequence and tool call detection
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
@@ -10845,10 +10931,10 @@ fn handleStreamingGeneration(
     // regardless of whether the underlying decode is regular, PLD, or drafter.
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -10874,14 +10960,13 @@ fn handleStreamingGeneration(
             client_gone = true;
             break;
         }
-        try lps.note(token_id);
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
         // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
         // then strip any new trailing incomplete bytes into the carry buffer.
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            try lps.note(token_id);
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             // Step 1: prepend carry-over from previous token
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
@@ -10913,26 +10998,21 @@ fn handleStreamingGeneration(
             }
 
             break :blk with_carry;
-        };
+        } else try stop_stream.takeHeld(allocator);
 
         // Accumulate for stop sequence and tool call detection
 
-        if (gated_stream or stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-        }
-
         // The stop cut is an INDEX, not a token boundary: bytes before the match still go out.
         if (stop_sequences.len > 0) {
-            if (answerStopCut(text_buf.items, token_text.len, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed)) |cut| {
-                stopped = true;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) {
-                    allocator.free(token_text);
-                    break;
-                }
-                token_text = try allocator.realloc(token_text, cut.token_keep);
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop != null) stopped = true;
+            if (token_text.len == 0) {
+                allocator.free(token_text);
+                continue;
             }
-        }
+        } else if (gated_stream) try text_buf.appendSlice(allocator, token_text);
 
         if (delivery) |*d| {
             defer allocator.free(token_text);
@@ -13454,6 +13534,15 @@ fn formatLogprobsObject(
 }
 
 /// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
+/// OpenAI's `frequency_penalty` (0-2) is read as `repeat_penalty` 1 + x; an explicit
+/// `repeat_penalty` wins.
+fn requestRepeatPenalty(root: std.json.ObjectMap) f32 {
+    const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
+    if (repeat > 0) return repeat;
+    const frequency = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    return if (frequency > 0) 1.0 + frequency else 1.0;
+}
+
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
     const raw = if (root.get(key)) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
@@ -15847,6 +15936,8 @@ fn handleAnthropicStreaming(
     var budget_exhausted = false;
 
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
@@ -15865,10 +15956,10 @@ fn handleAnthropicStreaming(
 
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -15894,12 +15985,11 @@ fn handleAnthropicStreaming(
             client_gone = true;
             break;
         }
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
         // UTF-8 carry handling
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                 @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -15923,26 +16013,23 @@ fn handleAnthropicStreaming(
                 break :blk trimmed;
             }
             break :blk with_carry;
-        };
-
-        if (gated_stream or stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-        }
+        } else try stop_stream.takeHeld(allocator);
 
         // Stop sequences; remember WHICH one matched (reported as stop_reason
         // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
         if (stop_sequences.len > 0) {
-            if (answerStopCut(text_buf.items, token_text.len, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed)) |cut| {
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop) |m| {
                 stopped = true;
-                matched_stop_seq = cut.matched;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) {
-                    allocator.free(token_text);
-                    break;
-                }
-                token_text = try allocator.realloc(token_text, cut.token_keep);
+                matched_stop_seq = m;
             }
-        }
+            if (token_text.len == 0) {
+                allocator.free(token_text);
+                continue;
+            }
+        } else if (gated_stream) try text_buf.appendSlice(allocator, token_text);
 
         if (delivery) |*d| {
             defer allocator.free(token_text);
@@ -17365,6 +17452,8 @@ fn handleResponsesInner(
         defer ts.deinit(allocator);
 
         var raw_buf = std.ArrayList(u8).empty;
+        var stop_stream: StopStream = .{};
+        defer stop_stream.deinit(allocator);
         defer raw_buf.deinit(allocator);
         var token_ids_buf = std.ArrayList(u32).empty;
         defer token_ids_buf.deinit(allocator);
@@ -17392,10 +17481,10 @@ fn handleResponsesInner(
 
         while (true) {
             // A stop cut resolved on the previous token ends the turn here.
-            if (stopped) break;
-            const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+            if (stopped or stop_stream.flushed) break;
+            const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
                 .token => |t| t,
-                .done => break,
+                .done => if (stop_stream.holding()) null else break,
                 .idle => {
                     // No tokens yet (long prefill). Probe the peer: an abandoned
                     // request must cancel instead of grinding a ghost prefill
@@ -17421,12 +17510,11 @@ fn handleResponsesInner(
                 client_gone = true;
                 break;
             }
-            try token_ids_buf.append(allocator, token_id);
-            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
             // UTF-8 carry across BPE-token boundaries (matches chat-completion).
-            var token_text = blk: {
+            var token_text = if (next_id) |token_id| blk: {
+                try token_ids_buf.append(allocator, token_id);
+                const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
+                if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
                 const with_carry = if (utf8_carry_len > 0) cc: {
                     const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                     @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -17450,19 +17538,16 @@ fn handleResponsesInner(
                     break :blk trimmed;
                 }
                 break :blk with_carry;
-            };
+            } else try stop_stream.takeHeld(allocator);
             defer allocator.free(token_text);
 
-            try raw_buf.appendSlice(allocator, token_text);
-
             if (stop_sequences.items.len > 0) {
-                if (answerStopCut(raw_buf.items, token_text.len, stop_sequences.items, opens_think and !constrained_proto)) |cut| {
-                    stopped = true;
-                    raw_buf.shrinkRetainingCapacity(cut.index);
-                    if (cut.token_keep == 0) break;
-                    token_text = try allocator.realloc(token_text, cut.token_keep);
-                }
-            }
+                const fed = try stop_stream.feed(allocator, &raw_buf, token_text, stop_sequences.items, opens_think and !constrained_proto);
+                allocator.free(token_text);
+                token_text = fed.send;
+                if (fed.stop != null) stopped = true;
+                if (token_text.len == 0) continue;
+            } else try raw_buf.appendSlice(allocator, token_text);
 
             // Beat BEFORE the tool early-continue below: a tool-active request
             // emits nothing for its whole generation, and the thinking branch

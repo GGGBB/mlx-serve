@@ -2416,3 +2416,7 @@ reaches `ensureLoaded` and its named 500. An unregistered path is a 404. The LAN
 the same helper. Startup was already loud: a failed `--model` load exits 1.
 Guards: `resolveRequestModelId: a path names its own entry, never the default model`,
 `tests/test_load_failure_no_fallback.sh`.
+
+## A stop string spanning tokens leaked its first bytes on every stream
+
+Defect: `stop: [", 12"]` streamed `…11, 1` where the non-stream reply ended `…11`, on chat, completions, messages and responses. Cause: each streaming loop sent a token as it decoded and the cut could trim only the ARRIVING token, never bytes already sent. Fix: `StopStream` holds a tail that could still begin a stop string until the next token decides it, and flushes it as one last token when generation ends without a match. Guard: `StopStream` unit test (every token split of the text) + `tests/test_api_edges.sh` stream == non-stream on all four surfaces.
