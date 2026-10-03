@@ -194,6 +194,8 @@ pub const ModelConfig = struct {
     // config.json says "silu" and is never read by the reference.
     swiglu_limit: f32 = 0.0,
     swiglu_alpha: f32 = 1.702,
+    /// GLM-5-Next's form under the same limit: silu(min(gate, limit)) * clip(up, ±limit).
+    swiglu_clamp: bool = false,
 
     // MoE
     num_experts: u32 = 0,
@@ -253,6 +255,16 @@ pub const ModelConfig = struct {
     mla_qk_rope_head_dim: u32 = 0,
     mla_v_head_dim: u32 = 0,
     mla_head_gate: bool = false,
+    // GLM-5-Next DeepSeek sparse attention: absorbed NoPE MLA over a `dsa_kv_lora_rank`
+    // latent (per-head q/k and v widths `dsa_head_dim`) plus a pooled indexer that picks
+    // `dsa_index_topk` tokens in `dsa_index_kpool`-token pools.
+    dsa_q_lora_rank: u32 = 0,
+    dsa_kv_lora_rank: u32 = 0,
+    dsa_head_dim: u32 = 0,
+    dsa_index_topk: u32 = 0,
+    dsa_index_kpool: u32 = 0,
+    dsa_index_heads: u32 = 0,
+    dsa_index_head_dim: u32 = 0,
     // RoPE rotates ADJACENT PAIRS (x[2i], x[2i+1]) instead of halves — mlx's
     // `traditional` rope. Set by rope_interleave.
     rope_interleaved_pairs: bool = false,
@@ -856,6 +868,8 @@ pub const ModelConfig = struct {
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        // GLM-5-Next stores one latent row plus the indexer's key and gate per token.
+        if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * (self.dsa_kv_lora_rank + 2 * self.dsa_index_head_dim) * 2;
         // An arch that declares its own V width (MiMo) also varies KV heads per
         // layer type: billed layer by layer. Ring layers are a fixed per-slot term.
         if (self.v_head_dim > 0) {
@@ -944,7 +958,7 @@ pub const ModelConfig = struct {
     /// GatedDeltaNet recurrent state dtype: f32 on Hadamard packs, as the
     /// reference runtime keeps it; bf16 elsewhere.
     pub fn ssmStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
-        return if (self.hadamard_block > 0) .float32 else .bfloat16;
+        return if (self.hadamard_block > 0 or self.isGlm5()) .float32 else .bfloat16;
     }
 
     /// Configured MTP depth (0 = auto). Hadamard packs run a grafted head that
@@ -963,6 +977,8 @@ pub const ModelConfig = struct {
     /// marker gives it a fresh root. Null keeps every other arch's root.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
+        // A pool's completing indexer row stores the pool's key in its gate half.
+        if (self.isGlm5()) return "glm5-pooled-keys-v1";
         return null;
     }
 
@@ -998,6 +1014,10 @@ pub const ModelConfig = struct {
     pub fn draftVocab(self: *const ModelConfig) c_int {
         if (self.rowExactDecode() and std.mem.startsWith(u8, self.model_type, "qwen3_5") and self.vocab_size >= 248320) return 98304;
         return 0;
+    }
+
+    pub fn isGlm5(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "glm5_next");
     }
 
     pub fn isMimo(self: *const ModelConfig) bool {
@@ -1248,6 +1268,9 @@ pub const ModelConfig = struct {
     /// kernel (`fusedSinkAttnPrefill`), whatever its width.
     pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
         if (self.isMimo()) return 0;
+        // GLM-5-Next: the sparse rows never form a score matrix (indexed kernel), and the
+        // dense ones end at the indexer budget (~2k), whatever the chunk.
+        if (self.isGlm5()) return 0;
         if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }
@@ -1298,6 +1321,8 @@ pub const ModelConfig = struct {
         // k2_horizon: the template opens a think marker on every assistant
         // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
         if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
+        // glm5_next: the template opens `<think>` on every assistant turn too.
+        if (self.isGlm5()) return true;
 
         return false;
     }
@@ -2739,6 +2764,139 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
         }
         config.ensureGptOssTerminators();
+    } else if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5_next_text")) {
+        // Z.ai GLM-5.3-Flash (Glm5NextForConditionalGeneration) in mlx-vlm's glm5_next layout
+        // (TensorFold's MLX packs). Three Kimi-Delta-Attention layers per DeepSeek sparse
+        // attention layer, every sublayer inside DeepSeek-V4's 4-stream Sinkhorn
+        // hyper-connection. The sparse attention is absorbed NoPE MLA over a 512 latent; a
+        // pooled indexer picks the tokens each query reads. Sigmoid noaux_tc MoE with one
+        // ungated shared expert and a clamped SwiGLU; dense MLP on the leading layers.
+        config.model_type = "glm5_next";
+        config.weight_prefix = if (jsonField(root, "text_config") != null) "language_model.model" else "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        config.moe_sigmoid_router = true;
+        if (jsonField(cfg_obj, "n_routed_experts")) |v| config.num_experts = try jsonU32(v);
+        if (jsonField(cfg_obj, "norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (jsonField(cfg_obj, "routed_scaling_factor")) |v| config.router_scaling_factor = try jsonFloat(v);
+        if (jsonField(cfg_obj, "n_group")) |v| config.moe_n_group = try jsonU32(v);
+        if (jsonField(cfg_obj, "topk_group")) |v| config.moe_topk_group = try jsonU32(v);
+        if (jsonField(cfg_obj, "n_shared_experts")) |v| {
+            if (v == .integer) config.shared_expert_intermediate_size =
+                std.math.mul(u32, try jsonU32(v), config.moe_intermediate_size) catch return error.InvalidConfigField;
+        }
+        if (jsonField(cfg_obj, "swiglu_limit")) |v| {
+            if (v != .null) config.swiglu_limit = try jsonFloat(v);
+        }
+        config.swiglu_clamp = true;
+
+        // Sparse attention: NoPE, q/k and v at one width.
+        if (jsonField(cfg_obj, "qk_rope_head_dim")) |v| {
+            if (v == .integer and v.integer != 0) {
+                log.err("glm5_next: qk_rope_head_dim {d} (only NoPE sparse attention is served)\n", .{v.integer});
+                return error.UnsupportedGlm5Config;
+            }
+        }
+        if (jsonField(cfg_obj, "q_lora_rank")) |v| config.dsa_q_lora_rank = try jsonU32(v);
+        if (jsonField(cfg_obj, "kv_lora_rank")) |v| config.dsa_kv_lora_rank = try jsonU32(v);
+        if (jsonField(cfg_obj, "qk_nope_head_dim")) |v| config.dsa_head_dim = try jsonU32(v);
+        if (jsonField(cfg_obj, "v_head_dim")) |v| {
+            if ((try jsonU32(v)) != config.dsa_head_dim) {
+                log.err("glm5_next: v_head_dim differs from qk_nope_head_dim (not supported)\n", .{});
+                return error.UnsupportedGlm5Config;
+            }
+        }
+        config.head_dim = config.dsa_head_dim;
+        if (config.num_key_value_heads != config.num_attention_heads) config.num_key_value_heads = config.num_attention_heads;
+        if (jsonField(cfg_obj, "index_topk")) |v| config.dsa_index_topk = try jsonU32(v);
+        if (jsonField(cfg_obj, "index_kpool")) |v| config.dsa_index_kpool = try jsonU32(v);
+        if (jsonField(cfg_obj, "index_n_heads")) |v| config.dsa_index_heads = try jsonU32(v);
+        if (jsonField(cfg_obj, "index_head_dim")) |v| config.dsa_index_head_dim = try jsonU32(v);
+        inline for (.{ "index_kpool_compress", "index_kpool_always_select_tail", "mla_use_nope" }) |key| {
+            if (jsonField(cfg_obj, key)) |v| {
+                if (v == .bool and !v.bool) {
+                    log.err("glm5_next: {s}=false (not supported)\n", .{key});
+                    return error.UnsupportedGlm5Config;
+                }
+            }
+        }
+        if (config.dsa_index_kpool == 0 or config.dsa_index_topk % config.dsa_index_kpool != 0) {
+            log.err("glm5_next: index_topk must be a multiple of index_kpool\n", .{});
+            return error.UnsupportedGlm5Config;
+        }
+        // Every indexer scores its own layer (`shared` reuses the previous one's top-k).
+        if (jsonField(cfg_obj, "indexer_types")) |v| {
+            for ((try jsonValue(.array, v)).items) |t| {
+                if (!std.mem.eql(u8, try jsonValue(.string, t), "full")) {
+                    log.err("glm5_next: a shared indexer layer (not supported)\n", .{});
+                    return error.UnsupportedGlm5Config;
+                }
+            }
+        }
+
+        // Layer pattern: sparse attention every 4th layer, the rest KDA.
+        config.full_attention_interval = 4;
+        if (jsonField(cfg_obj, "layer_types")) |v| {
+            for ((try jsonValue(.array, v)).items, 0..) |t, i| {
+                const name = try jsonValue(.string, t);
+                const sparse = std.mem.eql(u8, name, "deepseek_sparse_attention") or std.mem.eql(u8, name, "full_attention");
+                if (sparse != !config.isLinearLayer(@intCast(i))) {
+                    log.err("glm5_next: layer {d} is {s}, off the every-4th pattern (not supported)\n", .{ i, name });
+                    return error.UnsupportedGlm5Config;
+                }
+            }
+        }
+        if (jsonField(cfg_obj, "mlp_layer_types")) |v| {
+            config.first_k_dense_replace = 0;
+            for ((try jsonValue(.array, v)).items, 0..) |t, i| {
+                if (std.mem.eql(u8, try jsonValue(.string, t), "dense")) {
+                    if (config.first_k_dense_replace != i) {
+                        log.err("glm5_next: dense layer {d} after a MoE layer (not supported)\n", .{i});
+                        return error.UnsupportedGlm5Config;
+                    }
+                    config.first_k_dense_replace += 1;
+                }
+            }
+        } else if (jsonField(cfg_obj, "first_k_dense_replace")) |v| config.first_k_dense_replace = try jsonU32(v);
+
+        // KDA: per-channel bounded gate, sigmoid output gate, low-rank gate projections.
+        config.linear_num_key_heads = config.num_attention_heads;
+        config.linear_key_head_dim = 128;
+        if (jsonField(cfg_obj, "linear_attn_config")) |lac_v| {
+            const lac = try jsonValue(.object, lac_v);
+            if (jsonField(lac, "num_heads")) |v| config.linear_num_key_heads = try jsonU32(v);
+            if (jsonField(lac, "head_dim")) |v| config.linear_key_head_dim = try jsonU32(v);
+            if (jsonField(lac, "short_conv_kernel_size")) |v| config.linear_conv_kernel_dim = try jsonU32(v);
+            if (jsonField(lac, "gate_lower_bound")) |v| {
+                if (v != .null) config.kda_gate_lower_bound = try jsonFloat(v);
+            }
+        }
+        if (config.kda_gate_lower_bound == 0.0) config.kda_gate_lower_bound = -5.0;
+        config.linear_num_value_heads = config.linear_num_key_heads;
+        config.linear_value_head_dim = config.linear_key_head_dim;
+        config.kda_vector_gate = true;
+        config.kda_sigmoid_out_gate = true;
+
+        // DeepSeek-V4's Sinkhorn hyper-connection around every sublayer.
+        config.dsv4_hc_mult = 4;
+        if (jsonField(cfg_obj, "hc_mult")) |v| config.dsv4_hc_mult = try jsonU32(v);
+        if (config.dsv4_hc_mult != 4) {
+            log.err("glm5_next: hc_mult {d} (only 4 is served)\n", .{config.dsv4_hc_mult});
+            return error.UnsupportedGlm5Config;
+        }
+        config.dsv4_hc_sinkhorn_iters = 20;
+        if (jsonField(cfg_obj, "hc_sinkhorn_iters")) |v| config.dsv4_hc_sinkhorn_iters = try jsonU32(v);
+        if (jsonField(cfg_obj, "hc_eps")) |v| config.dsv4_hc_eps = try jsonFloat(v);
+        // The GLM-5-Next vision tower is not wired.
+        config.has_vision = false;
     } else if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "mimo_v2_flash")) {
         // Xiaomi MiMo-V2.6-Flash (309B-A15B) in the mlx-lm layout (tests/convert_mimo_v2.py,
         // the community packs); `mimo_v2_flash` is MiMo-V2-Flash and TensorFold's V2.6 label.
@@ -5130,6 +5288,86 @@ test "ModelConfig: mimo_v2 pack config parse" {
     try testing.expectEqual(@as(u64, 2 * 4 * (192 + 128) * 2), config.kvBytesPerToken());
     try testing.expectEqual(@as(u64, 4 * 8 * (192 + 128) * 2), config.slidingRowBytes());
     try testing.expectEqual(@as(u32, 128 + ModelConfig.SLIDING_RING_SLACK), config.slidingKeepRows());
+}
+
+/// GLM-5.3-Flash (TensorFold's MLX packs), layers trimmed to 8.
+const glm5_next_pack_json =
+    \\{
+    \\  "model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"],
+    \\  "tie_word_embeddings": false,
+    \\  "text_config": {
+    \\    "model_type": "glm5_next_text", "vocab_size": 154880, "hidden_size": 4096,
+    \\    "intermediate_size": 12288, "moe_intermediate_size": 2048, "num_hidden_layers": 8,
+    \\    "num_nextn_predict_layers": 1, "num_attention_heads": 64, "num_key_value_heads": 64,
+    \\    "n_shared_experts": 1, "n_routed_experts": 288, "routed_scaling_factor": 2.5,
+    \\    "kv_lora_rank": 512, "q_lora_rank": 1536, "qk_rope_head_dim": 0, "v_head_dim": 256,
+    \\    "qk_nope_head_dim": 256, "qk_head_dim": 256, "head_dim": 0, "n_group": 1, "topk_group": 1,
+    \\    "num_experts_per_tok": 8, "norm_topk_prob": true, "max_position_embeddings": 1048576,
+    \\    "rms_norm_eps": 1e-05, "eos_token_id": [154820, 154827, 154829], "pad_token_id": 154820,
+    \\    "mlp_layer_types": ["dense", "dense", "dense", "sparse", "sparse", "sparse", "sparse", "sparse"],
+    \\    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention",
+    \\                    "linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention"],
+    \\    "indexer_types": ["full", "full", "full", "full", "full", "full", "full", "full"],
+    \\    "index_topk": 2048, "index_head_dim": 128, "index_n_heads": 32, "index_kpool": 4,
+    \\    "index_kpool_always_select_tail": true, "index_kpool_compress": true, "mla_use_nope": true,
+    \\    "swiglu_limit": 10.0, "hc_mult": 4, "hc_eps": 1e-06, "hc_sinkhorn_iters": 20, "mhc": true,
+    \\    "first_k_dense_replace": 3, "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+    \\    "moe_router_dtype": "float32",
+    \\    "linear_attn_config": {"num_heads": 64, "head_dim": 128, "gate_lower_bound": -5.0,
+    \\                           "short_conv_kernel_size": 4, "full_attn_layers": [3, 7]}
+    \\  },
+    \\  "vision_config": {"model_type": "glm5_next_vision", "depth": 24}
+    \\}
+;
+
+test "ModelConfig: glm5_next binds KDA, sparse latent attention, mHC and the clamped SwiGLU" {
+    var config = try parseConfigFromJson(testing.allocator, glm5_next_pack_json);
+    defer config.deinit(testing.allocator);
+    try testing.expect(config.isGlm5());
+    // Its indexer rows carry pooled keys: an older SSD cache root never restores into it.
+    try testing.expectEqualStrings("glm5-pooled-keys-v1", config.cacheLayoutNamespace().?);
+    try testing.expect(!config.isMla());
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    // Layers 3 and 7 are sparse attention, the rest KDA.
+    try testing.expect(config.isLinearLayer(0) and config.isLinearLayer(2) and !config.isLinearLayer(3) and !config.isLinearLayer(7));
+    try testing.expectEqual(@as(u32, 2), config.attnCacheLayerCount());
+    try testing.expectEqual(@as(u32, 64), config.linear_num_key_heads);
+    try testing.expectEqual(@as(u32, 128), config.linear_key_head_dim);
+    try testing.expect(config.kda_vector_gate and config.kda_sigmoid_out_gate and config.kdaUsesBoundedGate());
+    try testing.expectEqual(@as(f32, -5.0), config.kda_gate_lower_bound);
+    try testing.expectEqual(@as(u32, 1536), config.dsa_q_lora_rank);
+    try testing.expectEqual(@as(u32, 512), config.dsa_kv_lora_rank);
+    try testing.expectEqual(@as(u32, 256), config.dsa_head_dim);
+    try testing.expectEqual(@as(u32, 2048), config.dsa_index_topk);
+    try testing.expectEqual(@as(u32, 4), config.dsa_index_kpool);
+    try testing.expectEqual(@as(u32, 32), config.dsa_index_heads);
+    try testing.expectEqual(@as(u32, 128), config.dsa_index_head_dim);
+    try testing.expectEqual(@as(u32, 4), config.dsv4_hc_mult);
+    try testing.expectEqual(@as(u32, 20), config.dsv4_hc_sinkhorn_iters);
+    try testing.expect(config.swiglu_clamp);
+    try testing.expectEqual(@as(f32, 10.0), config.swiglu_limit);
+    try testing.expectEqual(@as(u32, 288), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 3), config.first_k_dense_replace);
+    try testing.expectEqual(@as(u32, 2048), config.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(f32, 2.5), config.router_scaling_factor);
+    try testing.expect(config.moe_sigmoid_router and config.moe_route_norm);
+    // Per sparse-attention layer per token: the 512 latent plus the indexer's key and gate.
+    try testing.expectEqual(@as(u64, 2 * (512 + 128 + 128) * 2), config.kvBytesPerToken());
+    try testing.expect(!config.has_vision);
+    // The template opens `<think>` on every assistant turn.
+    try testing.expect(config.defaultEnableThinking(false) and config.defaultEnableThinking(true));
+    // The reference keeps the KDA state in f32.
+    try testing.expectEqual(mlx.mlx_dtype.float32, config.ssmStateDtype());
+}
+
+test "ModelConfig: glm5_next refuses what it does not serve, by name" {
+    for ([_][]const u8{ "\"shared\", \"full\"", "\"full\", \"shared\"" }) |types| {
+        var buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"model_type\": \"glm5_next_text\", \"num_hidden_layers\": 2, \"kv_lora_rank\": 64, \"indexer_types\": [{s}]}}", .{types});
+        try testing.expectError(error.UnsupportedGlm5Config, parseConfigFromJson(testing.allocator, body));
+    }
+    try testing.expectError(error.UnsupportedGlm5Config, parseConfigFromJson(testing.allocator, "{\"model_type\": \"glm5_next_text\", \"num_hidden_layers\": 2, \"kv_lora_rank\": 64, \"qk_rope_head_dim\": 64}"));
 }
 
 test "ModelConfig: mimo_v2 source release is refused with the converter's name" {

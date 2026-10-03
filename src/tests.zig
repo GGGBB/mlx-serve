@@ -35,6 +35,8 @@ test {
     _ = @import("mimo_mtp.zig");
     _ = @import("dec_attn.zig");
     _ = @import("nax_attention.zig");
+    _ = @import("glm5_next.zig");
+    _ = @import("kda_recurrence.zig");
     _ = @import("gdn_decode.zig");
     _ = @import("row_attn.zig");
     _ = @import("keyed_sample.zig");

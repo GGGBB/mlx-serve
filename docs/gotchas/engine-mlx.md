@@ -5431,3 +5431,31 @@ Fix: `ModelConfig.slidingRing` archs keep a ring of window + `SLIDING_RING_SLACK
 
 Guards: `KVCache sliding ring` (views bit-equal to a full buffer through chunks, decode, rollback, snapshot), `mimo_v2 sliding ring` (whole-forward logits bit-identical on the tiny pack), `prefix cache: a sliding ring restores only where…`, `DiskTier: a sliding ring is never persisted`.
 
+
+## A prefill-tiled kernel at decode width is one threadgroup's work (GLM-5)
+
+GLM's hyper-connection mixes kernel ran 8 rows per threadgroup with simdgroup matrices: right for prefill, but at one decode row it streamed the whole 1.5 MB `fn` through a single threadgroup, 90 times per token. Decode fell from 54 to 35 tok/s. The NAX indexer did the same thing in a different shape: one query padded to a 64-row tile, 63/64 of the MMA wasted per pool tile.
+
+Fix: the mixes kernel serves 512+ rows (`MIXES_KERNEL_MIN_ROWS`); one token runs `hcPre` (16 threadgroups, each a K-slice of all the mixes); one indexer query runs `decodeSelect` (fused pool + score, radix top-k).
+Guard: `glm5 mHC mixes and expand kernels match the op chain` (rows past the gate), `glm5 one-token hcPre chain…`, the two `glm5 one-query…` tests.
+
+## Partials that cross threadgroups inside one dispatch went stale
+
+`hcPre` reduces its 16 threadgroups' partial mixes in whichever threadgroup arrives last (a device counter nothing resets). With plain stores and loads the last threadgroup read wrong partials, and differently on each run, even with `atomic_thread_fence` on both sides: a core's L1 can hold stale lines of a reused buffer.
+
+Fix: partials go out by `atomic_store_explicit` and come back by `atomic_load_explicit` (both through L2); every storing thread fences before the arrival increment. The counter is 8 words, because an input shorter than 8 elements binds in the read-only constant address space.
+Guard: the hcPre test re-dispatches 32 times and requires bit-identical output.
+
+## An ablation that leaves an output unwritten measures NaN routing
+
+Profiling GLM decode by skipping parts: dropping the Sinkhorn gates (post/comb left unwritten), or feeding each branch the previous one's raw output, "saved" 0.5-1 ms. Both were artifacts. Garbage or unnormalized activations route every MoE layer to the same few experts, which then hit cache. Done right (real gates at 1 iteration; an `rms_norm` in place of the collapse) the gates cost 0.15 ms and the mHC 1.25 ms.
+
+Rule: an ablation keeps every live value sane (finite and normalized like the original). An f32 scalar in the stand-in op promotes bf16 and moves the whole branch to f32 kernels, so that skews the result too.
+
+## A cache row nothing reads in this forward stays a lazy chain (GLM-5 indexer)
+
+GLM's DSA layers append an indexer row (key | gate) every token, but below 2051 tokens selection never runs, so nothing in the token's graph read the indexer cache. The decode step evaluates only the token and the logits, so MLX never computed those rows: each `SliceUpdate` hung off the previous one, a chain growing by ~7 ops x 11 layers per token, evaluated all at once (a stall, and the retained intermediates' memory) when the context first passed 2051. Short-context decode looked faster than it was, because it skipped work.
+
+Fix: the attention output depends on the indexer cache (`glm5.withDependency` over `mlx_depends`), so every step materializes its row.
+Guard: `glm5 an output tied to a cache update evaluates the update with it`. Tell: a decode graph dump with no `SliceUpdate` for a cache the layer writes.
+

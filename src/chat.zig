@@ -1178,6 +1178,14 @@ pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
     return "low";
 }
 
+/// OpenAI's effort vocabulary -> GLM-5-Next's low|high|max (the template's default is max).
+fn glm5EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "max";
+    if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) return "low";
+    if (std.mem.eql(u8, e, "medium") or std.mem.eql(u8, e, "high")) return "high";
+    return "max";
+}
+
 /// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
 /// raise_exception's on any other string and its own default is xhigh, so an
 /// absent or unrecognized effort keeps the checkpoint default. Thinking-off
@@ -1316,6 +1324,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     } else if (qwen38_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, qwen38EffortFor(effort, enable_thinking));
+        try buf.append(allocator, '"');
+    } else if (std.mem.indexOf(u8, chat_config.chat_template, "reasoning_effort in ['low', 'high']") != null) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, glm5EffortFor(effort));
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
@@ -10122,6 +10134,34 @@ test "serializeExtraContext with thinking disabled" {
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":false") != null);
 }
 
+test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
+    // The template reads low|high and renders anything else as Max.
+    const allocator = testing.allocator;
+    var glm = ChatConfig{
+        .chat_template = @embedFile("fixtures/glm5_next_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const cases = [_]struct { in: ?[]const u8, out: []const u8 }{
+        .{ .in = null, .out = "max" },
+        .{ .in = "none", .out = "low" },
+        .{ .in = "minimal", .out = "low" },
+        .{ .in = "low", .out = "low" },
+        .{ .in = "medium", .out = "high" },
+        .{ .in = "high", .out = "high" },
+        .{ .in = "xhigh", .out = "max" },
+        .{ .in = "max", .out = "max" },
+    };
+    for (cases) |c| {
+        const r = try serializeExtraContext(allocator, &glm, true, c.in);
+        defer allocator.free(r);
+        var want: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
+    }
+}
+
 test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max" {
     // medium deliberately maps LOW: DeepSeek's "high" text is a verbose
     // "absolute maximum, no shortcuts" preamble and the reference default is
@@ -14822,4 +14862,20 @@ test "answerStopIndex: a stop after trailing whitespace in the answer still cuts
     try t.expectEqual(@as(?usize, std.mem.indexOf(u8, hard_break, "  \n").? + 2), answerStopIndex(hard_break, 0, "\n", true));
     // Whitespace leading the answer is never delivered, so it never matches.
     try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
+}
+
+test "renderChatTemplate: GLM-5-Next tool history renders natively (jinja `obj.0` is `obj[0]`)" {
+    // The template probes `m.content.0.output`; jinja.cpp refused a numeric attribute and the
+    // whole turn fell back to the generic format, which the model answered with `<end_of_turn>`.
+    const cfg = ChatConfig{ .chat_template = @embedFile("fixtures/glm5_next_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const calls = [_]ToolCall{.{ .id = "a", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "{\"temp_c\": 21}", .tool_call_id = "a" },
+    };
+    const out = try renderChatTemplate(testing.allocator, &messages, &cfg, null, null, true, null, false);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<|observation|><tool_response>{\"temp_c\": 21}</tool_response><|assistant|><think>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<start_of_turn>") == null);
 }

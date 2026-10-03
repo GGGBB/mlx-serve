@@ -5345,6 +5345,13 @@ pub fn dsv4PrefillMemoryNeeded(seq: u64, layers: u64, latent: u64, hidden: u64, 
 ///
 /// Attention-only archs return 0 and keep exactly the bill they had.
 fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
+    return prefillStreamBytesPerTokenOn(config, transformer_mod.verifyQmmNaxAvailable());
+}
+
+fn prefillStreamBytesPerTokenOn(config: *const model_mod.ModelConfig, nax: bool) u64 {
+    // GLM-5 on NAX: the sorted expert gather reads tokens through its row map (no top_k
+    // replica) and the per-core KDA recurrence holds no per-layer q/k/v stream.
+    if (nax and config.isGlm5()) return 0;
     var per_tok: u64 = 0;
     const linear_layers: u64 = @as(u64, config.num_hidden_layers) -| config.attnCacheLayerCount();
     if (config.linear_num_value_heads > 0 and linear_layers > 0) {
@@ -21828,6 +21835,22 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
     const dense_only = prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 0, .{});
     const pre_fix: u64 = (9827 * 53248 + 3 * 8 * 2048 * 19968 * 2) * 5 / 4;
     try t.expectEqual(dense_only - pre_fix, 512 * 1024 * 1024 * 5 / 4);
+}
+
+test "prefill stream bill: GLM-5 on NAX bills no top_k replica or linear stream" {
+    const t = std.testing;
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    glm.num_hidden_layers = 45;
+    glm.full_attention_interval = 4;
+    glm.linear_num_key_heads = 64;
+    glm.linear_num_value_heads = 64;
+    glm.hidden_size = 4096;
+    glm.num_experts = 288;
+    glm.num_experts_per_tok = 8;
+    glm.moe_intermediate_size = 2048;
+    // Measured 380 KB per chunk-token on M5 (NAX), under the 3-envelope floor.
+    try t.expectEqual(@as(u64, 0), prefillStreamBytesPerTokenOn(&glm, true));
+    try t.expect(prefillStreamBytesPerTokenOn(&glm, false) > 0);
 }
 
 test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for plain attention" {

@@ -7,7 +7,7 @@ const log = @import("log.zig");
 const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
 /// `mx`: an MXFP4 bank (uint8 e8m0 scales, no biases) instead of affine.
 const CanaryKey = struct { plan: Plan, bits: u32, group: u32, align_n: bool, align_k: bool, mx: bool };
-const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false };
+const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, limit: u32 = 0 };
 var scan_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mm_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mapped_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -164,11 +164,12 @@ fn mmConfig(key: MmKey) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BK", key.plan.bk));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GX", key.plan.gx));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PAD", key.plan.pad));
-    if (key.mapped) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", @intFromBool(key.paired)));
+    if (key.mapped) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", if (key.paired) 1 + @as(c_int, @intCast(key.limit)) else 0));
     return cfg;
 }
 
-const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array };
+/// `limit`: a `swiglu_limit` the epilogue clamps at (whole numbers; 0 = none).
+const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32 = 0 };
 
 /// An MXFP4 bank has no biases; the kernel signature still binds the slot. 16
 /// elements: MLX binds an array under 8 in `constant`, not `device`.
@@ -195,7 +196,7 @@ fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: 
     const pb = if (pair) |v| v.bi else bi;
     const sigtab = if (pair) |v| v.sigtab else biasArg(.{ .ctx = null }); // unread without a pair
     const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map };
-    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null });
+    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .limit = if (pair) |v| v.limit else 0 });
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     return applyOne(try mapKernel(pair != null), &inputs, cfg, s);
 }
@@ -506,14 +507,14 @@ pub fn sortedGatherMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_a
     return out;
 }
 
-pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!nax_available or !mlx.streamIsGpu(s)) return null;
     if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map) or !supported(x, up_w, up_sc, up_bi, idx, bits, group, mx, row_map)) return null;
     if (!std.mem.eql(c_int, mlx.getShape(w), mlx.getShape(up_w)) or @rem(mlx.getShape(w)[1], 32) != 0) return null;
     if (sigtab.ctx == null or mlx.mlx_array_dtype(sigtab) != .bfloat16 or mlx.mlx_array_size(sigtab) != 65536) return null;
     const key = mappedKey(x, w, idx, bits, group, mx, true);
     if (!armed(key, s) or !armedMapped(key, false, s) or !armedMapped(key, true, s)) return null;
-    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = up_w, .sc = up_sc, .bi = up_bi, .sigtab = sigtab }, bits, group, mx, key.plan, s);
+    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = up_w, .sc = up_sc, .bi = up_bi, .sigtab = sigtab, .limit = limit }, bits, group, mx, key.plan, s);
     if (!paired_engaged_logged) {
         paired_engaged_logged = true;
         log.info("[gather-nax] paired SwiGLU engaged: M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2] });
@@ -806,7 +807,7 @@ test "segmented NAX sorted gather row map and paired SwiGLU match composed proje
         const plain_u = (try sortedGather(x_rep, uw, us, ub, ids, case.bits, case.group, case.mx, true, s)) orelse return error.KernelDeclinedTestShape;
         defer _ = mlx.mlx_array_free(plain_u);
         const sigtab = try @import("hc_prefill.zig").sigmoidTable(s);
-        const fused = (try sortedGateUp(x, row_map, gw, gs, gb, uw, us, ub, ids, sigtab, case.bits, case.group, case.mx, true, s)) orelse return error.KernelDeclinedTestShape;
+        const fused = (try sortedGateUp(x, row_map, gw, gs, gb, uw, us, ub, ids, sigtab, 0, case.bits, case.group, case.mx, true, s)) orelse return error.KernelDeclinedTestShape;
         defer _ = mlx.mlx_array_free(fused);
         var sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sig);
@@ -818,6 +819,12 @@ test "segmented NAX sorted gather row map and paired SwiGLU match composed proje
         try mlx.check(mlx.mlx_multiply(&act, plain_g, sig, s));
         try mlx.check(mlx.mlx_multiply(&ref, act, plain_u, s));
         try expectBitEqual(ref, fused, s);
+        // A swiglu_limit of 1 clamps these magnitudes: the epilogue equals the clamp ops on the split gathers.
+        const clamped = (try sortedGateUp(x, row_map, gw, gs, gb, uw, us, ub, ids, sigtab, 1, case.bits, case.group, case.mx, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(clamped);
+        const clamp_ref = try @import("transformer.zig").clampedSwiGLU(s, plain_g, plain_u, 1.0);
+        defer _ = mlx.mlx_array_free(clamp_ref);
+        try expectBitEqual(clamp_ref, clamped, s);
     }
 }
 
