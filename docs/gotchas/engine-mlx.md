@@ -5459,3 +5459,7 @@ GLM's DSA layers append an indexer row (key | gate) every token, but below 2051 
 Fix: the attention output depends on the indexer cache (`glm5.withDependency` over `mlx_depends`), so every step materializes its row.
 Guard: `glm5 an output tied to a cache update evaluates the update with it`. Tell: a decode graph dump with no `SliceUpdate` for a cache the layer writes.
 
+
+## GLM-5.3's long-prompt output moved with the prefill chunk width, and it was not a bug
+
+Defect suspected: on a cold 9.5k-token prompt, token 0's top-2 swapped and one token moved 4+ nats between prefill widths (single pass, 8192, 4096, 2048), and the prefix cache's 30-token tail split flipped the greedy answer against cache-off; Qwen3.6-35B-A3B moved at most 0.25 nats on the same sweep. Cause: rounding order, not carried state. Swapping the KDA recurrence for an equivalent kernel in ONE pass moved the token as far as chunking did (1.16 vs 1.35 nats with the indexer forced dense), a confident next token agreed at every width (-0.06), the per-core KDA kernel matches f64 from a nonzero state with a partial tail block, and the tiny fixture's chunked prefill matches the reference past its indexer budget. DSA's top-k pool choice is discontinuous, so small differences pick other pools. Bar for "chunking bug": a width swing larger than a same-math kernel swap at one pass, or a confident token that moves.
