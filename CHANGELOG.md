@@ -3,10 +3,13 @@
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
 ### New
+- **Chat keeps answering while media renders.** An agent or chat session no longer freezes while the same server generates an image, speech, music, video or a 3D model: chat runs between generation steps, and the CPU-heavy parts of 3D generation run beside it. Two coding agents on Qwen3.8 27B kept their first token under a second while image, speech, music and a textured 3D model rendered on one M5 Ultra, and the images come out byte-identical to a solo run.
 - **GLM-5.3-Flash.** TensorFold's MLX packs of GLM-5-Next run with text, thinking (with `reasoning_effort`) and tool calls, decoding within a few percent of oMLX on the same pack.
+- **Sound effects with Stable Audio 3.** `POST /v1/audio/sound-generations` turns a description into up to two minutes of 44.1 kHz stereo in about a second, from Stability's own `stabilityai/stable-audio-3-small-sfx` repo as downloaded; the app gets a Sound Effects tab in Audio and a `generate_sound` chat tool.
 - **MiMo-V2.6-Flash.** Xiaomi's 309B MoE runs on a 256 GB Mac, from the MLX packs already on Hugging Face or from the release via `tests/convert_mimo_v2.py`, whose packs also load in mlx-lm; text, thinking and tool calls, with the checkpoint's own MTP heads drafting (up to ~30% faster decode on code).
 
 ### Speed
+- **Textured 3D models in about a minute.** The Hunyuan3D texture stage now simplifies the mesh to 40,000 faces before unwrapping it, as the reference pipeline does; a detailed (resolution 320) textured model that ran for more than ten minutes now finishes in about a minute.
 - **MiniMax-H3 video renders start sooner after the first one.** The text encoder, the DiT and the Turbo adapter now stay loaded between requests while the Mac has the memory for all of them, so a short Turbo clip takes about a quarter less time from the second render on; when memory is short the model is freed first and nothing else is affected.
 
 ### Fixes
@@ -16,7 +19,8 @@
 - A streamed reply no longer sends the start of a stop string that spans several tokens before cutting at it; streamed and non-streamed replies now end on the same byte.
 - `frequency_penalty` now applies on `/v1/completions`, as it already did on chat.
 - Deleting a provider in Settings no longer crashes the app.
-- The model browser lists GLM-5.3-Flash packs as supported.
+- A speech request whose client disconnects now stops instead of finishing audio nobody will receive.
+- The model browser lists GLM-5.3-Flash and MiMo-V2.6-Flash packs as supported.
 - `mlx-serve launch pi` offers pi's `xhigh` and `max` thinking levels, so a model's maximum effort (GLM-5.3's default) is reachable from pi.
 
 ---

@@ -738,6 +738,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/tokenize",
     "/v1/3d/generations",
     "/v1/audio/music-generations",
+    "/v1/audio/sound-generations",
     "/v1/audio/speech",
     "/v1/chat/completions",
     "/v1/completions",
@@ -2624,6 +2625,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .music);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/sound-generations")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .sound);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -6306,6 +6311,8 @@ const ReadyCaps = struct {
     /// Audio engine's backend is the ACE-Step music generator (advertises
     /// "music" ADDITIVELY beside "audio", the ready-model "3d" precedent).
     has_music_backend: bool = false,
+    /// Stable Audio 3 text-to-audio: "sound" beside "audio", the same rule.
+    has_sound_backend: bool = false,
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
     has_decision_engine: bool = false,
@@ -6350,6 +6357,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_image_engine) try append_cap(allocator, &caps, &n_caps, "image");
     if (c.has_audio_engine and !c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
     if (c.has_music_backend) try append_cap(allocator, &caps, &n_caps, "music");
+    if (c.has_sound_backend) try append_cap(allocator, &caps, &n_caps, "sound");
     if (c.has_video_engine) try append_cap(allocator, &caps, &n_caps, "video");
     if (c.has_mesh_engine) try append_cap(allocator, &caps, &n_caps, "3d");
     if (c.has_decision_engine) try append_cap(allocator, &caps, &n_caps, "decisions");
@@ -6473,7 +6481,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
     };
     if (modality) |m| return switch (m) {
         .image => "This is an image generation model; it cannot serve chat/text requests. Use POST /v1/images/generations instead.",
-        .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS) or /v1/audio/music-generations (music) instead.",
+        .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS), /v1/audio/music-generations (music) or /v1/audio/sound-generations (text-to-audio) instead.",
         .video => "This is a video generation model; it cannot serve chat/text requests. Use POST /v1/video/generations instead.",
         .mesh => "This is a 3D generation model; it cannot serve chat/text requests. Use POST /v1/3d/generations instead.",
         .decision => "This is a typed-decision model; it cannot serve chat/text requests. Use POST /v1/decisions instead.",
@@ -6566,6 +6574,7 @@ fn renderModelEntry(
                 .music, .music3 => true,
                 else => false,
             } else false,
+            .has_sound_backend = if (entry.audio_engine) |ae| ae.backend == .sound else false,
             .has_video_engine = entry.video_engine != null,
             .has_mesh_engine = entry.mesh_engine != null,
             .has_decision_engine = entry.decision_engine != null,
@@ -6711,6 +6720,8 @@ fn renderModelEntry(
             // too (matches the ready-path readyCapsJson additive rule).
             if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint).servesMusic())
                 break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"music\"]");
+            if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint) == .sound)
+                break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"sound\"]");
             break :blk try std.fmt.allocPrint(allocator, ",\"capabilities\":[\"{s}\"]", .{m.capability()});
         }
         if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
@@ -7090,6 +7101,7 @@ fn genJobRun(ctx: *anyopaque) void {
         .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .speech => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .sound => if (job.lm.audio_engine) |e| media_mod.handleSound(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .decisions => {
@@ -12898,6 +12910,20 @@ test "the index page documents every endpoint the server serves (drift guard)" {
             std.debug.print("endpoint missing from the index page: {s}\n", .{p});
             return error.EndpointNotDocumented;
         }
+    }
+}
+
+test "the mlx-serve agent skill documents every /v1 endpoint it does not deliberately leave out" {
+    // The skill is what an agent reads before writing client code; an endpoint
+    // missing there does not exist for it.
+    const left_out = [_][]const u8{ "/v1/completions", "/v1/models/rescan", "/v1/providers", "/v1/providers/reload", "/v1/responses/compact" };
+    const skills = @import("agent_skills");
+    outer: for (ROUTE_PATHS) |p| {
+        if (!std.mem.startsWith(u8, p, "/v1/")) continue;
+        for (left_out) |l| if (std.mem.eql(u8, p, l)) continue :outer;
+        for (skills.files) |f| if (std.mem.indexOf(u8, f.bytes, p) != null) continue :outer;
+        std.debug.print("endpoint missing from skills/mlx-serve: {s}\n", .{p});
+        return error.EndpointNotInSkill;
     }
 }
 

@@ -1552,6 +1552,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             case .image:  return try await runImageTool(args, onProgress: onProgress)
             case .speech: return try await runSpeechTool(args, onProgress: onProgress)
             case .music:  return try await runMusicTool(args, onProgress: onProgress)
+            case .sound:  return try await runSoundTool(args, onProgress: onProgress)
             case .video:  return try await runVideoTool(args, onProgress: onProgress)
             }
         } catch let missing as MediaToolArgs.MissingArgument {
@@ -1635,6 +1636,21 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         let path = try await appState.musicGen.generateForAgent(req, server: appState.server,
                                                                 onProgress: onProgress)
         let caption = "Generated a \(req.durationSeconds)s track for: \(req.prompt). Saved to \(path)."
+        return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .audio, path: path))"
+    }
+
+    private func runSoundTool(_ args: [String: String],
+                              onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
+        let s = SoundGenSettings.load()
+        let model = s.resolvedModel(models: appState.server.allModels)
+        let lanId = LanPick.lanId(s.modelId)
+        if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
+                                            approxGB: String(format: "%.1f", model.approxDownloadGB),
+                                            window: "Audio", lanId: lanId) { return notice }
+        let req = try MediaToolArgs.sound(args, model: model, keepResident: s.keepResident, lanId: lanId)
+        let path = try await appState.soundGen.generateForAgent(req, server: appState.server,
+                                                                onProgress: onProgress)
+        let caption = String(format: "Generated a %.1fs sound for: %@. Saved to %@.", req.durationSeconds, req.prompt, path)
         return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .audio, path: path))"
     }
 

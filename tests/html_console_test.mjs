@@ -146,7 +146,8 @@ const M = (id, capabilities, over = {}) => ({
 });
 
 // A slice of a real `/v1/models` payload: chat models, an encoder, an image
-// backend, a TTS voice, a music model, and a LAN-mirrored peer entry.
+// backend, a TTS voice, a music model, a text-to-audio model, and a
+// LAN-mirrored peer entry.
 const FLEET = [
   M('gemma-4-e4b-it-4bit', ['chat', 'tool_use', 'streaming', 'json_schema', 'vision']),
   M('qwen3.6-27b', ['chat', 'tool_use', 'streaming', 'json_schema'], { loaded: true, state: 'ready' }),
@@ -154,6 +155,7 @@ const FLEET = [
   M('ddalcu/Mage-Flow-Turbo-MLX-Serve-8bit', ['image']),
   M('Qwen3-TTS-Flash-Base-MLX-8bit', ['audio']),
   M('ACE-Step-v1-3.5B-MLX-8bit', ['audio', 'music']),
+  M('stabilityai/stable-audio-3-small-sfx', ['audio', 'sound']),
   M('no-caps-gguf-shelf', undefined),
 ];
 
@@ -175,7 +177,7 @@ test('image selection lists image backends only', () => {
   ]);
 });
 
-test('speech selection excludes the music backend', () => {
+test('speech selection excludes the music and text-to-audio backends', () => {
   // Music models advertise BOTH "audio" and "music" (additive rule in
   // readyCapsJson), so a naive `has("audio")` filter routes a TTS request at
   // ACE-Step, which 400s "loaded audio model is a music generator".
@@ -190,10 +192,16 @@ test('music selection lists music backends only', () => {
   ]);
 });
 
+test('sound selection lists text-to-audio backends only', () => {
+  assert.deepEqual(C.pickModels(FLEET, 'sound').map(m => m.id), [
+    'stabilityai/stable-audio-3-small-sfx',
+  ]);
+});
+
 test('a model with no capabilities array is never selected', () => {
   // Unloaded stubs whose config.json couldn't be read ship no `capabilities`
   // key at all — `undefined.includes` would throw and blank every list.
-  for (const kind of ['chat', 'image', 'speech', 'music']) {
+  for (const kind of ['chat', 'image', 'speech', 'music', 'sound']) {
     assert.equal(C.pickModels(FLEET, kind).some(m => m.id === 'no-caps-gguf-shelf'), false);
   }
   assert.deepEqual(C.pickModels([], 'chat'), []);
@@ -207,7 +215,7 @@ test('a model with no capabilities array is never selected', () => {
 
 test('mediaTools offers one tool per modality that exists on this server', () => {
   const names = C.mediaTools(FLEET).map(t => t.function.name);
-  assert.deepEqual(names.sort(), ['edit_image', 'generate_image', 'generate_music', 'generate_speech']);
+  assert.deepEqual(names.sort(), ['edit_image', 'generate_image', 'generate_music', 'generate_sound', 'generate_speech']);
 });
 
 test('mediaTools offers nothing a server cannot run', () => {
@@ -419,6 +427,15 @@ test('toolInvocation maps speech and music onto their endpoints', () => {
   assert.equal(music.path, '/v1/audio/music-generations');
   assert.deepEqual(music.body, {
     model: 'ACE-Step-v1-3.5B-MLX-8bit', prompt: 'lofi', lyrics: 'la', duration_seconds: 30,
+  });
+
+  const sound = C.toolInvocation(
+    { name: 'generate_sound', args: { prompt: 'door creak', duration_seconds: 3 } },
+    { models: FLEET, refs: [] },
+  );
+  assert.equal(sound.path, '/v1/audio/sound-generations');
+  assert.deepEqual(sound.body, {
+    model: 'stabilityai/stable-audio-3-small-sfx', prompt: 'door creak', duration_seconds: 3,
   });
 });
 

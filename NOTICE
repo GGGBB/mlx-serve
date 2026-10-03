@@ -491,6 +491,17 @@ and compiled into the mlx-serve binary: the quadric decimation the Hunyuan3D
 texture stage runs before its UV unwrap.
 
 --------------------------------------------------------------------------------
+Stable Audio 3 (MLX reference implementation)
+https://github.com/Stability-AI/stable-audio-3
+Copyright (c) 2026 Stability AI
+Licensed under the MIT License.
+
+`src/stable_audio.zig` ports the T5Gemma encoder, DiT, ping-pong sampler and
+SAME-S decoder from `optimized/mlx/models/defs`. The model WEIGHTS are not
+part of mlx-serve: they are the Stability AI Community License
+(https://stability.ai/license), T5Gemma the Gemma Terms of Use.
+
+--------------------------------------------------------------------------------
 stb_image / stb_image_write
 https://github.com/nothings/stb
 Copyright (c) 2017 Sean Barrett

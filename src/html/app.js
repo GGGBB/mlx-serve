@@ -57,17 +57,19 @@
     return m && Array.isArray(m.capabilities) ? m.capabilities : [];
   }
 
-  /// Models that can serve a given kind of work. `speech` excludes music
-  /// backends: they advertise BOTH "audio" and "music" (the additive rule in
-  /// readyCapsJson), and posting one to /v1/audio/speech is an honest 400.
+  /// Models that can serve a given kind of work. `speech` excludes music and
+  /// text-to-audio backends: they advertise "audio" beside "music"/"sound"
+  /// (the additive rule in readyCapsJson), and posting one to
+  /// /v1/audio/speech is an honest 400.
   function pickModels(models, kind) {
     if (!Array.isArray(models)) return [];
     return models.filter(function (m) {
       var c = capsOf(m);
       if (kind === 'chat') return c.indexOf('chat') >= 0;
       if (kind === 'image') return c.indexOf('image') >= 0;
-      if (kind === 'speech') return c.indexOf('audio') >= 0 && c.indexOf('music') < 0;
+      if (kind === 'speech') return c.indexOf('audio') >= 0 && c.indexOf('music') < 0 && c.indexOf('sound') < 0;
       if (kind === 'music') return c.indexOf('music') >= 0;
+      if (kind === 'sound') return c.indexOf('sound') >= 0;
       return false;
     });
   }
@@ -170,6 +172,7 @@
     var img = rankedIds(models, 'image');
     var speech = rankedIds(models, 'speech');
     var music = rankedIds(models, 'music');
+    var sound = rankedIds(models, 'sound');
 
     if (img.length) {
       tools.push(toolDef('generate_image',
@@ -212,6 +215,15 @@
           instrumental: { type: 'boolean', description: 'True for a wordless track. Never send lyrics with it.' },
           duration_seconds: { type: 'integer', description: 'Length in seconds, 10 to 600. Omit for 60.' },
           model: modelArg(music, 'music'),
+        }, ['prompt']));
+    }
+    if (sound.length) {
+      tools.push(toolDef('generate_sound',
+        'Make a sound effect or ambience (footsteps, rain, a door creak, an explosion) and give the user an audio player.',
+        {
+          prompt: { type: 'string', description: 'The sound, described concretely: source, material, space and character.' },
+          duration_seconds: { type: 'number', description: 'Length in seconds, up to 120. Omit for 10.' },
+          model: modelArg(sound, 'sound'),
         }, ['prompt']));
     }
     return tools;
@@ -320,6 +332,13 @@
           }),
         });
       }
+      case 'generate_sound': {
+        var pso = resolveFrom(idsFor('sound'), 'sound');
+        if (pso.error) return { error: pso.error };
+        var sb = { model: pso.id, prompt: args.prompt };
+        if (isNum(args.duration_seconds)) sb.duration_seconds = Number(args.duration_seconds);
+        return plan(pso, { kind: 'audio', path: '/v1/audio/sound-generations', body: sb });
+      }
       default:
         return { error: 'no such tool "' + (call && call.name) + '" — answer in text instead' };
     }
@@ -354,6 +373,7 @@
     'POST /v1/images/edits — multipart/form-data, NOT JSON. Accepted fields: model, prompt, image[] (repeat the field once per reference file), size. REJECTED with a 400, never list these as options: mask (the editors are maskless), n greater than 1, response_format "url", any output_format other than png, stream.',
     'POST /v1/audio/speech — model, input, optional ref_audio (base64 WAV) to clone a voice, stream; returns audio/wav bytes.',
     'POST /v1/audio/music-generations — model, prompt (style/genre/mood, required), lyrics, duration_seconds (10-600), vocal_language, bpm, seed, stream; returns audio/wav bytes.',
+    'POST /v1/audio/sound-generations — model, prompt (a description of the sound, required), duration_seconds (up to 120), steps (default 8), seed, stream; returns audio/wav bytes.',
     'POST /v1/video/generations — model, prompt, width, height, num_frames, steps, seed, stream; optional preview, preview_frames, preview_max_side (opt-in JPEG on each SSE progress event); LTX: pipeline, first_frame_image, last_frame_image, audio, cfg_scale, stg_scale; H3: turbo, fast, chain_windows, first_frame_image / last_frame_image or ref_images / ref_videos / ref_audios.',
     'POST /v1/embeddings — model, input (string or array), optional dimensions.',
     'POST /v1/load-model and /v1/unload-model — model (a discovered id, or an absolute path to register one).',
@@ -1553,7 +1573,7 @@
           showImage(out, ev.data[0].b64_json, sId);
           summary = DONE_IMAGE;
         } else {
-          var name = plan.path.indexOf('music') >= 0 ? 'music.wav' : 'speech.wav';
+          var name = plan.path.indexOf('music') >= 0 ? 'music.wav' : plan.path.indexOf('sound') >= 0 ? 'sound.wav' : 'speech.wav';
           showAudio(out, URL.createObjectURL(b64ToBlob(ev.data, 'audio/wav')), name);
           summary = 'Done. The audio is playing in the user\'s browser. ' + STOP_HERE;
         }

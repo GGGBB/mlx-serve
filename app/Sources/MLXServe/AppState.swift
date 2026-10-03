@@ -230,6 +230,7 @@ class AppState: ObservableObject {
     lazy var videoGen = VideoGenService()
     lazy var audioGen = AudioGenService()
     lazy var musicGen = MusicGenService()
+    lazy var soundGen = SoundGenService()
     lazy var model3dGen = Model3DGenService()
     @Published var autoStartServer: Bool {
         didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }

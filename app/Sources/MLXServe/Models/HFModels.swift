@@ -92,6 +92,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
+    "stable_audio3",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -129,7 +130,7 @@ func discoverableMediaModelType(_ modelType: String) -> Bool {
 /// the same split, minus the running-server requirement (a browser row is a
 /// filesystem `LocalModel` with no capabilities).
 enum MediaModality: CaseIterable {
-    case image, voice, music, video, mesh
+    case image, voice, music, sound, video, mesh
 
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
@@ -139,6 +140,7 @@ enum MediaModality: CaseIterable {
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
         case "acestep", "minimax_music3": self = .music
+        case "stable_audio3": self = .sound
         case "AudioVideo", "minimax_h3": self = .video
         default: return nil
         }
@@ -149,7 +151,7 @@ enum MediaModality: CaseIterable {
     var experiment: GenExperiment {
         switch self {
         case .image: return .image
-        case .voice, .music: return .audio
+        case .voice, .music, .sound: return .audio
         case .video: return .video
         case .mesh: return .model3d
         }
@@ -160,6 +162,7 @@ enum MediaModality: CaseIterable {
         switch self {
         case .voice: return .voice
         case .music: return .music
+        case .sound: return .sound
         default: return nil
         }
     }
@@ -170,6 +173,7 @@ enum MediaModality: CaseIterable {
         case .image: return "Image Generation"
         case .voice: return "Voice"
         case .music: return "Music"
+        case .sound: return "Sound Effects"
         case .video: return "Video Generation"
         case .mesh: return "3D"
         }

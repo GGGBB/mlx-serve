@@ -289,6 +289,12 @@ return contig(o, s);   // `o` is never freed
 - **Rule**: a helper that materializes a view owns the view — free the intermediate, don't just wrap it. `mlx_clear_cache` is NOT the fix for this class (that's the cache-growth one above); if `active_bytes` itself climbs, you are holding handles. Prefer one shared slice-and-materialize helper per file over N hand-rolled copies: this shipped six times in one file because each site was written independently.
 - Guards: `tests/test_media_gen_memory.sh` (varies the size-driving shape across generations — a fixed-size replay cannot separate a leak from size-keyed caching — and asserts three load/gen/unload cycles return to the pre-load baseline; red-on-revert at +3.18 GB across four generations) and the hermetic `materializing helpers hand back every array they take` in mage_flow.zig, which calls each helper with a source built and freed INSIDE the loop and asserts `mlx_get_active_memory` returns to baseline. **The input must be rebuilt per iteration**: a caller-owned source that outlives the call keeps the parent alive anyway, and the first version of that test passed against the broken code for exactly that reason.
 
+### A scope freed AFTER the eval holds every activation of the step (Stable Audio 3, 45 GB at 120 s, 2026-10-03)
+`stable_audio.zig` collects a forward's intermediates in a `Scope` and frees them together. The sampler and the chunked decoder built each step inside a scope whose `deinit` ran after `mlx_array_eval`, so every handle was still live during the eval and MLX could not release a buffer once its consumer ran: a 120 s clip (162 decode windows, 8 DiT steps) peaked at 45 GB on a 2.6 GB model, and 30 s held 10 GB above the weights. Parity was perfect throughout; only `/props` `peak_bytes` showed it.
+- **Fix**: close the scope BEFORE the eval and keep only the output (`Scope.out` in a labelled block); 30 s now holds 657 MB, 120 s peaks at 4.2 GB, and it got faster (1.5 s → 0.6 s).
+- **Rule**: a handle you still hold pins its buffer through the eval. Release a step's intermediates before evaluating its result, not after.
+- Guard: `sa3: a 30 s sample + decode holds no more than one step's working set` (SA3_TEST_MODEL), red at 9969 MB before the fix.
+
 ## GDN blocked-prefill kernel: hardcoded bf16 vs an f16 checkpoint (2026-07-25)
 
 `./mlx-serve --serve --model=~/.mlx-serve/models/…/Nanbeige…` died mid-request with

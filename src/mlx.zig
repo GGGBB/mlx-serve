@@ -371,6 +371,7 @@ pub extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: m
 // ── Random ──
 pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
+pub extern "c" fn mlx_random_split(res_0: *mlx_array, res_1: *mlx_array, key: mlx_array, s: mlx_stream) c_int;
 // Uniform noise — Kokoro's SineGen draws a random initial phase per harmonic.
 // Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
 pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;

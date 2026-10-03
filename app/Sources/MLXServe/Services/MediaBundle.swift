@@ -465,6 +465,27 @@ extension MediaBundle {
         )
     }
 
+    /// Stable Audio 3, Stability's own repo as published: `model_config.json`
+    /// (no `config.json`), `model.safetensors`, and T5Gemma in a subdir that
+    /// is also the server's completion marker. The thumbnail stays behind.
+    static func sound(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "sound:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, excludeSubstrings: [".png"]),
+                    readyMarkers: [
+                        "model_config.json", "model.safetensors",
+                        "t5gemma-b-b-ul2/model.safetensors", "t5gemma-b-b-ul2/tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// Mage-Flow (diffusers layout): one repo with weight subdirs
     /// (`transformer/`, `vae/`, `text_encoder/`, `scheduler/`) and NO root
     /// config.json — detection keys on `model_index.json`. Recursive download
@@ -579,6 +600,10 @@ extension MusicModelPreset {
     }
 }
 
+extension SoundModelPreset {
+    var bundle: MediaBundle { .sound(repo: repo, displayName: name, sizeGB: approxDownloadGB) }
+}
+
 // MARK: - Media pane generic surface
 
 /// Common surface every media-gen preset (image/audio/video/music) exposes to
@@ -619,5 +644,6 @@ extension ImageModelPreset: MediaModelPreset {}
 extension AudioModelPreset: MediaModelPreset {}
 extension VideoModelPreset: MediaModelPreset {}
 extension MusicModelPreset: MediaModelPreset {}
+extension SoundModelPreset: MediaModelPreset {}
 // Sizing only — see `MediaModelSizing`: 3D stays out of the Media tab.
 extension Model3DModelPreset: MediaModelSizing {}

@@ -50,6 +50,7 @@ struct ToolApprovalSheet: View {
         case "generate_image": return "Generate an image"
         case "generate_speech": return "Generate spoken audio"
         case "generate_music": return "Generate a music track"
+        case "generate_sound": return "Generate a sound effect"
         case "generate_video": return "Generate a video"
         default:           return "Run \(request.toolName)"
         }
@@ -555,6 +556,7 @@ struct ChatView: View {
         case .audio:   AudioGenView()
                            .environmentObject(appState.audioGen)
                            .environmentObject(appState.musicGen)
+                           .environmentObject(appState.soundGen)
         case .model3d: Model3DGenView().environmentObject(appState.model3dGen)
         }
     }
