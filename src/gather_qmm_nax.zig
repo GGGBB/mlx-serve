@@ -22,8 +22,7 @@ var paired_engaged_logged = false;
 /// Tile configuration by mean rows per expert and K. The 96+-row rungs are ours: oMLX's
 /// seg tiles were measured against mlx 0.32.2, whose sorted kernel masked whole row blocks;
 /// 0.32.3 schedules row tiles itself and the plain db 96-row tile-on-x layout is the one
-/// that still beats it (M5 Ultra, 8192-token chunks: MiMo +1-3%, Flash Next +4-24%). The
-/// paired gate/up kernel keeps seg 128 (+25% over stock's two projections and activation).
+/// that still beats it. The paired gate/up kernel keeps seg 128.
 fn plan(rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) Plan {
     if (@rem(k, 64) != 0 or @rem(n, 64) != 0) return .{ .sched = .seg, .bm = 64, .bk = 64, .gx = 0, .pad = 0 };
     const per_expert = @divTrunc(rows, @max(experts, 1));

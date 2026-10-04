@@ -405,5 +405,6 @@ test "getAppMemFootprintMb returns a plausible nonzero footprint" {
 test "gpuCoreCount reads the GPU's core count" {
     if (comptime !is_macos) return error.SkipZigTest;
     const n = gpuCoreCount();
+    if (n == 0) return error.SkipZigTest; // a VM exposes no AGX accelerator entry
     try std.testing.expect(n >= 7 and n <= 256);
 }

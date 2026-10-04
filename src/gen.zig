@@ -103,8 +103,8 @@ pub const Modality = enum {
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image", "laya",
-    "kev",       "stable_audio3",
+    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
+    "laya",      "kev",        "stable_audio3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -1420,7 +1420,9 @@ fn packFileBytes(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, name: 
 /// The cache to hand `generate`, or null for the staged plan. Residency needs the whole set to
 /// fit in the memory that is free right now plus what the cache already holds; when it does not,
 /// whatever was held is released first, so the staged peak starts from a clean slate.
-pub fn h3ResidentFor(engine: *H3VideoEngine, io: std.Io, a: std.mem.Allocator) ?*minimax_h3.Resident {
+pub const H3Plan = struct { resident: *minimax_h3.Resident, bytes: u64 };
+
+pub fn h3ResidentFor(engine: *H3VideoEngine, io: std.Io, a: std.mem.Allocator) ?H3Plan {
     const dir = engine.model_dir;
     const need = h3ResidentBytes(
         packFileBytes(io, a, dir, "text_encoder.safetensors"),
@@ -1438,8 +1440,7 @@ pub fn h3ResidentFor(engine: *H3VideoEngine, io: std.Io, a: std.mem.Allocator) ?
         if (freed > 0) log.info("[minimax-h3] residency released ({d:.1} GB): the resident set no longer fits\n", .{@as(f64, @floatFromInt(freed)) / (1024.0 * 1024.0 * 1024.0)});
         return null;
     }
-    engine.resident.bytes = need;
-    return &engine.resident;
+    return .{ .resident = &engine.resident, .bytes = need };
 }
 
 pub const LtxVideoEngine = struct {
@@ -2558,7 +2559,10 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // error — refuse by NAME with the number we compared.
     if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len != 0) {
         const bill = qwenImageEditTransientBytes(
-            @intCast(gen_opts.edit_image_bytes.len), gen_opts.ref_resolution, width, height,
+            @intCast(gen_opts.edit_image_bytes.len),
+            gen_opts.ref_resolution,
+            width,
+            height,
         );
         if (bill > QWEN_IMAGE_EDIT_TRANSIENT_BYTES) {
             var active: usize = 0;
@@ -3819,10 +3823,10 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         if (paths.turbo_lora) |p| allocator.free(p);
     }
 
-    const resident = h3ResidentFor(engine, io, allocator);
+    const plan = h3ResidentFor(engine, io, allocator);
     var res = minimax_h3.generate(allocator, io, paths, .{
-        .resident = resident,
-        .resident_bytes = if (resident) |r| r.bytes else 0,
+        .resident = if (plan) |p| p.resident else null,
+        .resident_bytes = if (plan) |p| p.bytes else 0,
         .prompt = prompt,
         .width = width,
         .height = height,

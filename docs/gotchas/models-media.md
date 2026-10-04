@@ -2008,3 +2008,13 @@ Fix: vendored Fast-Quadric-Mesh-Simplification (`lib/fqms`, the code fast_simpli
 `mesh_simplify.decimate` to `PAINT_MAX_FACES` ahead of the unwrap, normals re-derived from faces.
 The untextured shape output is unchanged, as upstream. A textured res-320 job now takes about a minute.
 Guard: `decimate:` tests (mesh_simplify.zig), `tests/test_3d_paint.sh` at res 320 (decimation line, GLB ≤ 40k faces).
+
+## A resident H3 text encoder crashed the second keyframe request (2026-10-03)
+
+Defect: with residency on, the second video request carrying a keyframe killed the server.
+Cause: the weights map is opened only when something must be read from it, and the guard
+said "resident text encoder with its vision tower loaded: nothing to read"; the load call
+below then unwrapped that unopened map (`&tw.?`) before `loadVision`'s own early return ran.
+Fix: the tower is loaded only when the encoder has none (`needs_vision and te.vision == null`),
+the one condition under which the map was opened.
+Guard: `tests/test_h3_resident.sh` [4], two keyframe requests on one resident server.

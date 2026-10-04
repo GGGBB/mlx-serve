@@ -6,6 +6,8 @@
 #  [2] a plain request after a Turbo one carries no Turbo residue: it matches a plain request on a
 #      fresh server (the resident DiT's LoRA slots are cleared between requests)
 #  [3] MLX_SERVE_H3_RESIDENT=0 runs the staged plan: no cache hits
+#  [4] two keyframe requests in a row: the second reuses the resident text encoder's vision tower
+#      (the weights map is not reopened) and answers 200 — the server does not die
 #
 # Usage: [H3_MODEL=<dir>] ./tests/test_h3_resident.sh [port]
 set -uo pipefail
@@ -69,4 +71,30 @@ boot /tmp/h3_res_c.log MLX_SERVE_H3_RESIDENT=0
 gen true 4 >/dev/null; gen true 4 >/dev/null
 n=$(hits /tmp/h3_res_c.log "resident hit")
 [ "$n" = 0 ] && echo "PASS: MLX_SERVE_H3_RESIDENT=0 runs the staged plan" || { echo "FAIL: $n cache hits with residency off"; rc=1; }
+echo "[4] keyframes on a resident text encoder"
+if ! grep -q '"fl2va"' "$MODEL/config.json"; then
+  echo "SKIP: pack declares no fl2va task"
+else
+  boot /tmp/h3_res_d.log
+  IMG=/tmp/h3_res_frame.png
+  python3 - "$IMG" <<'PY'
+import sys, struct, zlib
+W, H = 256, 256
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+raw = bytearray()
+for y in range(H):
+    raw.append(0)
+    for x in range(W):
+        v = 20 if x < W // 2 else 235
+        raw += bytes((v, v, v))
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png)
+PY
+  B64=$(base64 < "$IMG" | tr -d '\n')
+  python3 -c "import json,sys;json.dump({'prompt':'a static abstract scene of two solid color fields','num_frames':5,'width':256,'height':256,'steps':4,'seed':3,'turbo':True,'fast':False,'first_frame_image':sys.argv[1]}, open('/tmp/h3_res_kf_req.json','w'))" "$B64"
+  kf() { curl -s --max-time 900 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' --data @/tmp/h3_res_kf_req.json -o /dev/null -w "%{http_code}"; }
+  c1=$(kf); c2=$(kf)
+  te_hits=$(hits /tmp/h3_res_d.log "text encoder: resident hit")
+  if [ "$c1" = 200 ] && [ "$c2" = 200 ] && [ "$te_hits" = 1 ] && kill -0 $SRV 2>/dev/null; then echo "PASS: the second keyframe request hit the resident text encoder (http $c1/$c2)"; else echo "FAIL: keyframe requests http $c1/$c2, te hits $te_hits, server alive=$(kill -0 $SRV 2>/dev/null && echo yes || echo no)"; tail -5 /tmp/h3_res_d.log; rc=1; fi
+fi
 exit $rc

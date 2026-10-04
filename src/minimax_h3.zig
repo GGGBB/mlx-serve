@@ -3559,7 +3559,8 @@ pub const Resident = struct {
     stack: lora_mod.Stack,
     /// True while `dit`'s slots are bound to `stack`; a fresh DiT starts unbound.
     lora_bound: bool = false,
-    /// File bytes of what is held, for the "held" figure the policy and the log read.
+    /// File bytes of what is held, for the "held" figure the policy and the log read:
+    /// stamped once the DiT is in, never from the plan (a failed load holds nothing).
     bytes: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Resident {
@@ -4201,7 +4202,7 @@ fn generateOne(
         // The tower is 1.2 GB and only the presentation knows whether anything
         // needs it — a keyframe with vision blocks off, or an audio-only ref
         // set, does not.
-        if (needs_vision) try te.loadVision(&tw.?, s);
+        if (needs_vision and te.vision == null) try te.loadVision(&tw.?, s);
         var e = try te.encodeItems(allocator, present.items, s);
         errdefer e.deinit();
         try mlx.check(mlx.mlx_array_eval(e.hidden));
@@ -6876,12 +6877,12 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     const shAT = [_]c_int{ 3, 2 };
     const shBT = [_]c_int{ 2, 4 };
-    const at = mlx.mlx_array_new_data(@constCast(@ptrCast(&AT)), &shAT, 2, f32t);
+    const at = mlx.mlx_array_new_data(@ptrCast(@constCast(&AT)), &shAT, 2, f32t);
     defer _ = mlx.mlx_array_free(at);
-    const bt = mlx.mlx_array_new_data(@constCast(@ptrCast(&BT)), &shBT, 2, f32t);
+    const bt = mlx.mlx_array_new_data(@ptrCast(@constCast(&BT)), &shBT, 2, f32t);
     defer _ = mlx.mlx_array_free(bt);
     const shX = [_]c_int{ 2, 3 };
-    const x = mlx.mlx_array_new_data(@constCast(@ptrCast(&X)), &shX, 2, f32t);
+    const x = mlx.mlx_array_new_data(@ptrCast(@constCast(&X)), &shX, 2, f32t);
     defer _ = mlx.mlx_array_free(x);
 
     // Turbo at 1.0 plus a style adapter at 0.5 — the stacking case, on the
@@ -6894,7 +6895,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     const zbuf = [_]f32{ 0, 0, 0, 0, 0, 0, 0, 0 }; // zero base: the deltas alone come back
     const shZ = [_]c_int{ 2, 4 };
-    const zero = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    const zero = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
     const got = try loraAdd(zero, x, slot, s); // consumes `zero`
     defer _ = mlx.mlx_array_free(got);
     try mlx.check(mlx.mlx_array_eval(got));
@@ -6913,7 +6914,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
     // An empty slot is the identity — and returns the SAME handle, since the
     // no-adapter path must cost nothing on a 50-block DiT.
     const empty: LoraSlot = .{};
-    const base2 = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    const base2 = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
     defer _ = mlx.mlx_array_free(base2);
     const same = try loraAdd(base2, x, empty, s);
     try testing.expectEqual(base2.ctx, same.ctx);
@@ -6939,8 +6940,8 @@ test "minimax h3: an adapter file resolves to our own module names, dotted or fl
     const bv = [_]f32{ 0.5, 0.6, 0.7, 0.8 };
     const ash = [_]c_int{ 2, 2 };
     const bsh = [_]c_int{ 2, 2 };
-    const aarr = mlx.mlx_array_new_data(@constCast(@ptrCast(&av)), &ash, 2, mlx.mlx_dtype.float32);
-    const barr = mlx.mlx_array_new_data(@constCast(@ptrCast(&bv)), &bsh, 2, mlx.mlx_dtype.float32);
+    const aarr = mlx.mlx_array_new_data(@ptrCast(@constCast(&av)), &ash, 2, mlx.mlx_dtype.float32);
+    const barr = mlx.mlx_array_new_data(@ptrCast(@constCast(&bv)), &bsh, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(aarr);
     defer _ = mlx.mlx_array_free(barr);
     // One module under the reference's own key shape (ComfyUI writes the

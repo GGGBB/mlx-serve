@@ -9593,6 +9593,7 @@ fn handleStreamingCompletion(
             if (fed.stop != null) stopped = true;
             if (token_text.len == 0) continue;
         }
+        lps.sent(token_text.len, utf8_carry_c_len);
 
         const escaped = try jsonEscape(allocator, token_text);
         defer allocator.free(escaped);
@@ -11025,6 +11026,7 @@ fn handleStreamingGeneration(
                 continue;
             }
         } else if (gated_stream) try text_buf.appendSlice(allocator, token_text);
+        lps.sent(token_text.len, utf8_carry_len);
 
         if (delivery) |*d| {
             defer allocator.free(token_text);
@@ -11687,6 +11689,12 @@ const StreamLogprobs = struct {
     lens: std.ArrayList(usize) = .empty,
     /// Total decoded bytes noted so far — the generation's length.
     bytes_noted: usize = 0,
+    /// Decoded bytes the stream has SENT: a stop-string hold keeps a token's
+    /// bytes back and a stop cut drops them, and the entry goes with the bytes
+    /// (`sentTokens`). A trailing incomplete UTF-8 sequence (`carry`) is the
+    /// stream's own buffering, not a hold, so its token still counts.
+    bytes_sent: usize = 0,
+    carry: usize = 0,
     entries: std.ArrayList(generate_mod.LogprobResult) = .empty,
     /// The last rendered JSON, owned here and freed on the next drain — the
     /// caller passes it straight into a chunk and never sees the lifetime.
@@ -11713,6 +11721,11 @@ const StreamLogprobs = struct {
         defer if (text.len > 0) self.allocator.free(text);
         try self.lens.append(self.allocator, text.len);
         self.bytes_noted += text.len;
+    }
+
+    fn sent(self: *StreamLogprobs, n: usize, carry: usize) void {
+        self.bytes_sent += n;
+        self.carry = carry;
     }
 
     /// Drop the entries for tokens whose bytes never reach the client.
@@ -11768,8 +11781,9 @@ const StreamLogprobs = struct {
         const slot = self.slot orelse return null;
         self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
         // An id with no entry yet (or the reverse) is a partially published
-        // token — hold it for the next chunk rather than shipping a half pair.
-        const avail = @min(self.ids.items.len, self.entries.items.len);
+        // token — hold it for the next chunk rather than shipping a half pair;
+        // so is one whose bytes a stop-string hold has not released.
+        const avail = @min(@min(self.ids.items.len, self.entries.items.len), sentTokens(self.lens.items, self.bytes_sent + self.carry));
         if (avail <= self.emitted) return null;
         const ids = self.ids.items[self.emitted..avail];
         const lps = self.entries.items[self.emitted..avail];
@@ -11782,6 +11796,26 @@ const StreamLogprobs = struct {
         return json;
     }
 };
+
+/// How many leading tokens of `lens` are wholly inside the first `bytes_sent` bytes.
+fn sentTokens(lens: []const usize, bytes_sent: usize) usize {
+    var acc: usize = 0;
+    for (lens, 0..) |len, i| {
+        if (acc + len > bytes_sent) return i;
+        acc += len;
+    }
+    return lens.len;
+}
+
+test "stream logprobs: a token whose bytes a stop hold keeps back waits for its chunk" {
+    const lens = [_]usize{ 2, 3, 0, 4 };
+    try std.testing.expectEqual(@as(usize, 0), sentTokens(&lens, 1));
+    try std.testing.expectEqual(@as(usize, 1), sentTokens(&lens, 2));
+    try std.testing.expectEqual(@as(usize, 1), sentTokens(&lens, 4));
+    try std.testing.expectEqual(@as(usize, 3), sentTokens(&lens, 5));
+    try std.testing.expectEqual(@as(usize, 4), sentTokens(&lens, 9));
+    try std.testing.expectEqual(@as(usize, 4), sentTokens(&lens, 50));
+}
 
 /// How a stream ended: the wire `finish_reason` plus, when the
 /// degenerate-tail guard cut it, the sibling cause (`finishDetailsField`).
@@ -13771,7 +13805,7 @@ fn piecesOf(item: MediaItem) usize {
 }
 
 fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
-    var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(piece)));
+    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(piece)));
     switch (piece) {
         .image => |im| {
             h.update(std.mem.asBytes(&[_]u32{ im.width, im.height, im.grid_h, im.grid_w }));
@@ -20182,8 +20216,22 @@ test "expandMediaPlaceholders: an LFM2-VL tiled source is one item, every tile l
     // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
     const want = [_]u32{
         1,
-        125009, 124908, 124907, 124909, 124907, 124918, 124907, 124919, 124907, 125008, 124907, 125010,
-        125009, 124907, 124907, 125010,
+        125009,
+        124908,
+        124907,
+        124909,
+        124907,
+        124918,
+        124907,
+        124919,
+        124907,
+        125008,
+        124907,
+        125010,
+        125009,
+        124907,
+        124907,
+        125010,
         2,
     };
     try testing.expectEqualSlices(u32, &want, out.ids);
