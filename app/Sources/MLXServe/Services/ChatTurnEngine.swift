@@ -317,6 +317,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var reasoningEffort: ReasoningEffort = .low
         /// The agent's own voice for this turn; nil = follow Settings.
         var voice: AgentVoice? = nil
+        /// A surface's own model pin (a scheduled task); nil = the picker's selection.
+        var modelPath: String? = nil
         /// The spoken name this turn answers to (the agent's phrase when it has
         /// one). nil = the app's own phrase.
         var wakePhrase: String? = nil
@@ -415,6 +417,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     // MARK: - Convenience accessors
 
     private var server: ServerManager { appState.server }
+    private func requestModelId(_ config: TurnConfig) -> String? {
+        server.chatRequestModelId(selectedPath: config.modelPath ?? appState.selectedModelPath)
+    }
     private var mcpManager: MCPManager { appState.mcpManager }
     private func session(_ id: UUID) -> ChatSession? {
         appState.chatSessions.first { $0.id == id }
@@ -751,7 +756,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
                 defaults: config.requestDefaults(from: appState.serverOptions),
-                modelId: server.chatModelId,
+                modelId: requestModelId(config),
                 continueFinalMessage: continuing
             )
             }
@@ -1082,7 +1087,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
                 defaults: config.requestDefaults(from: appState.serverOptions),
-                modelId: server.chatModelId
+                modelId: requestModelId(config)
             )
             }
 
