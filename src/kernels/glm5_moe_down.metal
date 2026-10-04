@@ -2,19 +2,13 @@
 // oMLX 0.7.0 (Apache-2.0, see NOTICE): MLX's qmv_fast arithmetic for one-token MoE decode.
 #define HAS_SHARED 1
 #define ADD_SHARED_Y 0
-#define SLOT_MAJOR 0
 #define SHARED_WIDE_DOWN 0
 
   const uint simd_lid = thread_index_in_simdgroup;
   const uint simd_gid = simdgroup_index_in_threadgroup;
-#if SLOT_MAJOR
-  // Tokens vary fastest: experts they share are read back to back.
-  const int tile = int(threadgroup_position_in_grid.z);
-  const int token = int(threadgroup_position_in_grid.y);
-#else
-  const int tile = int(threadgroup_position_in_grid.y);
-  const int token = int(threadgroup_position_in_grid.z);
-#endif
+  // SM (slot-major): rows vary fastest, so experts they share are read back to back.
+  const int tile = SM ? int(threadgroup_position_in_grid.z) : int(threadgroup_position_in_grid.y);
+  const int token = SM ? int(threadgroup_position_in_grid.y) : int(threadgroup_position_in_grid.z);
   // Activation slots per token: the routed ones, then the shared expert's.
   constexpr int RT = TOPK + HAS_SHARED;
   const int out_row = (tile * NSG + int(simd_gid)) * RPS;

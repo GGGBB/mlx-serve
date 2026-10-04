@@ -969,6 +969,9 @@ pub const ModelConfig = struct {
         // round cost climbs with depth while the head's acceptance decays;
         // depth 2 beats both 1 and 3+, the adaptive default cap (6) loses.
         if (configured == 0 and std.mem.eql(u8, self.model_type, "nemotron_h")) return 2;
+        // glm5_next: the head's acceptance decays past three drafts while every verify row
+        // costs a MoE expert read; the adaptive default settled at one draft and lost.
+        if (configured == 0 and self.isGlm5()) return 3;
         return configured;
     }
 

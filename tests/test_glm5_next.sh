@@ -7,10 +7,11 @@
 #   [1] short answer, thinking off   [5] needle past the indexer's 2048-token budget (sparse path)
 #   [2] thinking on by default, and  [6] prefix reuse: cached tokens, same answer
 #       low effort thinks less       [7] streaming carries no think/tool markup
-#   [3] parallel tool calls
+#   [3] parallel tool calls             [8] the pack's MTP head loads and drafts
 #
 # Hermetic counterparts: the config-parse tests in model.zig, the effort and tool-history
-# render tests in chat.zig, and the `glm5_next fixture` parity test in transformer.zig.
+# render tests in chat.zig, and the `glm5_next fixture` + `glm5_next MTP fixture` parity
+# tests in transformer.zig.
 
 set -euo pipefail
 
@@ -105,6 +106,9 @@ print("REASONING:" + "".join(r)); print("CONTENT:" + "".join(c))')
 check "[7] streamed answer carries 12" "$S" "12"
 check_absent "[7] no think tags streamed" "$S" "<think"
 check_absent "[7] no tool markup streamed" "$S" "<tool_call"
+
+check "[8] MTP head loaded" "$(cat "$LOG")" "GLM MTP head ready"
+check "[8] MTP drafted" "$(cat "$LOG")" "[spec-stats] mode=mtp"
 
 check_absent "[log] no MLX error" "$(cat "$LOG")" "[mlx]"
 echo

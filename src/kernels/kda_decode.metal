@@ -224,6 +224,13 @@
         state[i] = state[i] + ks[t][s_idx] * delta;
         out += state[i] * qs[t][s_idx];
       }
+      if (CAP) {
+        // A spec verify keeps every row's state for the partial-accept rollback.
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state_seq[((size_t(t) * (QKV / DK) + h) * DK + dv_idx) * DK + s_idx] = state[i];
+        }
+      }
       out = simd_sum(out);
       if (thread_index_in_simdgroup == 0) {
         ys[t][dv_idx] = static_cast<T>(out);

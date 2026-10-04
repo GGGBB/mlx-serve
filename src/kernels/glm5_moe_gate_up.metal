@@ -2,20 +2,14 @@
 // oMLX 0.7.0 (Apache-2.0, see NOTICE): MLX's qmv_fast arithmetic for one-token MoE decode.
 #define HAS_SHARED 1
 #define SHARED_WIDE 0
-#define SLOT_MAJOR 0
 #define SELECT 0
 
   const uint simd_lid = thread_index_in_simdgroup;
   const uint simd_gid = simdgroup_index_in_threadgroup;
-#if SLOT_MAJOR
-  // Route slots vary fastest, so the slots of an expert that several
-  // tokens share read its row block back to back (cache hits).
-  const int tile = int(threadgroup_position_in_grid.z);
-  const int z = int(threadgroup_position_in_grid.y);
-#else
-  const int tile = int(threadgroup_position_in_grid.y);
-  const int z = int(threadgroup_position_in_grid.z);
-#endif
+  // SM (slot-major): route slots vary fastest, and `order` lists them expert-sorted, so the
+  // slots of an expert that several rows share read its row block back to back (cache hits).
+  const int tile = SM ? int(threadgroup_position_in_grid.z) : int(threadgroup_position_in_grid.y);
+  const int z = SM ? int(threadgroup_position_in_grid.y) : int(threadgroup_position_in_grid.z);
   const T lim = T(limit[0]);
   const T neg_lim = T(-limit[0]);
 #if SHARED_WIDE
@@ -58,8 +52,16 @@
 #else
   constexpr int RT = TOPK + HAS_SHARED;
 #endif
-  const int token = z / RT;
-  const int r = z - token * RT;
+  // Routed slots first (in `order` under SM), then one shared-expert slot per row.
+  int token, r;
+  if (z < NTOK * TOPK) {
+    const int slot = SM ? int(order[z]) : z;
+    token = slot / TOPK;
+    r = slot - token * TOPK;
+  } else {
+    token = z - NTOK * TOPK;
+    r = TOPK;
+  }
   const int out_row = (tile * NSG + int(simd_gid)) * RPS;
   const device T* xr = x + token * K;
 
@@ -115,7 +117,7 @@
         sh_up_b + row0 * G, xr, simd_lid, u_res);
 #endif
   }
-  device T* o = out + size_t(z) * N + out_row;
+  device T* o = out + (size_t(token) * RT + r) * N + out_row;
   for (int row = 0; row < RPS; row++) {
     float gv = simd_sum(g_res[row]);
     float uv = simd_sum(u_res[row]);

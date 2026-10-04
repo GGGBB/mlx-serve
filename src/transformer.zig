@@ -7704,6 +7704,7 @@ const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const glm5 = @import("glm5_next.zig");
+const glm_mtp = @import("glm_mtp.zig");
 const kda_recurrence = @import("kda_recurrence.zig");
 const dec_attn = @import("dec_attn.zig");
 const Weights = model_mod.Weights;
@@ -14297,7 +14298,7 @@ const FullAttnWeights = struct {
 };
 
 /// A projection triple (`scales`/`biases` null-ctx when dense). Borrowed handles.
-const QW = struct {
+pub const QW = struct {
     w: mlx.mlx_array = .{ .ctx = null },
     s: mlx.mlx_array = .{ .ctx = null },
     b: mlx.mlx_array = .{ .ctx = null },
@@ -14305,7 +14306,7 @@ const QW = struct {
 
 /// GLM-5-Next DeepSeek sparse attention: absorbed NoPE MLA over a latent, plus the
 /// pooled indexer that picks the tokens each query reads.
-const DsaWeights = struct {
+pub const DsaWeights = struct {
     q_a: QW,
     kv_a: QW,
     q_a_norm: mlx.mlx_array,
@@ -15127,6 +15128,8 @@ pub const ForwardCtx = struct {
     capture_ssm_seq: bool = false,
     /// Verify rows forming a draft tree (null = a chain).
     tree: ?*const SpecTree = null,
+    /// A speculative VERIFY forward (drafts behind one committed token), never a prompt chunk.
+    spec_verify: bool = false,
     /// Hand the graph built so far to the GPU every this many layers (0 =
     /// build it whole): a spec round's verify waits on the host otherwise.
     pipeline_build: u32 = 0,
@@ -25627,6 +25630,10 @@ pub const Transformer = struct {
             stream = try df.materialize(self.s);
         }
         dt.end(stream);
+        if (diagEnvOnCached(&glm_profile_env, "MLX_SERVE_GLM_PROFILE")) {
+            log.info("[glm-profile] rows={d} collapse {d:.2} kda {d:.2} dsa {d:.2} moe {d:.2} expand {d:.2} ms\n", .{ seq_len, glmProfMs(.collapse), glmProfMs(.kda), glmProfMs(.dsa), glmProfMs(.moe), glmProfMs(.expand) });
+            glm_prof_ns = @splat(0);
+        }
 
         var mean = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mean);
@@ -25672,13 +25679,36 @@ pub const Transformer = struct {
             deferred.* = pre.defer_(out, stream.*);
             return;
         }
+        // A verify window (2..8 rows): the fused pre-step takes every row in one dispatch,
+        // the expand kernel already works per row; no deferral past one token.
+        // DIAGNOSTIC (MLX_SERVE_GLM_PROFILE): eval at each seam and bill the wall time per kind.
+        const prof = diagEnvOnCached(&glm_profile_env, "MLX_SERVE_GLM_PROFILE");
+        if (glm5.hcRowsServes(self.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w)) {
+            var t0: i128 = if (prof) glmProfNow() else 0;
+            var pre = try glm5.hcPre(self.s, stream.*, null, w.fn_rows, w.scale, w.base, norm_w, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps, cfg.rms_norm_eps);
+            defer pre.deinit();
+            if (prof) t0 = glmProfLap(pre.normed, .collapse, t0);
+            const out = try self.glmBranch(ctx, pre.normed, lw, attn, li, offset, batch, seq_len, is_prefill);
+            defer _ = mlx.mlx_array_free(out);
+            if (prof) t0 = glmProfLap(out, if (!attn) .moe else if (lw.attn == .linear) .kda else .dsa, t0);
+            const c: glm5.Collapsed = .{ .x = pre.normed, .post = pre.post, .comb = pre.comb };
+            const res = try glm5.expand(self.s, out, stream.*, &c);
+            if (prof) t0 = glmProfLap(res, .expand, t0);
+            _ = mlx.mlx_array_free(stream.*);
+            stream.* = res;
+            return;
+        }
+        var t0: i128 = if (prof) glmProfNow() else 0;
         var c = try glm5.collapse(self.s, stream.*, w.fn_rows, w.scale, w.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps);
         defer c.deinit();
         const normed = try self.rmsNorm(c.x, norm_w);
         defer _ = mlx.mlx_array_free(normed);
+        if (prof) t0 = glmProfLap(normed, .collapse, t0);
         const out = try self.glmBranch(ctx, normed, lw, attn, li, offset, batch, seq_len, is_prefill);
         defer _ = mlx.mlx_array_free(out);
+        if (prof) t0 = glmProfLap(out, if (!attn) .moe else if (lw.attn == .linear) .kda else .dsa, t0);
         const res = try glm5.expand(self.s, out, stream.*, &c);
+        if (prof) t0 = glmProfLap(res, .expand, t0);
         _ = mlx.mlx_array_free(stream.*);
         stream.* = res;
     }
@@ -25697,7 +25727,7 @@ pub const Transformer = struct {
     /// (`k`) and the indexer's key and pool gate (`v`). Queries attend in the latent
     /// (absorbed MLA) over the tokens the indexer picks; when every query picks every
     /// earlier token the attention is plain causal and prefill runs it on lifted keys.
-    fn glmDsaAttn(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, d: *const DsaWeights, layer: u32, offset: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    pub fn glmDsaAttn(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, d: *const DsaWeights, layer: u32, offset: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
         const cfg = &self.config;
         const heads: c_int = @intCast(cfg.num_attention_heads);
         const hd: c_int = @intCast(cfg.dsa_head_dim);
@@ -25840,12 +25870,26 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(q_abs);
             var o_lat = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(o_lat);
-            if (glm5.selectsAll(t, ix) and rows == 1 and batch == 1) {
+            if (glm5.selectsAll(t, ix) and rows <= glm5.HC_PRE_MAX_ROWS and batch == 1) {
                 var keys = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(keys);
                 try mlx.check(mlx.mlx_reshape(&keys, view.k, &[_]c_int{ 1, t, r }, 3, self.s));
                 _ = mlx.mlx_array_free(o_lat);
-                o_lat = try glm5.latentAttendFolded(self.s, q_abs, keys, null, q_scale);
+                if (rows == 1) {
+                    o_lat = try glm5.latentAttendFolded(self.s, q_abs, keys, null, q_scale);
+                } else {
+                    // A verify window folds its rows into the head axis under a per-row causal
+                    // mask: MLX's sdpa declines the 64:1 GQA factor and reads the keys per head.
+                    var qf = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(qf);
+                    try mlx.check(mlx.mlx_reshape(&qf, q_abs, &[_]c_int{ 1, heads * rows, 1, r }, 4, self.s));
+                    const valid = try glm5.latentCausalMask(self.s, heads, rows, t);
+                    defer _ = mlx.mlx_array_free(valid);
+                    const of = try glm5.latentAttendFolded(self.s, qf, keys, valid, q_scale);
+                    defer _ = mlx.mlx_array_free(of);
+                    o_lat = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_reshape(&o_lat, of, &[_]c_int{ 1, heads, rows, r }, 4, self.s));
+                }
             } else if (glm5.selectsAll(t, ix)) {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o_lat, q_abs, view.k, view.k, q_scale orelse 1.0, if (rows > 1) "causal" else "", none, none, false, self.s));
             } else {
@@ -28796,8 +28840,7 @@ pub const Transformer = struct {
         const v_shape = [_]c_int{ batch, seq_len, kv_h, vd };
         const flat_shape = [_]c_int{ batch, seq_len, h_count * vd };
         const perm = [_]c_int{ 0, 2, 1, 3 };
-        // MiMo's verify windows read the decode copies its serial steps read.
-        const decode_shape = batch == 1 and (!is_prefill or (cfg.isMimo() and seq_len <= dec_attn.MAX_ROWS));
+        const decode_shape = mimoDecodeCopies(cfg.isMimo(), batch, is_prefill, ctx.spec_verify, seq_len);
 
         const use_yarn = self.rope_freqs_yarn != null;
         const rope_base = mlx.mlx_optional_float{
@@ -30009,18 +30052,36 @@ pub const Transformer = struct {
             a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
             b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
         }
-        // KDA decode: one dispatch per layer over the row-joined projection.
-        if (in_all.ctx != null and batch == 1 and seq_len <= 8 and !self.spec_capture_ssm and la.a_log_h.ctx != null and
+        // KDA decode: one dispatch per layer over the row-joined projection. A spec verify
+        // steps row by row instead, keeping each row's state for the partial-accept rollback
+        // (`spec_state_seq`, `spec_conv_input`: the layout `ssmRollbackFromCapture` reads).
+        if (in_all.ctx != null and batch == 1 and seq_len <= 8 and la.a_log_h.ctx != null and
             ssm.initialized and ssm.ssm_state.ctx != null and ssm.conv_state.ctx != null)
         step: {
             const w = la.in.widths;
             const a2q = self.quantParamsHinted(la.a2.w, la.a2.s, @intCast(dk));
             const z2q = self.quantParamsHinted(la.z2.w, la.z2.s, @intCast(dk));
-            const r = (try kda_recurrence.decodeStep(self.s, in_all, w[0], w[0] + w[1], w[0] + w[1] + w[2], num_v_heads, ssm.conv_state, la.conv1d_w, la.a_log_h, la.dt_f32, ssm.ssm_state, la.norm_w, //
-                .{ .w = la.a2.w, .s = la.a2.s, .b = la.a2.b, .bits = a2q.bits, .gs = a2q.group_size }, //
-                .{ .w = la.z2.w, .s = la.z2.s, .b = la.z2.b, .bits = z2q.bits, .gs = z2q.group_size }, //
-                cfg.kda_gate_lower_bound, cfg.rms_norm_eps)) orelse break :step;
+            const fb: kda_recurrence.Low = .{ .w = la.a2.w, .s = la.a2.s, .b = la.a2.b, .bits = a2q.bits, .gs = a2q.group_size };
+            const gb: kda_recurrence.Low = .{ .w = la.z2.w, .s = la.z2.s, .b = la.z2.b, .bits = z2q.bits, .gs = z2q.group_size };
+            const r = (try kda_recurrence.decodeStep(self.s, in_all, w[0], w[0] + w[1], w[0] + w[1] + w[2], num_v_heads, ssm.conv_state, la.conv1d_w, la.a_log_h, la.dt_f32, ssm.ssm_state, la.norm_w, fb, gb, cfg.kda_gate_lower_bound, cfg.rms_norm_eps, self.spec_capture_ssm)) orelse break :step;
             defer _ = mlx.mlx_array_free(r.y);
+            if (self.spec_capture_ssm) {
+                // The window's conv inputs behind the 3 that preceded it, and the state after
+                // every row: the layout `ssmRollbackFromCapture` slices.
+                var qkv_rows = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(qkv_rows);
+                try mlx.check(mlx.mlx_slice(&qkv_rows, in_all, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, seq_len, w[0] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
+                const parts = [_]mlx.mlx_array{ ssm.conv_state, qkv_rows };
+                const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
+                ssm.spec_conv_input = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_concatenate_axis(&ssm.spec_conv_input, vec, 1, self.s));
+                if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+                ssm.spec_state_seq = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(&ssm.spec_state_seq, r.state_seq, &[_]c_int{ seq_len, 1, num_v_heads, dv, dk }, 5, self.s));
+                _ = mlx.mlx_array_free(r.state_seq);
+            }
             _ = mlx.mlx_array_free(ssm.conv_state);
             ssm.conv_state = r.conv_state;
             _ = mlx.mlx_array_free(ssm.ssm_state);
@@ -32023,7 +32084,10 @@ pub const Transformer = struct {
         var ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ids);
         try mlx.check(mlx.mlx_astype(&ids, flat, .uint32, self.s));
-        const y = (try glm5.moeDecode(self.s, x, ids, scores, //
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{k}, 1, self.s));
+        const y = (try glm5.moeDecode(self.s, x, ids, sc, //
             .{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b, .bits = gate_qp.bits, .gs = gate_qp.group_size }, //
             .{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b, .bits = up_qp.bits, .gs = up_qp.group_size }, //
             .{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b, .bits = down_qp.bits, .gs = down_qp.group_size }, //
@@ -32099,7 +32163,6 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(x_flat);
         const dshape = [_]c_int{D};
         try mlx.check(mlx.mlx_reshape(&x_flat, expert_x, &dshape, 1, self.s));
-
 
         // gate / up share the single token's hidden state, so one kernel can
         // do both dot products and the activation — three dispatches off the
@@ -32442,7 +32505,7 @@ pub const Transformer = struct {
             norm_scores = scaled_scores;
         }
 
-        if (cfg.isGlm5() and !skip_shared and mlx.mlx_array_size(expert_x) == cfg.hidden_size) {
+        if (cfg.isGlm5() and !skip_shared and mlx.mlx_array_size(expert_x) <= @as(usize, glm5.MOE_DECODE_MAX_ROWS) * cfg.hidden_size) {
             if (try self.glmMoeDecode(expert_x, inds, norm_scores, mw, gate_qp, up_qp, down_qp)) |y| return y;
         }
 
@@ -32509,7 +32572,7 @@ pub const Transformer = struct {
         var moe_reduced = false;
         var cost_arm: u8 = 4;
 
-        if (B * S <= moe_fp4.MAX_ROWS and gate_qp.mode == .mxfp4 and up_qp.mode == .mxfp4 and down_qp.mode == .mxfp4 and
+        if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), gate_qp.mode, up_qp.mode, down_qp.mode) and
             try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size))
         {
             moe_reduced = true;
@@ -33279,7 +33342,7 @@ fn maybeTransposeDepthwiseConv(
 /// In-place: if `*sc` is null-ctx, we treat the matching `*w` as plain bf16.
 /// Replace `*w` with its pre-transposed `[in, out]` form and record the new
 /// array in `owned` so we can free it on Transformer.deinit.
-fn maybeTransposeForBf16(
+pub fn maybeTransposeForBf16(
     w: *mlx.mlx_array,
     sc: mlx.mlx_array,
     owned: *std.ArrayList(mlx.mlx_array),
@@ -33788,26 +33851,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             }
         } else if (is_glm) {
             // Sparse latent attention: no q/k/v projections; `o_proj` is the output.
-            var dsa: DsaWeights = .{
-                .q_a = try loadQW(weights, name_buf, prefix, li, "self_attn.q_a_proj"),
-                .kv_a = try loadQW(weights, name_buf, prefix, li, "self_attn.kv_a_proj_with_mqa"),
-                .q_a_norm = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_a_layernorm.weight"),
-                .kv_a_norm = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.kv_a_layernorm.weight"),
-                .q_b = try loadQW(weights, name_buf, prefix, li, "self_attn.q_b_proj"),
-                .embed_q = try loadQW(weights, name_buf, prefix, li, "self_attn.embed_q"),
-                .unembed = try loadQW(weights, name_buf, prefix, li, "self_attn.unembed_out"),
-                .o = try loadQW(weights, name_buf, prefix, li, "self_attn.o_proj"),
-                .idx_wq_b = try loadQW(weights, name_buf, prefix, li, "self_attn.indexer.wq_b"),
-                .idx_wk = try loadQW(weights, name_buf, prefix, li, "self_attn.indexer.wk"),
-                .idx_k_norm_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.k_norm.weight"),
-                .idx_k_norm_b = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.k_norm.bias"),
-                .idx_wproj = try loadQW(weights, name_buf, prefix, li, "self_attn.indexer.weights_proj"),
-                .idx_gate_t = try f32Table(try getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.index_kpool_compress_gate"), true, &owned_bf16, allocator, s),
-                .idx_ape = try f32Table(try getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.index_kpool_compress_ape"), false, &owned_bf16, allocator, s),
-            };
-            for ([_]*QW{ &dsa.q_a, &dsa.kv_a, &dsa.q_b, &dsa.o, &dsa.idx_wq_b, &dsa.idx_wk, &dsa.idx_wproj }) |q| {
-                try maybeTransposeForBf16(&q.w, q.s, &owned_bf16, allocator, s);
-            }
+            var base_buf: [96]u8 = undefined;
+            const dsa = try loadDsaWeightsAt(weights, name_buf, layerBase(&base_buf, prefix, li), &owned_bf16, allocator, s);
             lw.attn = .{ .full = .{
                 .q_w = mlx.mlx_array_new(),
                 .q_s = mlx.mlx_array_new(),
@@ -34043,74 +34088,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         else
             (config.isMoe() and li >= config.first_k_dense_replace);
         if (layer_is_moe and (is_bailing or is_glm)) {
-            // bailing_hybrid MoE: mlx-lm's stacked `mlp.experts.*` banks, an
-            // `mlp.gate.weight` router with an f32 `mlp.gate.expert_bias`
-            // SELECTION bias, and one UNGATED always-added shared expert.
-            // Routing itself (sigmoid → +bias → group limit → top-k → renorm →
-            // routed_scaling_factor) is hy3's chain with the group limit
-            // inserted; `moe_n_group`/`moe_topk_group` pick it in moeMLP2.
-            //
-            // mlx-lm's converter renames both banks: it quantizes the router
-            // and keeps its module level, so the router lands at
-            // `mlp.gate.gate_proj.*`, and it stacks the experts under
-            // `mlp.switch_mlp.*`. Resolve each by probing, exactly as laguna
-            // and hy_v3 already do, so reference and converted checkpoints
-            // both bind.
-            const rt = bailingRouterBase(weights, name_buf, prefix, li);
-            const ex = hy3ExpertContainer(weights, name_buf, prefix, li);
-            var rtbuf: [64]u8 = undefined;
-            var exbuf: [64]u8 = undefined;
-            lw.mlp = .{
-                .moe = .{
-                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "weight")),
-                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
-                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
-                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
-                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
-                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
-                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
-                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
-                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
-                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
-                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
-                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
-                    .shared_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
-                    .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
-                    .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.weight"),
-                    .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.scales") orelse mlx.mlx_array_new(),
-                    .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.weight"),
-                    .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.scales") orelse mlx.mlx_array_new(),
-                    .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.biases") orelse mlx.mlx_array_new(),
-                    .expert_bias = if (is_glm)
-                        try f32Table(try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.e_score_correction_bias"), false, &owned_bf16, allocator, s)
-                    else getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.expert_bias") orelse blk: {
-                        // moe_router_enable_expert_bias=false ships no bias; the
-                        // reference zero-inits it (selection = plain sigmoid top-k).
-                        var zeros = mlx.mlx_array_new();
-                        const zshape = [_]c_int{@intCast(config.num_experts)};
-                        try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
-                        try owned_bf16.append(allocator, zeros);
-                        break :blk zeros;
-                    },
-                    .route_norm = config.moe_route_norm,
-                    .route_scale = config.router_scaling_factor,
-                    .shared_ungated = true,
-                },
-            };
-            {
-                const mw = &lw.mlp.moe;
-                try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
-                // GLM-5-Next routes in f32 (`moe_router_dtype`).
-                if (is_glm and mw.router_s.ctx == null) mw.router_w = try f32Table(mw.router_w, false, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
-            }
+            var base_buf: [96]u8 = undefined;
+            lw.mlp = .{ .moe = try loadRoutedMoeAt(weights, name_buf, layerBase(&base_buf, prefix, li), is_glm, &config, &owned_bf16, allocator, s) };
         } else if (layer_is_moe and is_gemma4) {
             // Gemma 4 MoE: different weight naming, Sigma-MoE routing, no shared expert gate.
             // Each `*_s`/`*_b` is loaded optionally for Unsloth Dynamic compatibility —
@@ -36833,7 +36812,7 @@ const Qwen4AttnProf = struct {
 
     fn lap(arr: mlx.mlx_array, stage: Stage) void {
         sync(arr);
-        ns[@intFromEnum(stage)] += clock.lap();
+        ns[@backingInt(stage)] += clock.lap();
     }
 
     fn flush(seq_len: c_int, kv: usize) void {
@@ -39749,7 +39728,7 @@ var gate_mul_cfg_key: [gate_mul_kinds]GateMulCfgKey = @splat(std.mem.zeroes(Gate
 var gate_mul_engaged: [gate_mul_kinds]bool = @splat(false);
 
 fn getGateMulKernel(kind: GateMulKind) !mlx.mlx_fast_metal_kernel {
-    const k: usize = @intFromEnum(kind);
+    const k: usize = @backingInt(kind);
     if (gate_mul_kernels[k]) |kr| return kr;
     const input_names = [_][*:0]const u8{ "gate", "up", "sigtab", "N_size", "lim" };
     const output_names = [_][*:0]const u8{"y"};
@@ -39802,7 +39781,7 @@ fn tableGateMul(s: mlx.mlx_stream, kind: GateMulKind, gate: mlx.mlx_array, up: m
     }
     if (n <= 0 or n > std.math.maxInt(c_int)) return null;
     const ni: c_int = @intCast(n);
-    const k: usize = @intFromEnum(kind);
+    const k: usize = @backingInt(kind);
 
     const tg: c_int = @min(@as(c_int, 256), @max(@as(c_int, 32), @divTrunc(ni + 31, 32) * 32));
     const key = GateMulCfgKey{ .shape = ShapeKey.from(gsh), .dtype = dt };
@@ -42028,8 +42007,8 @@ pub fn gatherQmvDownReduce(
     const N: c_int = wsh[1];
     const K: c_int = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
     if (@rem(K, @as(c_int, @intCast(group_size))) != 0) return null;
-    // Eight lanes per row: at a 2048-wide expert (GLM-5-Next) the reduction lost 10 ms a token to
-    // the gathered down projection plus the composed sum.
+    // Eight lanes per row: from a 2048-wide expert the gathered down projection plus the
+    // composed sum beats the lanes (GLM-5-Next and MiMo widths).
     if (K >= 2048) return null;
     const ish = mlx.getShape(inds);
     if (ish.len != 1) return null;
@@ -44100,6 +44079,131 @@ fn ffKey(buf: *[64]u8, name: []const u8, suffix: []const u8) []const u8 {
 }
 
 /// `getLayerWeight` for `<base>.<rest>`, formatted into its own buffer.
+/// `<prefix>.layers.<li>`: the name base of one trunk layer.
+fn layerBase(buf: *[96]u8, prefix: []const u8, li: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}.layers.{d}", .{ prefix, li }) catch unreachable;
+}
+
+pub fn getWeightAt(weights: *const Weights, buf: *[256]u8, base: []const u8, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
+    const name = std.fmt.bufPrint(buf, "{s}.{s}", .{ base, suffix }) catch unreachable;
+    return weights.get(name) orelse {
+        log.err("MISSING WEIGHT: {s}\n", .{name});
+        return error.MissingWeight;
+    };
+}
+
+fn getWeightAtOpt(weights: *const Weights, buf: *[256]u8, base: []const u8, suffix: []const u8) ?mlx.mlx_array {
+    const name = std.fmt.bufPrint(buf, "{s}.{s}", .{ base, suffix }) catch unreachable;
+    return weights.get(name);
+}
+
+/// A quantized (or dense) projection `<base>.<sub>.{weight,scales,biases}`.
+pub fn loadQWAt(weights: *const Weights, buf: *[256]u8, base: []const u8, sub: []const u8) error{MissingWeight}!QW {
+    var nb: [160]u8 = undefined;
+    const b = std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, sub }) catch unreachable;
+    return .{
+        .w = try getWeightAt(weights, buf, b, "weight"),
+        .s = getWeightAtOpt(weights, buf, b, "scales") orelse mlx.mlx_array_new(),
+        .b = getWeightAtOpt(weights, buf, b, "biases") orelse mlx.mlx_array_new(),
+    };
+}
+
+/// GLM-5-Next sparse latent attention weights under `<base>.self_attn.*` (a trunk layer or the
+/// MTP block); dense bf16 projections are transposed for `qmatmul`.
+pub fn loadDsaWeightsAt(weights: *const Weights, name_buf: *[256]u8, base: []const u8, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !DsaWeights {
+    var dsa: DsaWeights = .{
+        .q_a = try loadQWAt(weights, name_buf, base, "self_attn.q_a_proj"),
+        .kv_a = try loadQWAt(weights, name_buf, base, "self_attn.kv_a_proj_with_mqa"),
+        .q_a_norm = try getWeightAt(weights, name_buf, base, "self_attn.q_a_layernorm.weight"),
+        .kv_a_norm = try getWeightAt(weights, name_buf, base, "self_attn.kv_a_layernorm.weight"),
+        .q_b = try loadQWAt(weights, name_buf, base, "self_attn.q_b_proj"),
+        .embed_q = try loadQWAt(weights, name_buf, base, "self_attn.embed_q"),
+        .unembed = try loadQWAt(weights, name_buf, base, "self_attn.unembed_out"),
+        .o = try loadQWAt(weights, name_buf, base, "self_attn.o_proj"),
+        .idx_wq_b = try loadQWAt(weights, name_buf, base, "self_attn.indexer.wq_b"),
+        .idx_wk = try loadQWAt(weights, name_buf, base, "self_attn.indexer.wk"),
+        .idx_k_norm_w = try getWeightAt(weights, name_buf, base, "self_attn.indexer.k_norm.weight"),
+        .idx_k_norm_b = try getWeightAt(weights, name_buf, base, "self_attn.indexer.k_norm.bias"),
+        .idx_wproj = try loadQWAt(weights, name_buf, base, "self_attn.indexer.weights_proj"),
+        .idx_gate_t = try f32Table(try getWeightAt(weights, name_buf, base, "self_attn.indexer.index_kpool_compress_gate"), true, owned_bf16, allocator, s),
+        .idx_ape = try f32Table(try getWeightAt(weights, name_buf, base, "self_attn.indexer.index_kpool_compress_ape"), false, owned_bf16, allocator, s),
+    };
+    for ([_]*QW{ &dsa.q_a, &dsa.kv_a, &dsa.q_b, &dsa.o, &dsa.idx_wq_b, &dsa.idx_wk, &dsa.idx_wproj }) |q| {
+        try maybeTransposeForBf16(&q.w, q.s, owned_bf16, allocator, s);
+    }
+    return dsa;
+}
+
+/// A bailing_hybrid / GLM-5-Next routed MoE under `<base>.mlp.*` (a trunk layer or the MTP
+/// block): mlx-lm's stacked `switch_mlp` banks, a router bias and one UNGATED shared expert.
+pub fn loadRoutedMoeAt(weights: *const Weights, name_buf: *[256]u8, base: []const u8, is_glm: bool, config: *const ModelConfig, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !MoeMlpWeights {
+    // bailing_hybrid MoE: mlx-lm's stacked `mlp.experts.*` banks, an
+    // `mlp.gate.weight` router with an f32 `mlp.gate.expert_bias`
+    // SELECTION bias, and one UNGATED always-added shared expert.
+    // Routing itself (sigmoid → +bias → group limit → top-k → renorm →
+    // routed_scaling_factor) is hy3's chain with the group limit
+    // inserted; `moe_n_group`/`moe_topk_group` pick it in moeMLP2.
+    //
+    // mlx-lm's converter renames both banks: it quantizes the router
+    // and keeps its module level, so the router lands at
+    // `mlp.gate.gate_proj.*`, and it stacks the experts under
+    // `mlp.switch_mlp.*`. Resolve each by probing, exactly as laguna
+    // and hy_v3 already do, so reference and converted checkpoints
+    // both bind.
+    const rt = bailingRouterBaseAt(weights, name_buf, base);
+    const ex = expertContainerAt(weights, name_buf, base);
+    var rtbuf: [64]u8 = undefined;
+    var exbuf: [64]u8 = undefined;
+    var mw: MoeMlpWeights = .{
+        .router_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "weight")),
+        .router_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
+        .router_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
+        .switch_gate_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+        .switch_gate_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
+        .switch_gate_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
+        .switch_up_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+        .switch_up_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
+        .switch_up_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
+        .switch_down_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+        .switch_down_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
+        .switch_down_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
+        .shared_gate_w = try getWeightAt(weights, name_buf, base, "mlp.shared_experts.gate_proj.weight"),
+        .shared_gate_s = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
+        .shared_gate_b = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
+        .shared_up_w = try getWeightAt(weights, name_buf, base, "mlp.shared_experts.up_proj.weight"),
+        .shared_up_s = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.up_proj.scales") orelse mlx.mlx_array_new(),
+        .shared_up_b = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.up_proj.biases") orelse mlx.mlx_array_new(),
+        .shared_down_w = try getWeightAt(weights, name_buf, base, "mlp.shared_experts.down_proj.weight"),
+        .shared_down_s = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.down_proj.scales") orelse mlx.mlx_array_new(),
+        .shared_down_b = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.down_proj.biases") orelse mlx.mlx_array_new(),
+        .expert_bias = if (is_glm)
+            try f32Table(try getWeightAt(weights, name_buf, base, "mlp.gate.e_score_correction_bias"), false, owned_bf16, allocator, s)
+        else
+            getWeightAtOpt(weights, name_buf, base, "mlp.gate.expert_bias") orelse blk: {
+                // moe_router_enable_expert_bias=false ships no bias; the
+                // reference zero-inits it (selection = plain sigmoid top-k).
+                var zeros = mlx.mlx_array_new();
+                const zshape = [_]c_int{@intCast(config.num_experts)};
+                try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
+                try owned_bf16.append(allocator, zeros);
+                break :blk zeros;
+            },
+        .route_norm = config.moe_route_norm,
+        .route_scale = config.router_scaling_factor,
+        .shared_ungated = true,
+    };
+    try maybeTransposeForBf16(&mw.router_w, mw.router_s, owned_bf16, allocator, s);
+    // GLM-5-Next routes in f32 (`moe_router_dtype`).
+    if (is_glm and mw.router_s.ctx == null) mw.router_w = try f32Table(mw.router_w, false, owned_bf16, allocator, s);
+    try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, owned_bf16, allocator, s);
+    try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, owned_bf16, allocator, s);
+    try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, owned_bf16, allocator, s);
+    try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, owned_bf16, allocator, s);
+    try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, owned_bf16, allocator, s);
+    try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, owned_bf16, allocator, s);
+    return mw;
+}
+
 fn getLayerWeightAt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, base: []const u8, rest: []const u8) error{MissingWeight}!mlx.mlx_array {
     var nb: [128]u8 = undefined;
     return getLayerWeight(weights, buf, prefix, layer, std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, rest }) catch unreachable);
@@ -44159,7 +44263,12 @@ fn moeExpertSuffix(buf: []u8, container: []const u8, leaf: []const u8) []const u
 /// tensors `mlp.switch_mlp.*`. Prefers `experts` when present, so an ox-ox
 /// checkpoint binds byte-identically to before this fallback existed.
 fn hy3ExpertContainer(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32) []const u8 {
-    return if (getLayerWeightOpt(weights, buf, prefix, layer, "mlp.experts.gate_proj.weight") != null)
+    var base_buf: [96]u8 = undefined;
+    return expertContainerAt(weights, buf, layerBase(&base_buf, prefix, layer));
+}
+
+fn expertContainerAt(weights: *const Weights, buf: *[256]u8, base: []const u8) []const u8 {
+    return if (getWeightAtOpt(weights, buf, base, "mlp.experts.gate_proj.weight") != null)
         "mlp.experts"
     else
         "mlp.switch_mlp";
@@ -44187,9 +44296,9 @@ fn lagunaRouterBase(weights: *const Weights, buf: *[256]u8, prefix: []const u8, 
 /// Same shape as lagunaRouterBase: prefer the flat name so reference
 /// checkpoints bind byte-identically, and fall back to it when neither exists
 /// so the MISSING WEIGHT error names the canonical key.
-fn bailingRouterBase(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32) []const u8 {
-    return if (getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.weight") == null and
-        getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.gate_proj.weight") != null)
+fn bailingRouterBaseAt(weights: *const Weights, buf: *[256]u8, base: []const u8) []const u8 {
+    return if (getWeightAtOpt(weights, buf, base, "mlp.gate.weight") == null and
+        getWeightAtOpt(weights, buf, base, "mlp.gate.gate_proj.weight") != null)
         "mlp.gate.gate_proj"
     else
         "mlp.gate";
@@ -63064,10 +63173,20 @@ fn gdnDecodeRowsCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, t_
     const eps_arr = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps_arr);
     var in = gdn_decode.Inputs{
-        .qkv = rows[0], .z = rows[1], .a = rows[2], .b = rows[3],
-        .conv_state = conv_state, .ssm_state = ssm_state, .conv_w = conv_w,
-        .A_log = A_log, .dt_bias = dt_bias, .q_scale = q_scale, .k_scale = k_scale,
-        .norm_w = norm_w, .eps = eps_arr, .signs = .{ .ctx = null },
+        .qkv = rows[0],
+        .z = rows[1],
+        .a = rows[2],
+        .b = rows[3],
+        .conv_state = conv_state,
+        .ssm_state = ssm_state,
+        .conv_w = conv_w,
+        .A_log = A_log,
+        .dt_bias = dt_bias,
+        .q_scale = q_scale,
+        .k_scale = k_scale,
+        .norm_w = norm_w,
+        .eps = eps_arr,
+        .signs = .{ .ctx = null },
     };
     const all = (try gdn_decode.recurSeq(g, t_len, in, s)) orelse return error.FusedDeclined;
     defer for ([_]mlx.mlx_array{ all.y, all.conv_state, all.ssm_state, all.state_seq }) |a| {
@@ -63142,7 +63261,6 @@ test "gdn_decode.recurSeqFold: a threadgroup the GPU refuses declines cleanly, a
     try gdnDecodeFoldParityCase(s, .bfloat16, .bfloat16, 2, 8, 2, false);
     try std.testing.expect(!gdn_decode.foldDeclined(2));
 }
-
 
 fn gdnDecodeFoldParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, hk: c_int, hv: c_int, t_len: c_int, swish: bool) !void {
     var prng = std.Random.DefaultPrng.init(0xF01D + @as(u64, @intCast(t_len * 131 + hv)));
@@ -63235,7 +63353,6 @@ fn gdnDecodeFoldParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dty
     try mlx.check(mlx.mlx_slice(&got_head, got.state_seq, &start, 5, &stop, 5, &strides, 5, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(ref_head, got_head, s));
 }
-
 
 test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kernel would misread" {
     const s = mlx.gpuStream();
@@ -72192,4 +72309,190 @@ test "KVCache sliding ring: a sliding layer keeps its newest rows and serves the
     defer ysnap.deinit();
     var ytrim = try ysnap.trimmedCopy(2, s);
     ytrim.deinit();
+}
+
+var glm_profile_env: ?bool = null;
+const GlmProfKind = enum(u8) { collapse, kda, dsa, moe, expand };
+var glm_prof_ns: [5]u64 = @splat(0);
+
+fn glmProfNow() i128 {
+    return @intCast(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .boot).nanoseconds);
+}
+
+fn glmProfLap(a: mlx.mlx_array, kind: GlmProfKind, t0: i128) i128 {
+    _ = mlx.mlx_array_eval(a);
+    const now = glmProfNow();
+    glm_prof_ns[@intFromEnum(kind)] += @intCast(now - t0);
+    return now;
+}
+
+fn glmProfMs(kind: GlmProfKind) f64 {
+    return @as(f64, @floatFromInt(glm_prof_ns[@intFromEnum(kind)])) / 1.0e6;
+}
+
+/// MiMo's attention reads its LOSSY decode-attn-quant copies at decode width and on a
+/// speculative verify window (drafts behind one committed token, the rows its serial
+/// steps would read); a prompt chunk prefills dense whatever its length.
+fn mimoDecodeCopies(is_mimo: bool, batch: c_int, is_prefill: bool, spec_verify: bool, seq_len: c_int) bool {
+    if (batch != 1) return false;
+    if (!is_prefill) return true;
+    return is_mimo and spec_verify and seq_len <= dec_attn.MAX_ROWS;
+}
+
+test "mimo decode copies: a short prompt chunk prefills dense, a verify window reads the copies" {
+    try testing.expect(!mimoDecodeCopies(true, 1, true, false, 5));
+    try testing.expect(mimoDecodeCopies(true, 1, true, true, 5));
+    try testing.expect(!mimoDecodeCopies(true, 1, true, true, dec_attn.MAX_ROWS + 1));
+    try testing.expect(mimoDecodeCopies(true, 1, false, false, 1));
+    try testing.expect(!mimoDecodeCopies(false, 1, true, true, 5));
+    try testing.expect(!mimoDecodeCopies(true, 2, false, false, 1));
+}
+
+/// The MXFP4 MoE decode kernels bake plain `silu(gate) * up` and read no expert biases:
+/// a pack with either keeps the composed chain, like the row kernels below it.
+/// `clamp` is `swigluClampLimit`: 0 = no clamp, null = a clamp no kernel serves.
+fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, gate: model_mod.QuantMode, up: model_mod.QuantMode, down: model_mod.QuantMode) bool {
+    return rows <= moe_fp4.MAX_ROWS and !has_expert_bias and (clamp orelse 1) == 0 and gate == .mxfp4 and up == .mxfp4 and down == .mxfp4;
+}
+
+test "moe fp4 decode: expert biases or a clamped SwiGLU keep the composed chain" {
+    var cfg: ModelConfig = undefined;
+    cfg.swiglu_limit = 0;
+    cfg.swiglu_clamp = false;
+    try testing.expectEqual(@as(?u32, 0), swigluClampLimit(&cfg));
+    cfg.swiglu_limit = 10;
+    cfg.swiglu_clamp = true;
+    try testing.expectEqual(@as(?u32, 10), swigluClampLimit(&cfg));
+    try testing.expect(moeFp4DecodeEligible(1, false, 0, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, true, 0, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, 10, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, null, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .affine, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(moe_fp4.MAX_ROWS + 1, false, 0, .mxfp4, .mxfp4, .mxfp4));
+}
+
+test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter, one-shot and row by row (GLM5_MODEL, GLM5_MTP_FIXTURE)" {
+    const model_dir = std.c.getenv("GLM5_MODEL") orelse return error.SkipZigTest;
+    const fixture_path = std.c.getenv("GLM5_MTP_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    var head = (try glm_mtp.Head.load(allocator, s, &xfm.config, &weights)) orelse return error.MissingWeight;
+    defer head.deinit();
+
+    var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
+    defer fx.deinit();
+    const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
+    const ref_arr = fx.get("mtp_logits") orelse return error.MissingFixtureTensor;
+    const T: c_int = mlx.getShape(ids_arr)[1];
+    const R: c_int = T - 1; // head rows: (hidden p, token p+1) for p < T-1
+    const v: usize = @intCast(config.vocab_size);
+    const hsz: c_int = @intCast(config.hidden_size);
+    try testing.expectEqual(R, mlx.getShape(ref_arr)[1]);
+    const ref = try qwen4ReadF32(allocator, ref_arr, s);
+    defer allocator.free(ref);
+    // The head's own indexer pick margins per row: a near tie flips under bf16, and with
+    // no recurrence behind it the flip stays on its row, so such rows are skipped, not cut.
+    const gap = try qwen4ReadF32(allocator, fx.get("sel_gap") orelse return error.MissingFixtureTensor, s);
+    defer allocator.free(gap);
+    const Scored = struct {
+        fn row(g: []const f32, i: usize) bool {
+            return g[i] >= 0.10;
+        }
+    };
+
+    // The REFERENCE trunk's final-normed rows: our trunk's differ on its near-tie indexer
+    // picks (see the trunk fixture test), and this test scores the head alone.
+    const hidden_all = fx.get("hidden") orelse return error.MissingFixtureTensor;
+    var hid = mlx.mlx_array_new(); // [1, R, H]: rows 0..R-1
+    defer _ = mlx.mlx_array_free(hid);
+    try mlx.check(mlx.mlx_slice(&hid, hidden_all, &.{ 0, 0, 0 }, 3, &.{ 1, R, hsz }, 3, &.{ 1, 1, 1 }, 3, s));
+    var next_ids = mlx.mlx_array_new(); // [R]: tokens 1..T-1
+    defer _ = mlx.mlx_array_free(next_ids);
+    {
+        var sl = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sl);
+        try mlx.check(mlx.mlx_slice(&sl, ids_arr, &.{ 0, 1 }, 2, &.{ 1, T }, 2, &.{ 1, 1 }, 2, s));
+        try mlx.check(mlx.mlx_reshape(&next_ids, sl, &.{R}, 1, s));
+    }
+    const Rows = struct {
+        fn of(a: mlx.mlx_array, axis: usize, from: c_int, to: c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+            const sh = mlx.getShape(a);
+            var lo: [3]c_int = @splat(0);
+            var hi: [3]c_int = undefined;
+            for (sh, 0..) |d, i| hi[i] = d;
+            lo[axis] = from;
+            hi[axis] = to;
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&out, a, &lo, sh.len, &hi, sh.len, &[_]c_int{ 1, 1, 1 }, sh.len, st));
+            return out;
+        }
+    };
+
+    // One shot over every row.
+    var cache = try head.makeCache(allocator);
+    defer cache.deinit();
+    const out = try head.rows(&xfm, &cache, next_ids, hid);
+    defer _ = mlx.mlx_array_free(out);
+    var normed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(normed);
+    try mlx.check(mlx.mlx_fast_rms_norm(&normed, out, head.norm, config.rms_norm_eps, s));
+    const logits = try xfm.lmHeadForDraft(normed);
+    defer _ = mlx.mlx_array_free(logits);
+    const ours = try qwen4ReadF32(allocator, logits, s);
+    defer allocator.free(ours);
+    const n_rows: usize = @intCast(R);
+    var scored: usize = 0;
+    var min_cos: f64 = 1.0;
+    var misses: usize = 0;
+    for (0..n_rows) |ri| {
+        if (!Scored.row(gap, ri)) continue;
+        scored += 1;
+        min_cos = @min(min_cos, qwen4CompareRows(ours[ri * v ..][0..v], ref[ri * v ..][0..v], 1, v).min_cos);
+        misses += mimoDecidedMisses(ours[ri * v ..][0..v], ref[ri * v ..][0..v], 1, v);
+    }
+    std.debug.print("[glm5 mtp fixture] one-shot {d} of {d} rows: min cos {d:.5}, decided misses {d}\n", .{ scored, R, min_cos, misses });
+    const one_shot_ok = scored >= 24 and min_cos > 0.995 and misses == 0;
+
+    // History then one row at a time: the decode path (one query, pooled keys, cache offset).
+    var cache2 = try head.makeCache(allocator);
+    defer cache2.deinit();
+    const t_pre: c_int = R - 8;
+    {
+        const ids_pre = try Rows.of(next_ids, 0, 0, t_pre, s);
+        defer _ = mlx.mlx_array_free(ids_pre);
+        const hid_pre = try Rows.of(hid, 1, 0, t_pre, s);
+        defer _ = mlx.mlx_array_free(hid_pre);
+        const first = try head.forward(&xfm, &cache2, ids_pre, hid_pre, .none);
+        _ = mlx.mlx_array_free(first.hidden_next);
+    }
+    var worst: f64 = 1.0;
+    misses = 0;
+    var t = t_pre;
+    while (t < R) : (t += 1) {
+        const id1 = try Rows.of(next_ids, 0, t, t + 1, s);
+        defer _ = mlx.mlx_array_free(id1);
+        const hid1 = try Rows.of(hid, 1, t, t + 1, s);
+        defer _ = mlx.mlx_array_free(hid1);
+        const step = try head.forward(&xfm, &cache2, id1, hid1, .logits);
+        defer _ = mlx.mlx_array_free(step.logits);
+        defer _ = mlx.mlx_array_free(step.hidden_next);
+        const row = try qwen4ReadF32(allocator, step.logits, s);
+        defer allocator.free(row);
+        if (!Scored.row(gap, @intCast(t))) continue;
+        const ref_row = ref[@as(usize, @intCast(t)) * v ..][0..v];
+        worst = @min(worst, qwen4CompareRows(row, ref_row, 1, v).min_cos);
+        misses += mimoDecidedMisses(row, ref_row, 1, v);
+    }
+    try testing.expectEqual(@as(usize, @intCast(R)), cache2.seqLen(0));
+    std.debug.print("[glm5 mtp fixture] history + {d} single rows: min cos {d:.5}, decided misses {d}\n", .{ R - t_pre, worst, misses });
+    try testing.expect(one_shot_ok and worst > 0.995 and misses == 0);
 }

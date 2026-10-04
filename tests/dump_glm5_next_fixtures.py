@@ -10,7 +10,7 @@ with random weights, runs it in bf16 (the engine's numerics), and writes:
                               plus the MTP head (`language_model.mtp.0.*`)
   <out>/fixture.safetensors   input_ids, logits_full (one forward), logits_step
                               (prefill then one-token decode through the reference cache)
-  <out>/mtp_fixture.safetensors  the MTP drafter's logits for the same sequence
+  <out>/mtp_fixture.safetensors  the trunk's final-normed rows and the MTP drafter's logits for the same sequence
 
 The pack round-trips through the reference's own `sanitize` (asserted), so the
 layout our loader reads is the one mlx-vlm reads. Every expert runs (top-k = all)
@@ -39,6 +39,9 @@ from mlx_vlm.models.glm5_next.language import LanguageModel
 # dropped). bf16 flips a pick where that gap is noise, and the flip reaches every later
 # row through the KDA state, so the test scores only the rows before the first such tie.
 _SEL_GAPS = []
+# The same gap relative to the row's TOP score: a k-th pick of 0.0005 over exact zeros is a
+# tie bf16 flips, which the k-th-relative gap reads as 1.0.
+_SEL_GAPS_TOP = []
 _exact_pool_select = glm_language._exact_pool_select
 
 
@@ -51,11 +54,14 @@ def _recording_pool_select(q, pool_keys, weights, pool_ends, pool_valid, query_p
         sc = np.array(glm_language._score_index_keys(q, pool_keys, weights, scale))[0]
         cand = np.array(cand)[0]
         gap = np.full(sc.shape[0], np.inf, dtype=np.float32)
+        gap_top = np.full(sc.shape[0], np.inf, dtype=np.float32)
         for r in range(sc.shape[0]):
             c = np.sort(sc[r][cand[r]])[::-1]
             if len(c) > select_k:
                 gap[r] = (c[select_k - 1] - c[select_k]) / max(abs(c[select_k - 1]), 1e-6)
+                gap_top[r] = (c[select_k - 1] - c[select_k]) / max(abs(c[0]), 1e-6)
         _SEL_GAPS.append(gap)
+        _SEL_GAPS_TOP.append(gap_top)
     return out
 
 
@@ -240,7 +246,12 @@ def main():
     hidden = lm.model(ids)
     emb = lm.model.embed_tokens(ids[:, 1:])
     h = draft.eh_proj(mx.concatenate([draft.enorm(emb), draft.hnorm(hidden[:, :-1])], axis=-1))
+    _SEL_GAPS_TOP.clear()
     h = draft.mtp_block(h, None)
+    # One DSA layer and no recurrence: a near-tie pick perturbs its own row only, so the
+    # test skips rows by gap instead of cutting at the first tie.
+    mtp_sel_gap = np.min(np.stack(_SEL_GAPS_TOP), axis=0) if _SEL_GAPS_TOP else np.full(args.len - 1, np.inf)
+    _SEL_GAPS_TOP.clear()
     mtp_logits = lm.lm_head(draft.shared_head_norm(h)).astype(mx.float32)
 
     published.update(mtp_pub)
@@ -258,7 +269,9 @@ def main():
         "prefill": mx.array([args.prefill], dtype=mx.int32),
         "sel_gap": mx.array(sel_gap.astype(np.float32)),
     })
-    mx.save_safetensors(str(out / "mtp_fixture.safetensors"), {"input_ids": ids, "mtp_logits": mtp_logits})
+    mx.save_safetensors(str(out / "mtp_fixture.safetensors"),
+                        {"input_ids": ids, "hidden": hidden, "mtp_logits": mtp_logits,
+                         "sel_gap": mx.array(mtp_sel_gap.astype(np.float32))})
     d = mx.abs(logits_full - logits_step).max().item()
     first_tie = int(np.argmax(sel_gap < SEL_TIE)) if (sel_gap < SEL_TIE).any() else args.len
     print(f"wrote {out}: T={args.len}, full vs cached-step max |diff| {d:.2e}, "

@@ -33,6 +33,7 @@ test {
     _ = @import("add_norm.zig");
     _ = @import("moe_fp4.zig");
     _ = @import("mimo_mtp.zig");
+    _ = @import("glm_mtp.zig");
     _ = @import("dec_attn.zig");
     _ = @import("nax_attention.zig");
     _ = @import("glm5_next.zig");

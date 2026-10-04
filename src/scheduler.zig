@@ -43,6 +43,7 @@ const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
 const mtp_mod = @import("mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
+const glm_mtp = @import("glm_mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
@@ -3767,6 +3768,17 @@ fn loadMimoHead(allocator: std.mem.Allocator, config: *const model_mod.ModelConf
     return h;
 }
 
+/// The GLM-5.3-Flash MTP layer in `weights`, with its coarse draft readout bound; null when the pack ships none.
+fn loadGlmHead(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, weights: *const model_mod.Weights, xfm: *Transformer) !?*glm_mtp.Head {
+    var loaded = (try glm_mtp.Head.load(allocator, mlx.gpuStream(), config, weights)) orelse return null;
+    errdefer loaded.deinit();
+    const h = try allocator.create(glm_mtp.Head);
+    h.* = loaded;
+    h.bindRerank(xfm);
+    log.info("GLM MTP head ready (draft rerank {s}).\n", .{if (h.canRerankDrafts()) "on" else "off"});
+    return h;
+}
+
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
 /// mlx ops here bind to this thread's GPU stream from t0; subsequent
 /// forwards stay on the same thread.
@@ -3967,7 +3979,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             xfm_ptr.compileForward();
         }
     }
-
 
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
     // (model declares vision in config but the safetensors didn't ship the
@@ -4309,11 +4320,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
     if (mtp_enabled) mtp_graft.ensure(sch.allocator, sch.io, params.model_dir, params.config);
-    // MiMo's heads are in-checkpoint layers of their own shape, read from the trunk's weights.
+    // MiMo's heads and GLM's layer are in-checkpoint blocks of their own shape, read from the trunk's weights.
     var mimo_head: ?*mimo_mtp.Head = null;
+    var glm_head: ?*glm_mtp.Head = null;
     if (mtp_enabled and params.config.isMimo()) {
         mimo_head = loadMimoHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
             log.warn("MiMo MTP heads failed to load ({s}) — MTP off.\n", .{@errorName(err)});
+            break :blk null;
+        };
+    } else if (mtp_enabled and params.config.isGlm5()) {
+        glm_head = loadGlmHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
+            log.warn("GLM MTP head failed to load ({s}) — MTP off.\n", .{@errorName(err)});
             break :blk null;
         };
     } else if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
@@ -4361,6 +4378,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(h);
     };
     errdefer if (mimo_head) |h| {
+        h.deinit();
+        sch.allocator.destroy(h);
+    };
+    errdefer if (glm_head) |h| {
         h.deinit();
         sch.allocator.destroy(h);
     };
@@ -4459,6 +4480,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         generate_mod.MtpHeadRef{ .qwen = h }
     else if (mimo_head) |h|
         generate_mod.MtpHeadRef{ .mimo = h }
+    else if (glm_head) |h|
+        generate_mod.MtpHeadRef{ .glm = h }
     else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
     else
@@ -8483,7 +8506,7 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
     // Solo MTP rounds interleave one slot at a time, so any company decodes
-    // faster as plain batched ticks (MiMo: 91 vs ~80 tok/s at 2 slots).
+    // faster as plain batched ticks.
     if (slot.model.transformer) |t| if (!t.hasRecurrentLayers()) return 2;
     return if (mtpRoundsStaySolo(slot)) 3 else mtpCrowdThreshold();
 }

@@ -150,12 +150,13 @@ pub fn recur(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_a
 var decode_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 
 pub const Low = struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, bits: u32, gs: u32 };
-pub const DecodeOut = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, state: mlx.mlx_array };
+/// `state_seq` f32 [T, H, 128, 128], the state after each row, only under `capture`.
+pub const DecodeOut = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, state: mlx.mlx_array, state_seq: mlx.mlx_array = .{ .ctx = null } };
 
 /// `proj` [1, T, W] is the row-joined input projection: q|k|v at 0, then the first gate stages
 /// and b at `off_ga`, `off_fa`, `off_b`. `f_b`/`g_b` are the second gate stages ([H*Dk, Dk]),
 /// `a_log` f32 [H], `dt_bias` f32 [H*Dk]. Null outside the shapes served.
-pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa: c_int, off_b: c_int, heads: c_int, conv_state: mlx.mlx_array, conv_w: mlx.mlx_array, a_log: mlx.mlx_array, dt_bias: mlx.mlx_array, state: mlx.mlx_array, norm_w: mlx.mlx_array, f_b: Low, g_b: Low, lower_bound: f32, norm_eps: f32) !?DecodeOut {
+pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa: c_int, off_b: c_int, heads: c_int, conv_state: mlx.mlx_array, conv_w: mlx.mlx_array, a_log: mlx.mlx_array, dt_bias: mlx.mlx_array, state: mlx.mlx_array, norm_w: mlx.mlx_array, f_b: Low, g_b: Low, lower_bound: f32, norm_eps: f32, capture: bool) !?DecodeOut {
     if (!mlx.streamIsGpu(s)) return null;
     const ps = mlx.getShape(proj);
     const dt = mlx.mlx_array_dtype(proj);
@@ -179,7 +180,7 @@ pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa:
     const slot: usize = @intFromBool(gate5);
     const kern = decode_kernels[slot] orelse blk: {
         const ins = [_][*:0]const u8{ "proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts", "conv_state", "state_in", "fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b" };
-        const outs = [_][*:0]const u8{ "y", "conv_state_out", "state_out" };
+        const outs = [_][*:0]const u8{ "y", "conv_state_out", "state_out", "state_seq" };
         const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
@@ -199,10 +200,11 @@ pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa:
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, t, qkv }, 3, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, 3 * qkv }, 3, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, heads, 128, 128 }, 4, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, if (capture) &[_]c_int{ t, heads, 128, 128 } else &[_]c_int{ 1, 1, 1, 1 }, 4, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024 * heads, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
-    inline for (.{ .{ "TOK", t }, .{ "DK", 128 }, .{ "QKV", qkv }, .{ "PROJ_W", ps[2] }, .{ "OFF_FA", off_fa }, .{ "OFF_GA", off_ga }, .{ "OFF_B", off_b }, .{ "BITS", @as(c_int, @intCast(f_b.bits)) }, .{ "GS", @as(c_int, @intCast(f_b.gs)) } }) |ta| {
+    inline for (.{ .{ "TOK", t }, .{ "DK", 128 }, .{ "QKV", qkv }, .{ "PROJ_W", ps[2] }, .{ "OFF_FA", off_fa }, .{ "OFF_GA", off_ga }, .{ "OFF_B", off_b }, .{ "BITS", @as(c_int, @intCast(f_b.bits)) }, .{ "GS", @as(c_int, @intCast(f_b.gs)) }, .{ "CAP", @as(c_int, @intFromBool(capture)) } }) |ta| {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, ta[0], ta[1]));
     }
     const inputs = [_]mlx.mlx_array{ proj, conv_w, a_log, dt_bias, norm_w, consts, conv_state, state, f_b.w, f_b.s, f_b.b, g_b.w, g_b.s, g_b.b };
@@ -218,6 +220,10 @@ pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa:
     try mlx.check(mlx.mlx_vector_array_get(&out.y, ov, 0));
     try mlx.check(mlx.mlx_vector_array_get(&out.conv_state, ov, 1));
     try mlx.check(mlx.mlx_vector_array_get(&out.state, ov, 2));
+    if (capture) {
+        out.state_seq = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&out.state_seq, ov, 3));
+    }
     if (!decode_engaged) {
         decode_engaged = true;
         @import("log.zig").info("[kda] decode step engaged (T={d}, gate bits {d})\n", .{ t, f_b.bits });
