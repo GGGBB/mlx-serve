@@ -13215,6 +13215,15 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
     return if (actual < expected) actual else 0;
 }
 
+/// Bytes of a streamed think buffer safe to emit now: hold back the last 9
+/// bytes (the longest possible partial close tag) and cut on a UTF-8
+/// boundary; the escaper turns a split character into U+FFFD.
+fn thinkHoldBackLen(buf: []const u8) usize {
+    const max_partial: usize = 9;
+    var safe_len: usize = if (buf.len > max_partial) buf.len - max_partial else 0;
+    if (safe_len > 0) safe_len -= utf8TrailingIncomplete(buf[0..safe_len]);
+    return safe_len;
+}
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
 /// raw nanosecond counts and token totals. Caller frees. Returns an empty
 /// string when `prefill_ns`, `decode_ns`, AND `tokenize_ns` are all zero
@@ -17779,10 +17788,7 @@ fn handleResponsesInner(
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
                 } else if (skipped_think_open) {
-                    // Hold back the longest possible partial-tag suffix (max 9 bytes
-                    // covers both "</think>" and "<channel|>").
-                    const max_partial: usize = 9;
-                    const safe_len = if (think_buf.items.len > max_partial) think_buf.items.len - max_partial else 0;
+                    const safe_len = thinkHoldBackLen(think_buf.items);
                     if (safe_len > 0) {
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -19395,6 +19401,42 @@ test "utf8TrailingIncomplete partial after complete" {
 
 test "utf8TrailingIncomplete empty" {
     try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+}
+
+test "responses think hold-back never cuts a multibyte character" {
+    // A CJK thought replayed token-by-token through the hold-back: every emitted
+    // prefix must be valid UTF-8, and the stream must reassemble byte-exact.
+    const allocator = testing.allocator;
+    const tokens = [_][]const u8{
+        "\xE7\x94\xA8",
+        "\xE6\x88\xB7\xE9\x97\xAE",
+        "\xE7\x9A\x84 9.11",
+        "\xE8\xBF\x98\xE6\x98\xAF 9.9",
+        "\xEF\xBC\x8C\xE5\x85\x88\xE6\xAF\x94",
+        "\xE6\x95\xB4\xE6\x95\xB0",
+        "\xEF\xBC\x8C\xE5\x86\x8D",
+        "<|im_",
+        "end|>",
+    };
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var reconstituted = std.ArrayList(u8).empty;
+    defer reconstituted.deinit(allocator);
+    for (tokens) |tok| {
+        try buf.appendSlice(allocator, tok);
+        const safe_len = thinkHoldBackLen(buf.items);
+        if (safe_len == 0) continue;
+        // The emitted prefix must be valid UTF-8 standing alone.
+        try testing.expect(std.unicode.utf8ValidateSlice(buf.items[0..safe_len]));
+        try reconstituted.appendSlice(allocator, buf.items[0..safe_len]);
+        const remaining = try allocator.dupe(u8, buf.items[safe_len..]);
+        defer allocator.free(remaining);
+        buf.clearRetainingCapacity();
+        try buf.appendSlice(allocator, remaining);
+    }
+    try reconstituted.appendSlice(allocator, buf.items);
+    const want = "\xE7\x94\xA8\xE6\x88\xB7\xE9\x97\xAE\xE7\x9A\x84 9.11\xE8\xBF\x98\xE6\x98\xAF 9.9\xEF\xBC\x8C\xE5\x85\x88\xE6\xAF\x94\xE6\x95\xB4\xE6\x95\xB0\xEF\xBC\x8C\xE5\x86\x8D<|im_end|>";
+    try testing.expectEqualStrings(want, reconstituted.items);
 }
 
 test "parseJsonFloat returns value when present" {
