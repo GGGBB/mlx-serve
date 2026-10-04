@@ -97,7 +97,7 @@ pub fn piModelsJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
             \\{s}
             \\        {{"id": "{s}", "name": "{s} (mlx-serve)", "input": [{s}],
             \\         "contextWindow": {d}, "maxTokens": {d}, "reasoning": true,
-            \\         "thinkingLevelMap": {{"off": "none"}}}}
+            \\         "thinkingLevelMap": {{"off": "none", "xhigh": "xhigh", "max": "max"}}}}
         , .{
             if (i == 0) "" else ",",
             e.id,
@@ -1076,7 +1076,11 @@ test "pi models.json sends the thinking level as reasoning_effort, off as none" 
     const mlx_p = parsed.value.object.get("providers").?.object.get("mlx").?.object;
     try t.expect(mlx_p.get("compat").?.object.get("thinkingFormat") == null);
     const m = mlx_p.get("models").?.array.items[0].object;
-    try t.expectEqualStrings("none", m.get("thinkingLevelMap").?.object.get("off").?.string);
+    const levels = m.get("thinkingLevelMap").?.object;
+    try t.expectEqualStrings("none", levels.get("off").?.string);
+    // pi offers xhigh/max only when the map names them, else clamps max to high.
+    try t.expectEqualStrings("xhigh", levels.get("xhigh").?.string);
+    try t.expectEqualStrings("max", levels.get("max").?.string);
 }
 
 test "compactionReserve: a quarter of the window, capped where the agents' own defaults take over" {

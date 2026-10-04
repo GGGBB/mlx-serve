@@ -986,9 +986,8 @@ private struct ProvidersSectionContent: View {
                             serverPort: server.port,
                             status: status.first { $0.name == entry.name },
                             duplicate: ProvidersFile.duplicateNames(formState.providerEntries).contains(entry.name),
-                            onDelete: {
-                                formState.providerEntries.removeAll { $0.id == entry.id }
-                                formState.providerModelText[entry.id] = nil
+                            onDelete: { [id = entry.id] in
+                                formState.removeProvider(id: id)
                                 save()
                             },
                             onCommit: save)

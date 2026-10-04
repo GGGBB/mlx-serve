@@ -180,11 +180,13 @@ pub fn build(b: *std.Build) void {
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
     mod.addIncludePath(b.path("lib"));
 
-    // xatlas UV unwrapping (MIT, vendored amalgamation) + C shim for the
-    // Hunyuan3D texture paint stage. See lib/xatlas/xatlas_shim.h + src/uvwrap.zig.
+    // xatlas UV unwrapping + FQMS decimation (MIT, vendored) with C shims for the
+    // Hunyuan3D texture paint stage. See lib/{xatlas,fqms} + src/{uvwrap,mesh_simplify}.zig.
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addIncludePath(b.path("lib/xatlas"));
+    mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/fqms"));
 
     // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
     // `lib/ds4/` submodule pinned at 9139e2a and `src/arch/ds4.zig`. Kernel
@@ -268,6 +270,8 @@ pub fn build(b: *std.Build) void {
     test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     test_mod.addIncludePath(b.path("lib/xatlas"));
+    test_mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    test_mod.addIncludePath(b.path("lib/fqms"));
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));
     addAneSources(b, test_mod);
@@ -442,6 +446,8 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addIncludePath(b.path("lib/xatlas"));
+    mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/fqms"));
 
     // ANE offload C ABI → unavailable stubs on Linux (src/ane_stub.c); ane.zig
     // compiles unchanged and gates itself off via available() == false.
@@ -638,6 +644,8 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addIncludePath(b.path("lib/xatlas"));
+    mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/fqms"));
 
     const lib = b.addLibrary(.{
         .name = "mlxserve",

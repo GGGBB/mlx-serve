@@ -160,6 +160,17 @@ Group-wise affine quantization of K/V via `mlx_quantize`/`mlx_dequantize` (no ne
 ### Hot prefix cache memory budget (`--prefix-cache-mem`)
 Wave 1.B — the hot prefix cache used to cap on entry count alone; with 4 KB-ctx entries on Gemma 4 E4B that's an 8 GB worst case. `--prefix-cache-mem N{KB,MB,GB}` (default 2 GB) caps resident KV bytes; `commit` evicts LRU entries until `current_kv_bytes + new_bytes <= budget`. `0`/`off` disables the byte cap (count cap still applies). Each `HotEntry` records its bytes at commit time (sum of `mlx_array_size × mlx_array_itemsize` across keys/values plus the scales/biases triples in quant mode). Log line: `[hot-cache] resident=X.XX / Y.YY MB (E entries)` on every commit / eviction.
 
+### Disabled prefix cache still reduced available context
+
+`--prefix-cache-entries 0` disabled allocation but left the configured RAM budget
+in context and prefill-chunk sizing. Gated architectures still reserved 2 GiB;
+other architectures reserved the raw ask. `/props` also reported that unused budget.
+All three reserve accessors now return zero when the entry count is zero;
+startup preserves zero rather than raising it to the concurrency count, and
+`/props` reads the effective budget.
+The `disabled prefix cache` unit test covers both architecture paths, several
+byte caps, and restoration of the enabled-cache behavior.
+
 ### head_dim-256 prefill: the msv_attn_p256 band kernel + the guards that stay load-bearing (long-context OOM class)
 MLX's fused SDPA covers head_dim ≤ 128 in prefill (`sdpa_full`; `sdpa_vector` covers 256 for seq ≤ 8); **every Gemma-4 and Qwen3.5/3.6 checkpoint ships head_dim 256**, whose prefill otherwise rides the composed path that MATERIALIZES a `[heads, chunk, total_kv]` bf16 score tensor per layer (tens of GB/layer at long ctx — the uncatchable Metal OOM class). The self-contained flash-style kernel `msv_attn_p256` (transformer.zig, `mlx_fast_metal_kernel`; FA-2 online softmax, register-resident Q, float32 accum) covers hd-256 prefill via `fusedSdpa256Prefill` (null → composed fallback). Scoping is three regimes:
 - **Sliding-band (Gemma local layers, `window > 0`): ALWAYS fused** (master kill `MLX_SERVE_FUSED_256=0`) — the band + block-skip run in-kernel so the GB-scale sliding mask is never built and out-of-band KV is never touched (composed has no answer). Output byte-identical; kernel-vs-composed one bf16 ULP.
@@ -288,6 +299,12 @@ return contig(o, s);   // `o` is never freed
 - **Fix**: one `sliceContig(x, lo, hi, st, s)` owns the intermediate (`defer mlx_array_free(o)` before `return contig(o, s)`), and all six helpers delegate to it — the pattern now exists in exactly ONE place. Numerics are untouched: the same seed produces a **byte-identical PNG** before and after. `krea.zig`/`flux.zig` were already correct (`defer free(out); return contig(out, s)`), which is why only MageFlow leaked.
 - **Rule**: a helper that materializes a view owns the view — free the intermediate, don't just wrap it. `mlx_clear_cache` is NOT the fix for this class (that's the cache-growth one above); if `active_bytes` itself climbs, you are holding handles. Prefer one shared slice-and-materialize helper per file over N hand-rolled copies: this shipped six times in one file because each site was written independently.
 - Guards: `tests/test_media_gen_memory.sh` (varies the size-driving shape across generations — a fixed-size replay cannot separate a leak from size-keyed caching — and asserts three load/gen/unload cycles return to the pre-load baseline; red-on-revert at +3.18 GB across four generations) and the hermetic `materializing helpers hand back every array they take` in mage_flow.zig, which calls each helper with a source built and freed INSIDE the loop and asserts `mlx_get_active_memory` returns to baseline. **The input must be rebuilt per iteration**: a caller-owned source that outlives the call keeps the parent alive anyway, and the first version of that test passed against the broken code for exactly that reason.
+
+### A scope freed AFTER the eval holds every activation of the step (Stable Audio 3, 45 GB at 120 s, 2026-10-03)
+`stable_audio.zig` collects a forward's intermediates in a `Scope` and frees them together. The sampler and the chunked decoder built each step inside a scope whose `deinit` ran after `mlx_array_eval`, so every handle was still live during the eval and MLX could not release a buffer once its consumer ran: a 120 s clip (162 decode windows, 8 DiT steps) peaked at 45 GB on a 2.6 GB model, and 30 s held 10 GB above the weights. Parity was perfect throughout; only `/props` `peak_bytes` showed it.
+- **Fix**: close the scope BEFORE the eval and keep only the output (`Scope.out` in a labelled block); 30 s now holds 657 MB, 120 s peaks at 4.2 GB, and it got faster (1.5 s → 0.6 s).
+- **Rule**: a handle you still hold pins its buffer through the eval. Release a step's intermediates before evaluating its result, not after.
+- Guard: `sa3: a 30 s sample + decode holds no more than one step's working set` (SA3_TEST_MODEL), red at 9969 MB before the fix.
 
 ## GDN blocked-prefill kernel: hardcoded bf16 vs an f16 checkpoint (2026-07-25)
 
@@ -5416,3 +5433,50 @@ raw BF16 rows do not depend on quantization group size`.
   slot's cached keys already carry their positions. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping
   branch of `qsaMask`, the gather's early return) and the raw pad-waste bill for such slots are gone.
 - Guard: `qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions`.
+
+### A per-round buffer sized by one drafter's cap overflows when another feeds the round
+
+MiMo's MTP history stash kept the round's committed ids in `[MAX_DEPTH + 1]u32` (9), but prompt-lookup rounds ride the same stash and commit up to `mtp_lookup.MAX_DRAFT_STRONG` (14) drafts. The first whole-file edit that engaged lookup wrote past the array; ReleaseFast has no bounds check, so the write landed in the generator's `ForwardCtx` and the next verify spliced a garbage `vision_embeddings` handle (`spliceVisionRows`, SIGSEGV at a two-u32 address). A ReleaseSafe build named the line at once (`index 9, len 9`).
+
+Fix: `MAX_ROUND_DRAFTS` = the max over every round producer, used by the stash and the merged history. Guard: `tests/test_mimo_v2.sh` [9] (a whole-file edit that engages lookup). Tell: a segfault on a field nothing writes, at an address made of small integers — rebuild ReleaseSafe and replay.
+
+## A full-buffer sliding layer caches every token it never reads
+
+MiMo-V2.6-Flash has 39 sliding-window (128) layers and 9 global ones. Our KV cache kept every token on the sliding layers too, so 87% of its 222 KB/token was rows attention never reads. The bill was honest about it, which is how it hurt: the app's `--ctx-size 1048576` billed 233 GB of context KV, the hot-cache clamp left 0 MB, and an 88k-token agent turn (a 20 GB entry anyway) re-prefilled its whole prompt every turn, ~38 s each; a 140k prompt failed admission.
+
+Fix: `ModelConfig.slidingRing` archs keep a ring of window + `SLIDING_RING_SLACK` rows per sliding layer (`KVCache.updateSliding`: a grow carries only the newest `keep` rows; `entry.base` maps buffer rows to absolute positions, so `offset`/`step` stay absolute), as mlx-lm's `RotatingKVCache`. Bills: global layers per token, rings once per slot (`slotFixedKvBytes`). A ring cannot rewind past its dropped rows: `truncate` and `trimmedCopy` refuse, the prefix cache restores only at matches above `ringFloor` (`ringRestores`), the SSD tier skips rings, and the hot-cache ask is one whole session (`ungatedHotCacheAsk`), since a ring entry is never trimmed.
+
+Guards: `KVCache sliding ring` (views bit-equal to a full buffer through chunks, decode, rollback, snapshot), `mimo_v2 sliding ring` (whole-forward logits bit-identical on the tiny pack), `prefix cache: a sliding ring restores only where…`, `DiskTier: a sliding ring is never persisted`.
+
+
+## A prefill-tiled kernel at decode width is one threadgroup's work (GLM-5)
+
+GLM's hyper-connection mixes kernel ran 8 rows per threadgroup with simdgroup matrices: right for prefill, but at one decode row it streamed the whole 1.5 MB `fn` through a single threadgroup, 90 times per token. Decode fell from 54 to 35 tok/s. The NAX indexer did the same thing in a different shape: one query padded to a 64-row tile, 63/64 of the MMA wasted per pool tile.
+
+Fix: the mixes kernel serves 512+ rows (`MIXES_KERNEL_MIN_ROWS`); one token runs `hcPre` (16 threadgroups, each a K-slice of all the mixes); one indexer query runs `decodeSelect` (fused pool + score, radix top-k).
+Guard: `glm5 mHC mixes and expand kernels match the op chain` (rows past the gate), `glm5 one-token hcPre chain…`, the two `glm5 one-query…` tests.
+
+## Partials that cross threadgroups inside one dispatch went stale
+
+`hcPre` reduces its 16 threadgroups' partial mixes in whichever threadgroup arrives last (a device counter nothing resets). With plain stores and loads the last threadgroup read wrong partials, and differently on each run, even with `atomic_thread_fence` on both sides: a core's L1 can hold stale lines of a reused buffer.
+
+Fix: partials go out by `atomic_store_explicit` and come back by `atomic_load_explicit` (both through L2); every storing thread fences before the arrival increment. The counter is 8 words, because an input shorter than 8 elements binds in the read-only constant address space.
+Guard: the hcPre test re-dispatches 32 times and requires bit-identical output.
+
+## An ablation that leaves an output unwritten measures NaN routing
+
+Profiling GLM decode by skipping parts: dropping the Sinkhorn gates (post/comb left unwritten), or feeding each branch the previous one's raw output, "saved" 0.5-1 ms. Both were artifacts. Garbage or unnormalized activations route every MoE layer to the same few experts, which then hit cache. Done right (real gates at 1 iteration; an `rms_norm` in place of the collapse) the gates cost 0.15 ms and the mHC 1.25 ms.
+
+Rule: an ablation keeps every live value sane (finite and normalized like the original). An f32 scalar in the stand-in op promotes bf16 and moves the whole branch to f32 kernels, so that skews the result too.
+
+## A cache row nothing reads in this forward stays a lazy chain (GLM-5 indexer)
+
+GLM's DSA layers append an indexer row (key | gate) every token, but below 2051 tokens selection never runs, so nothing in the token's graph read the indexer cache. The decode step evaluates only the token and the logits, so MLX never computed those rows: each `SliceUpdate` hung off the previous one, a chain growing by ~7 ops x 11 layers per token, evaluated all at once (a stall, and the retained intermediates' memory) when the context first passed 2051. Short-context decode looked faster than it was, because it skipped work.
+
+Fix: the attention output depends on the indexer cache (`glm5.withDependency` over `mlx_depends`), so every step materializes its row.
+Guard: `glm5 an output tied to a cache update evaluates the update with it`. Tell: a decode graph dump with no `SliceUpdate` for a cache the layer writes.
+
+
+## GLM-5.3's long-prompt output moved with the prefill chunk width, and it was not a bug
+
+Defect suspected: on a cold 9.5k-token prompt, token 0's top-2 swapped and one token moved 4+ nats between prefill widths (single pass, 8192, 4096, 2048), and the prefix cache's 30-token tail split flipped the greedy answer against cache-off; Qwen3.6-35B-A3B moved at most 0.25 nats on the same sweep. Cause: rounding order, not carried state. Swapping the KDA recurrence for an equivalent kernel in ONE pass moved the token as far as chunking did (1.16 vs 1.35 nats with the indexer forced dense), a confident next token agreed at every width (-0.06), the per-core KDA kernel matches f64 from a nonzero state with a partial tail block, and the tiny fixture's chunked prefill matches the reference past its indexer budget. DSA's top-k pool choice is discontinuous, so small differences pick other pools. Bar for "chunking bug": a width swing larger than a same-math kernel swap at one pass, or a confident token that moves.

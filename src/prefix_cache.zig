@@ -1009,6 +1009,7 @@ pub const HotPrefixCache = struct {
                 if (shared > p.best_raw) p.best_raw = shared;
             }
 
+            if (!ringRestores(&e.snapshot, shared, prompt_ids.len)) continue;
             const effective = if (require_ssm_checkpoint) blk: {
                 const cps = e.ssm_checkpoints orelse continue;
                 const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
@@ -1024,6 +1025,12 @@ pub const HotPrefixCache = struct {
         }
         if (best_idx) |idx| return .{ .idx = idx, .shared = best_shared };
         return null;
+    }
+
+    /// A sliding ring restores only where it still holds the window behind the match; a full
+    /// match restores one token short.
+    fn ringRestores(snap: *const KVCacheSnapshot, matched: usize, prompt_len: usize) bool {
+        return matched - @intFromBool(matched == prompt_len and matched > 0) >= snap.ringFloor();
     }
 
     fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, media: []const MediaSpan, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
@@ -1357,10 +1364,14 @@ pub const HotPrefixCache = struct {
                 effective_matched = 0;
             }
         }
+        if (effective_matched > 0 and !ringRestores(&e.snapshot, effective_matched, prompt_ids.len)) {
+            log.info("  [hot-cache] sliding ring holds rows from {d}; match {d} falls behind them\n", .{ e.snapshot.ringFloor(), effective_matched });
+            effective_matched = 0;
+        }
         target_moe_seq_offset.* = effective_matched;
 
-        // Miss path (hybrid without a usable checkpoint, and the QSA-history
-        // decline that funnels into it): also reset KV.
+        // Miss path (hybrid without a usable checkpoint, the QSA-history decline and a
+        // sliding ring past the match): also reset KV.
         if (effective_matched == 0) {
             try target_cache.truncate(0, s);
             // A 0-token outcome is not a restore: the marker was set above the restore (the hybrid
@@ -3075,6 +3086,43 @@ test "HotPrefixCache: restore clamps an inflated snapshot to the matched length 
         try testing.expect(e.initialized);
         try testing.expectEqual(@as(usize, 64), e.offset); // clamped, not 66
     }
+}
+
+test "prefix cache: a sliding ring restores only where it still holds the window behind the match" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var toks: [301]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 11);
+    var src = try KVCache.init(testing.allocator, 1);
+    defer src.deinit();
+    for (0..6) |_| {
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, 50, 4 }, 4, .bfloat16, s));
+        var view = try src.updateSliding(0, k, k, s, 8 + 50 - 1, 8, 24);
+        view.deinit();
+    }
+    try testing.expect(src.entries[0].base > 0);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    _ = try hc.commit(&src, toks[0..300], false);
+
+    // A prompt that leaves the entry early would need rows the ring dropped: a clean miss.
+    var early: [120]u32 = undefined;
+    @memcpy(early[0..100], toks[0..100]);
+    for (early[100..]) |*t| t.* = 7;
+    var dst = try KVCache.init(testing.allocator, 1);
+    defer dst.deinit();
+    var off: usize = 0;
+    const miss = try hc.lookupAndRestore(&dst, &off, null, s, &early, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 0), miss.matched);
+    try testing.expect(!dst.entries[0].initialized);
+
+    // A prompt that extends the entry restores it, positions absolute.
+    toks[300] = 7;
+    const hit = try hc.lookupAndRestore(&dst, &off, null, s, &toks, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 300), hit.matched);
+    try testing.expectEqual(@as(usize, 300), dst.entries[0].offset);
 }
 
 test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's matched length" {

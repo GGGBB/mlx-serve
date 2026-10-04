@@ -38,9 +38,12 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
+const gen_sse = @import("gen_sse.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
 const mtp_mod = @import("mtp.zig");
+const mimo_mtp = @import("mimo_mtp.zig");
+const glm_mtp = @import("glm_mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
@@ -1422,6 +1425,8 @@ pub const Scheduler = struct {
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
     promise_ledger: PromiseLedger = .{},
+    /// A running media job's estimated peak, kept off chat admitted between its steps.
+    gen_reserve_bytes: u64 = 0,
 
     /// Per-entry digest snapshot the connection-thread guard reads instead of the cache.
     /// Replaced under `digest_mu` by the inference thread; readers copy under the lock.
@@ -2454,12 +2459,38 @@ pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
     return 0;
 }
 
+/// A group whose longest billed slot is at most this long pads a tensor that is small in absolute
+/// terms, and splitting it sends a slot through a whole serial forward instead. Under the qwen4
+/// gather arm every long slot bills at the indexer budget (2052 rows), so a short sub-agent beside
+/// long streams reads as a 2x pad and was split off.
+pub const PAD_FREE_KV: u32 = 4096;
+
+/// The floor above only engages once some slot in the group holds at least this much context:
+/// below it the serial forward it saves is cheap and keeping the group whole does not pay.
+pub const PAD_FREE_MIN_CTX: u32 = 131072;
+
+/// Does the small-pad floor keep this group whole? `billed_max` is the longest billed length,
+/// `ctx_max` the longest true context.
+pub fn padFreeFloorApplies(billed_max: u32, ctx_max: u32) bool {
+    return ctx_max >= PAD_FREE_MIN_CTX and billed_max <= PAD_FREE_KV;
+}
+
 /// `batchedKvKeepCount` for a group whose forward may attend per slot: past the per-slot
-/// floor nothing is padded, so every slot batches.
-pub fn groupKeepCount(kv_lens_asc: []const u32, per_slot_capable: bool) usize {
-    if (per_slot_capable and kv_lens_asc.len >= 2 and
-        kv_lens_asc[kv_lens_asc.len - 1] >= transformer_mod.Transformer.BATCHED_PER_SLOT_ATTN_MIN_KV) return kv_lens_asc.len;
+/// floor nothing is padded, so every slot batches. `ctx_max` is the group's longest true context.
+pub fn groupKeepCount(kv_lens_asc: []const u32, per_slot_capable: bool, ctx_max: u32) usize {
+    if (kv_lens_asc.len >= 2) {
+        const billed_max = kv_lens_asc[kv_lens_asc.len - 1];
+        if (per_slot_capable and billed_max >= transformer_mod.Transformer.BATCHED_PER_SLOT_ATTN_MIN_KV) return kv_lens_asc.len;
+        if (padFreeFloorApplies(billed_max, ctx_max)) return kv_lens_asc.len;
+    }
     return batchedKvKeepCount(kv_lens_asc);
+}
+
+/// The longest true context (not the billed length) among the group's caches.
+fn groupCtxMax(caches: []const *const KVCache) u32 {
+    var m: usize = 0;
+    for (caches) |c| m = @max(m, c.kvLenForBatching());
+    return @intCast(@min(m, std.math.maxInt(u32)));
 }
 
 /// The per-slot attention arm serves every batched trunk but qwen4's QSA reads.
@@ -2567,6 +2598,14 @@ pub fn holdsForMemory(fits: bool, live_company: bool) bool {
     return !fits and live_company;
 }
 
+/// Does a prefill needing `need` fit `avail` beside siblings' unallocated promises, a running
+/// media job's reserve, and the sibling margin? Metal OOM is uncatchable, so a media step's
+/// transients are billed before chat may take them.
+pub fn admissionFits(need: u64, avail: u64, promised: u64, gen_reserve: u64, live: usize) bool {
+    const margin: u64 = if (live > 0) SIBLING_MARGIN_BYTES else 0;
+    return need +| promised +| gen_reserve +| margin <= avail;
+}
+
 fn liveDecodingCount(sch: *Scheduler) usize {
     sch.queue_mu.lockUncancelable(sch.io);
     defer sch.queue_mu.unlock(sch.io);
@@ -2589,9 +2628,8 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     const bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null), slot.enable_mtp);
     var active_now: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_now);
-    const margin: u64 = if (live > 0) SIBLING_MARGIN_BYTES else 0;
-    const fits = bill[0] +| sch.promise_ledger.outstanding(active_now) +| margin <= bill[1];
-    if (!holdsForMemory(fits, live > 0)) {
+    const fits = admissionFits(bill[0], bill[1], sch.promise_ledger.outstanding(active_now), sch.gen_reserve_bytes, live);
+    if (!holdsForMemory(fits, live > 0 or sch.gen_reserve_bytes > 0)) {
         if (slot.memory_promised == 0) {
             slot.memory_promised = bill[0];
             sch.promise_ledger.admit(bill[0], active_now);
@@ -2600,7 +2638,7 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     }
     if (!slot.memory_hold_logged) {
         slot.memory_hold_logged = true;
-        log.info("[admission] held: {d} tokens do not fit beside {d} live request(s); waiting for one to finish\n", .{ slot.full_prompt.len, live });
+        log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> 20 });
     }
     return true;
 }
@@ -2630,6 +2668,16 @@ test "a prefill that does not fit waits only while another request is live" {
     try testing.expect(holdsForMemory(false, true));
     try testing.expect(!holdsForMemory(false, false)); // alone: never waits, or it waits forever
     try testing.expect(!holdsForMemory(true, true));
+}
+
+test "a running media job's reserve is billed: a prefill that fits live memory alone holds" {
+    const gb: u64 = 1 << 30;
+    try testing.expect(admissionFits(10 * gb, 20 * gb, 0, 0, 0));
+    try testing.expect(!admissionFits(10 * gb, 20 * gb, 0, 12 * gb, 0));
+    try testing.expect(holdsForMemory(admissionFits(10 * gb, 20 * gb, 0, 12 * gb, 0), 12 * gb > 0));
+    try testing.expect(!admissionFits(10 * gb, 20 * gb, 4 * gb, 7 * gb, 0)); // promises and reserve add
+    try testing.expect(admissionFits(17 * gb, 20 * gb, 0, 0, 1));
+    try testing.expect(!admissionFits(19 * gb, 20 * gb, 0, 0, 1)); // a sibling keeps its margin
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
@@ -3157,7 +3205,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         defer if (peeked) |p| sch.allocator.free(p);
         const backend_type = peeked orelse params.config.model_type;
         const peak = gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, backend_type);
-        const avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+        const avail = availForLoad(peak);
         const gb = 1024.0 * 1024.0 * 1024.0;
         log.info("[preflight] media peak ~{d:.2} GB (staged residency), available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(peak)) / gb,
@@ -3459,6 +3507,15 @@ test "coldLoadVision honors the process-wide vision opt-out" {
 /// model that fit comfortably inside the ~6.4 GB process limit.
 /// `gpu_limit` = Metal's working-set limit (0 = unknown): a lowered `iogpu.wired_limit_mb` makes
 /// it bind below free RAM, and weights past it OOM in warmup instead of refusing by name.
+/// Memory a load of `need` bytes can use. A resident media cache is opportunistic, so a load that
+/// would be refused makes it let go first and the figure is read again.
+fn availForLoad(need: u64) u64 {
+    var avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+    if (memInsufficientForLoad(need, avail) and gen_mod.releaseMediaResidency() > 0)
+        avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+    return avail;
+}
+
 fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
     const avail = if (proc_avail > 0) proc_avail else host_avail;
     return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
@@ -3731,6 +3788,28 @@ test "memInsufficientForLoad: headroom + unknown-query guards" {
     try std.testing.expect(memInsufficientForLoad(109_730 * MB, 112 * GB));
 }
 
+/// The MiMo-V2 MTP heads in `weights`, with their coarse draft readout bound; null when the pack ships none.
+fn loadMimoHead(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, weights: *const model_mod.Weights, xfm: *Transformer) !?*mimo_mtp.Head {
+    var loaded = (try mimo_mtp.Head.load(allocator, mlx.gpuStream(), config, weights)) orelse return null;
+    errdefer loaded.deinit();
+    const h = try allocator.create(mimo_mtp.Head);
+    h.* = loaded;
+    h.bindRerank(xfm);
+    log.info("MiMo MTP heads ready ({d} heads, draft rerank {s}).\n", .{ h.heads, if (h.canRerankDrafts()) "on" else "off" });
+    return h;
+}
+
+/// The GLM-5.3-Flash MTP layer in `weights`, with its coarse draft readout bound; null when the pack ships none.
+fn loadGlmHead(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, weights: *const model_mod.Weights, xfm: *Transformer) !?*glm_mtp.Head {
+    var loaded = (try glm_mtp.Head.load(allocator, mlx.gpuStream(), config, weights)) orelse return null;
+    errdefer loaded.deinit();
+    const h = try allocator.create(glm_mtp.Head);
+    h.* = loaded;
+    h.bindRerank(xfm);
+    log.info("GLM MTP head ready (draft rerank {s}).\n", .{if (h.canRerankDrafts()) "on" else "off"});
+    return h;
+}
+
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
 /// mlx ops here bind to this thread's GPU stream from t0; subsequent
 /// forwards stay on the same thread.
@@ -3807,7 +3886,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
         const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
-        const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+        const avail_bytes = availForLoad(weights_bytes);
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(model_bytes)) / gb,
             @as(f64, @floatFromInt(avail_bytes)) / gb,
@@ -3931,7 +4010,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             xfm_ptr.compileForward();
         }
     }
-
 
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
     // (model declares vision in config but the safetensors didn't ship the
@@ -4273,7 +4351,20 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
     if (mtp_enabled) mtp_graft.ensure(sch.allocator, sch.io, params.model_dir, params.config);
-    if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
+    // MiMo's heads and GLM's layer are in-checkpoint blocks of their own shape, read from the trunk's weights.
+    var mimo_head: ?*mimo_mtp.Head = null;
+    var glm_head: ?*glm_mtp.Head = null;
+    if (mtp_enabled and params.config.isMimo()) {
+        mimo_head = loadMimoHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
+            log.warn("MiMo MTP heads failed to load ({s}) — MTP off.\n", .{@errorName(err)});
+            break :blk null;
+        };
+    } else if (mtp_enabled and params.config.isGlm5()) {
+        glm_head = loadGlmHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
+            log.warn("GLM MTP head failed to load ({s}) — MTP off.\n", .{@errorName(err)});
+            break :blk null;
+        };
+    } else if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;
@@ -4314,6 +4405,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         );
     }
     errdefer if (mtp_ptr) |h| {
+        h.deinit();
+        sch.allocator.destroy(h);
+    };
+    errdefer if (mimo_head) |h| {
+        h.deinit();
+        sch.allocator.destroy(h);
+    };
+    errdefer if (glm_head) |h| {
         h.deinit();
         sch.allocator.destroy(h);
     };
@@ -4410,6 +4509,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter_block_size = sch.drafter_block_size;
     entry.mtp = if (mtp_ptr) |h|
         generate_mod.MtpHeadRef{ .qwen = h }
+    else if (mimo_head) |h|
+        generate_mod.MtpHeadRef{ .mimo = h }
+    else if (glm_head) |h|
+        generate_mod.MtpHeadRef{ .glm = h }
     else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
     else
@@ -4730,48 +4833,22 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     }
 
     while (!sch.shutdown.load(.acquire)) {
-        // 0a. Drain slots queued for cleanup. Conn threads hand finished
-        //     slots here in `complete()` — we own the mlx stream binding,
-        //     so freeing per-slot KVCache + vision_embeddings + ssm_entries
-        //     is safe here even though those slots' arrays might trigger
-        //     real GPU memory release on refcount-zero.
-        var cleanup_batch: [16]*Slot = undefined;
-        var cleanup_n: usize = 0;
-        // 0b. Drain any pending vision/embed work. These run synchronously on
-        //     behalf of conn threads waiting in `encodeVision` /
-        //     `computeEmbedding`. Processed here (not concurrently with decode
-        //     ticks) so they share the inference thread's mlx stream cleanly.
-        var vision_batch: [4]*VisionEncodeRequest = undefined;
-        var vision_n: usize = 0;
-        var embed_batch: [4]*EmbedRequest = undefined;
-        var embed_n: usize = 0;
         // Phase D: cold-load drain. Process ONE load per tick — loading a
         // model is heavy (~seconds; weight read + JIT compile + warmup)
         // and we want the rest of the inference loop to stay responsive.
         // Other pending loads wait in queue and get picked up next tick.
         var load_req: ?*LoadRequest = null;
         // Media-gen + unload work items (one per tick, like load — both are
-        // heavy and we re-check the loop between them). Gen runs to completion
-        // synchronously, blocking decode for its duration. Decision jobs queued
-        // back to back for one model run as one pass (`takeMergeable`).
+        // heavy and we re-check the loop between them). A gen job owns the
+        // loop until it returns; chat runs between its steps (`GenYield`).
+        // Decision jobs queued back to back for one model run as one pass
+        // (`takeMergeable`).
         var gen_batch: [MAX_MERGED_WEIGHT]*GenRequest = undefined;
         var gen_n: usize = 0;
         var unload_req: ?*UnloadRequest = null;
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (cleanup_n < cleanup_batch.len and sch.cleanup_queue.items.len > 0) {
-                cleanup_batch[cleanup_n] = sch.cleanup_queue.orderedRemove(0);
-                cleanup_n += 1;
-            }
-            while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {
-                vision_batch[vision_n] = sch.vision_queue.orderedRemove(0);
-                vision_n += 1;
-            }
-            while (embed_n < embed_batch.len and sch.embed_queue.items.len > 0) {
-                embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
-                embed_n += 1;
-            }
             if (sch.load_queue.items.len > 0) {
                 load_req = sch.load_queue.orderedRemove(0);
             }
@@ -4795,245 +4872,297 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
             }
         }
-        for (cleanup_batch[0..cleanup_n]) |s| {
-            // Decode-phase cancel: `complete()` pulled this slot straight
-            // into the cleanup queue, so it never went through finishSlot
-            // and its committed KV (prompt + every emitted token) would die
-            // right here with the slot. Commit it first — the same guards
-            // as a normal finish apply inside (pad-only / error / vision /
-            // empty all decline) — then flush what was committed to the
-            // SSD tier, since no finishSlot will. Normally-finished slots
-            // arrive here with `finished` already set (finishSlot committed
-            // them) and skip; errored slots decline via the error guard.
-            // Runs on the inference thread — the sole mlx caller — which is
-            // what makes the refcount-sharing snapshot legal here.
-            if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
-                commitSlotIfApplicable(sch, s);
-                if (s.model.prefix_cache) |*hc| {
-                    if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
-                }
-            }
-            // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
-            // record must not outlive the bytes `s.deinit()` frees.
-            if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
-            if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
-            s.deinit();
-        }
-        if (vision_n > 0 or embed_n > 0) {
-            for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
-            for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
-        }
+        _ = drainSideQueues(sch);
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
         if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
+        if (chatPass(sch, .main) == .shutdown) break;
+    }
+}
 
-        // 1. Wait for work. Drain pending slots into a local list under lock,
-        //    run prefills outside the lock.
-        var to_prefill: [16]*Slot = undefined;
-        var n_prefill: usize = 0;
-        {
-            sch.queue_mu.lockUncancelable(sch.io);
-            defer sch.queue_mu.unlock(sch.io);
+/// Cleanup, vision and embed work, drained on the inference thread. Returns
+/// whether there was any.
+fn drainSideQueues(sch: *Scheduler) bool {
+    // 0a. Drain slots queued for cleanup. Conn threads hand finished
+    //     slots here in `complete()` — we own the mlx stream binding,
+    //     so freeing per-slot KVCache + vision_embeddings + ssm_entries
+    //     is safe here even though those slots' arrays might trigger
+    //     real GPU memory release on refcount-zero.
+    var cleanup_batch: [16]*Slot = undefined;
+    var cleanup_n: usize = 0;
+    // 0b. Drain any pending vision/embed work. These run synchronously on
+    //     behalf of conn threads waiting in `encodeVision` /
+    //     `computeEmbedding`. Processed here (not concurrently with decode
+    //     ticks) so they share the inference thread's mlx stream cleanly.
+    var vision_batch: [4]*VisionEncodeRequest = undefined;
+    var vision_n: usize = 0;
+    var embed_batch: [4]*EmbedRequest = undefined;
+    var embed_n: usize = 0;
+    {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        while (cleanup_n < cleanup_batch.len and sch.cleanup_queue.items.len > 0) {
+            cleanup_batch[cleanup_n] = sch.cleanup_queue.orderedRemove(0);
+            cleanup_n += 1;
+        }
+        while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {
+            vision_batch[vision_n] = sch.vision_queue.orderedRemove(0);
+            vision_n += 1;
+        }
+        while (embed_n < embed_batch.len and sch.embed_queue.items.len > 0) {
+            embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
+            embed_n += 1;
+        }
+    }
+    for (cleanup_batch[0..cleanup_n]) |s| {
+        // Decode-phase cancel: `complete()` pulled this slot straight
+        // into the cleanup queue, so it never went through finishSlot
+        // and its committed KV (prompt + every emitted token) would die
+        // right here with the slot. Commit it first — the same guards
+        // as a normal finish apply inside (pad-only / error / vision /
+        // empty all decline) — then flush what was committed to the
+        // SSD tier, since no finishSlot will. Normally-finished slots
+        // arrive here with `finished` already set (finishSlot committed
+        // them) and skip; errored slots decline via the error guard.
+        // Runs on the inference thread — the sole mlx caller — which is
+        // what makes the refcount-sharing snapshot legal here.
+        if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+            commitSlotIfApplicable(sch, s);
+            if (s.model.prefix_cache) |*hc| {
+                if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
+            }
+        }
+        // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
+        // record must not outlive the bytes `s.deinit()` frees.
+        if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+        if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
+        s.deinit();
+    }
+    for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
+    for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
+    return cleanup_n + vision_n + embed_n > 0;
+}
+
+const ChatPassMode = enum { main, yield };
+const ChatPassResult = enum { shutdown, idle, ran };
+
+/// One admission -> prefill -> decode tick -> cull pass. `.main` parks while there is no
+/// work at all; `.yield` runs inside a media job, so it never parks and never touches the
+/// load, unload or gen queues. `.ran` = something advanced.
+fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
+    // 1. Wait for work. Drain pending slots into a local list under lock,
+    //    run prefills outside the lock.
+    var ran = mode == .yield and drainSideQueues(sch);
+    var to_prefill: [16]*Slot = undefined;
+    var n_prefill: usize = 0;
+    {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        if (mode == .main) {
             while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(false);
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
-            if (sch.shutdown.load(.acquire)) break;
             // Hold until the loop parks again.
-            sleep_inhibit.setActive(true);
-
-            // If only vision/embed/cleanup/load work is pending, loop back to drain it.
-            if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
-
-            // Single-flight admission (the dsv4 class): a model with
-            // MODULE-OWNED decode state admits at most one live slot.
-            // Snapshot live exclusive-model slots (same liveness predicate
-            // as the step-3 active list), let `admitPendingTick` decide,
-            // and leave held slots in `pending` — their conn threads keep
-            // flowing SSE keepalives while they wait, and the wait
-            // condition above never blocks while `pending` is non-empty,
-            // so a held slot admits on the first tick after the active one
-            // is culled (step 5, same mutex).
-            var live_buf: [32]AdmitCand = undefined;
-            var n_live: usize = 0;
-            for (sch.decoding.items) |s| {
-                if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
-                if (!slotExclusiveDecode(s)) continue;
-                if (n_live >= live_buf.len) break;
-                live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = true };
-                n_live += 1;
-            }
-            var cand_buf: [32]AdmitCand = undefined;
-            const n_cands = @min(sch.pending.items.len, cand_buf.len);
-            for (sch.pending.items[0..n_cands], 0..) |s, i| {
-                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
-            }
-            var admit_idx: [to_prefill.len]usize = undefined;
-            const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
-            for (admit_idx[0..n_admit]) |idx| {
-                to_prefill[n_prefill] = sch.pending.items[idx];
-                _ = to_prefill[n_prefill].in_pass.fetchAdd(1, .acq_rel);
-                n_prefill += 1;
-            }
-            // Remove admitted entries in DESCENDING index order so the
-            // earlier (ascending) indices stay valid during removal.
-            var r = n_admit;
-            while (r > 0) {
-                r -= 1;
-                _ = sch.pending.orderedRemove(admit_idx[r]);
-            }
+            if (!sch.shutdown.load(.acquire)) sleep_inhibit.setActive(true);
         }
+        if (sch.shutdown.load(.acquire)) return .shutdown;
 
-        if (sch.budget_revise_sw) |sw| {
-            if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
-            if (n_prefill > 0) reviseHotCacheBudgets(sch);
+        // If only vision/embed/cleanup/load work is pending, loop back to drain it.
+        if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) return if (ran) .ran else .idle;
+
+        // Single-flight admission (the dsv4 class): a model with
+        // MODULE-OWNED decode state admits at most one live slot.
+        // Snapshot live exclusive-model slots (same liveness predicate
+        // as the step-3 active list), let `admitPendingTick` decide,
+        // and leave held slots in `pending` — their conn threads keep
+        // flowing SSE keepalives while they wait, and the wait
+        // condition above never blocks while `pending` is non-empty,
+        // so a held slot admits on the first tick after the active one
+        // is culled (step 5, same mutex).
+        var live_buf: [32]AdmitCand = undefined;
+        var n_live: usize = 0;
+        for (sch.decoding.items) |s| {
+            if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+            if (!slotExclusiveDecode(s)) continue;
+            if (n_live >= live_buf.len) break;
+            live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = true };
+            n_live += 1;
         }
-
-        // 2. Prefill each pending slot (heavy; mlx ops on this thread).
-        //    The inference thread is the sole mlx caller post-cleanup, so
-        //    no per-tick stream rebind / mutex coexistence is needed.
-        if (n_prefill > 0) {
-            for (to_prefill[0..n_prefill], 0..) |slot, pi| {
-                defer _ = slot.in_pass.fetchSub(1, .acq_rel);
-                // Between the slots of one admitted batch, tick the streams
-                // that just started decoding — a single-chunk prefill exposes
-                // no chunk-boundary yield, so without this every slot's first
-                // token waits for the LAST slot's prefill (the TTFT
-                // staircase collapse).
-                if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
-                if (slot.cancelled.load(.acquire)) {
-                    // finishSlot (not raw markFinished) so the metrics sink
-                    // counts the cancellation; safe pre-prefill — commit
-                    // no-ops with legacy_gen==null.
-                    finishSlot(sch, slot, "cancelled");
-                    continue;
-                }
-                if (slotHoldsForMemory(sch, slot)) {
-                    // Back to the head of `pending`, in order; the decode tick below runs first.
-                    sch.queue_mu.lockUncancelable(sch.io);
-                    defer sch.queue_mu.unlock(sch.io);
-                    var r = n_prefill;
-                    while (r > pi) {
-                        r -= 1;
-                        sch.pending.insert(sch.allocator, 0, to_prefill[r]) catch {
-                            to_prefill[r].markError("OutOfMemory");
-                        };
-                        if (r > pi) _ = to_prefill[r].in_pass.fetchSub(1, .acq_rel);
-                    }
-                    break;
-                }
-                var prefill_sw = io_util.Stopwatch.init(sch.io);
-                var qsa_gap_retried = false;
-                prefill: while (true) {
-                    runPrefill(sch, slot) catch |err| {
-                        if (err == error.Cancelled) {
-                            log.info("[scheduler] prefill aborted: client disconnected\n", .{});
-                            finishSlot(sch, slot, "cancelled");
-                            break :prefill;
-                        }
-                        if (err == error.QsaHistoryGap and !qsa_gap_retried) {
-                            if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
-                            if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
-                            if (slot.model.transformer) |xf| {
-                                slot.cache.truncate(0, xf.s) catch {};
-                                xf.resetQsaPooledRope();
-                                xf.qwen4MtpResetOwned(slot.enable_mtp);
-                            }
-                            if (slot.legacy_gen) |*g| {
-                                g.deinit(slot.allocator);
-                                slot.legacy_gen = null;
-                            }
-                            slot.moe_seq_offset = 0;
-                            slot.cached_tokens = 0;
-                            slot.skip_prefix_cache = true;
-                            log.warn("[hot-cache] restored entry failed the QSA history check — dropped, cold prefill\n", .{});
-                            qsa_gap_retried = true;
-                            continue :prefill;
-                        }
-                        log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
-                        slot.markError(@errorName(err));
-                        break :prefill;
-                    };
-                    break :prefill;
-                }
-                if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
-                slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
-                publishFirstToken(slot);
-                if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
-                    slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
-                });
-                // Exact time-to-first-token: elapsed from request arrival
-                // (Slot.init, pre-queue-wait) to prefill completion. Captured
-                // here rather than derived by subtraction in finishSlot, so a
-                // slot that finishes mid-tick can't skew it (metrics TTFT fix).
-                slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
-                sch.queue_mu.lockUncancelable(sch.io);
-                sch.decoding.append(sch.allocator, slot) catch |err| {
-                    sch.queue_mu.unlock(sch.io);
-                    slot.markError(@errorName(err));
-                    continue;
-                };
-                sch.queue_mu.unlock(sch.io);
-            }
+        var cand_buf: [32]AdmitCand = undefined;
+        const n_cands = @min(sch.pending.items.len, cand_buf.len);
+        for (sch.pending.items[0..n_cands], 0..) |s, i| {
+            cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
         }
-
-        // 3. Build active-list snapshot (skip cancelled / finished / errored).
-        var active: std.ArrayList(*Slot) = .empty;
-        defer active.deinit(sch.allocator);
-        {
-            sch.queue_mu.lockUncancelable(sch.io);
-            defer sch.queue_mu.unlock(sch.io);
-            for (sch.decoding.items) |s| {
-                if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
-                active.append(sch.allocator, s) catch break;
-                _ = s.in_pass.fetchAdd(1, .acq_rel);
-            }
+        var admit_idx: [to_prefill.len]usize = undefined;
+        const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
+        for (admit_idx[0..n_admit]) |idx| {
+            to_prefill[n_prefill] = sch.pending.items[idx];
+            _ = to_prefill[n_prefill].in_pass.fetchAdd(1, .acq_rel);
+            n_prefill += 1;
         }
-        defer for (active.items) |s| {
-            _ = s.in_pass.fetchSub(1, .acq_rel);
-        };
-
-        dflashYieldTick(active.items);
-
-        // 4. Decode tick. Charge the full wall-clock tick time to each
-        //    participating slot — for batched ticks this matches the per-slot
-        //    throughput a user actually observes (their stream advances at
-        //    the tick cadence regardless of how many peers share it).
-        if (active.items.len > 0) {
-            var decode_sw = io_util.Stopwatch.init(sch.io);
-            runDecodeTick(sch, active.items) catch |err| {
-                log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
-                for (active.items) |s| s.markError(@errorName(err));
-            };
-            const tick_ns = decode_sw.read();
-            for (active.items) |s| s.decode_ns +|= tick_ns;
-        }
-
-        // 5. Cull finished / errored / cancelled from `decoding`. The slot
-        //    still belongs to its connection thread until that thread calls
-        //    `complete`; we just stop touching it.
-        {
-            sch.queue_mu.lockUncancelable(sch.io);
-            defer sch.queue_mu.unlock(sch.io);
-            var i: usize = 0;
-            while (i < sch.decoding.items.len) {
-                const s = sch.decoding.items[i];
-                const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
-                const grown = if (s.legacy_gen) |*g| promiseMaterialized(g.completion_tokens) else false;
-                if (drop or grown) {
-                    sch.promise_ledger.release(s.memory_promised);
-                    s.memory_promised = 0;
-                }
-                if (drop) {
-                    _ = sch.decoding.orderedRemove(i);
-                } else i += 1;
-            }
-            publishLiveKvResidency(sch, null);
+        // Remove admitted entries in DESCENDING index order so the
+        // earlier (ascending) indices stay valid during removal.
+        var r = n_admit;
+        while (r > 0) {
+            r -= 1;
+            _ = sch.pending.orderedRemove(admit_idx[r]);
         }
     }
+
+    if (sch.budget_revise_sw) |sw| {
+        if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
+        if (n_prefill > 0) reviseHotCacheBudgets(sch);
+    }
+
+    // 2. Prefill each pending slot (heavy; mlx ops on this thread).
+    //    The inference thread is the sole mlx caller post-cleanup, so
+    //    no per-tick stream rebind / mutex coexistence is needed.
+    if (n_prefill > 0) {
+        for (to_prefill[0..n_prefill], 0..) |slot, pi| {
+            defer _ = slot.in_pass.fetchSub(1, .acq_rel);
+            // Between the slots of one admitted batch, tick the streams
+            // that just started decoding — a single-chunk prefill exposes
+            // no chunk-boundary yield, so without this every slot's first
+            // token waits for the LAST slot's prefill (the TTFT
+            // staircase collapse).
+            if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
+            if (slot.cancelled.load(.acquire)) {
+                // finishSlot (not raw markFinished) so the metrics sink
+                // counts the cancellation; safe pre-prefill — commit
+                // no-ops with legacy_gen==null.
+                finishSlot(sch, slot, "cancelled");
+                ran = true;
+                continue;
+            }
+            if (slotHoldsForMemory(sch, slot)) {
+                // Back to the head of `pending`, in order; the decode tick below runs first.
+                sch.queue_mu.lockUncancelable(sch.io);
+                defer sch.queue_mu.unlock(sch.io);
+                var r = n_prefill;
+                while (r > pi) {
+                    r -= 1;
+                    sch.pending.insert(sch.allocator, 0, to_prefill[r]) catch {
+                        to_prefill[r].markError("OutOfMemory");
+                    };
+                    if (r > pi) _ = to_prefill[r].in_pass.fetchSub(1, .acq_rel);
+                }
+                break;
+            }
+            ran = true;
+            var prefill_sw = io_util.Stopwatch.init(sch.io);
+            var qsa_gap_retried = false;
+            prefill: while (true) {
+                runPrefill(sch, slot) catch |err| {
+                    if (err == error.Cancelled) {
+                        log.info("[scheduler] prefill aborted: client disconnected\n", .{});
+                        finishSlot(sch, slot, "cancelled");
+                        break :prefill;
+                    }
+                    if (err == error.QsaHistoryGap and !qsa_gap_retried) {
+                        if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
+                        if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
+                        if (slot.model.transformer) |xf| {
+                            slot.cache.truncate(0, xf.s) catch {};
+                            xf.resetQsaPooledRope();
+                            xf.qwen4MtpResetOwned(slot.enable_mtp);
+                        }
+                        if (slot.legacy_gen) |*g| {
+                            g.deinit(slot.allocator);
+                            slot.legacy_gen = null;
+                        }
+                        slot.moe_seq_offset = 0;
+                        slot.cached_tokens = 0;
+                        slot.skip_prefix_cache = true;
+                        log.warn("[hot-cache] restored entry failed the QSA history check — dropped, cold prefill\n", .{});
+                        qsa_gap_retried = true;
+                        continue :prefill;
+                    }
+                    log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
+                    slot.markError(@errorName(err));
+                    break :prefill;
+                };
+                break :prefill;
+            }
+            if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
+            slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+            publishFirstToken(slot);
+            if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
+                slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
+            });
+            // Exact time-to-first-token: elapsed from request arrival
+            // (Slot.init, pre-queue-wait) to prefill completion. Captured
+            // here rather than derived by subtraction in finishSlot, so a
+            // slot that finishes mid-tick can't skew it (metrics TTFT fix).
+            slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+            sch.queue_mu.lockUncancelable(sch.io);
+            sch.decoding.append(sch.allocator, slot) catch |err| {
+                sch.queue_mu.unlock(sch.io);
+                slot.markError(@errorName(err));
+                continue;
+            };
+            sch.queue_mu.unlock(sch.io);
+        }
+    }
+
+    // 3. Build active-list snapshot (skip cancelled / finished / errored).
+    var active: std.ArrayList(*Slot) = .empty;
+    defer active.deinit(sch.allocator);
+    {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        for (sch.decoding.items) |s| {
+            if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+            active.append(sch.allocator, s) catch break;
+            _ = s.in_pass.fetchAdd(1, .acq_rel);
+        }
+    }
+    defer for (active.items) |s| {
+        _ = s.in_pass.fetchSub(1, .acq_rel);
+    };
+
+    dflashYieldTick(active.items);
+
+    // 4. Decode tick. Charge the full wall-clock tick time to each
+    //    participating slot — for batched ticks this matches the per-slot
+    //    throughput a user actually observes (their stream advances at
+    //    the tick cadence regardless of how many peers share it).
+    if (active.items.len > 0) {
+        ran = true;
+        var decode_sw = io_util.Stopwatch.init(sch.io);
+        runDecodeTick(sch, active.items) catch |err| {
+            log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
+            for (active.items) |s| s.markError(@errorName(err));
+        };
+        const tick_ns = decode_sw.read();
+        for (active.items) |s| s.decode_ns +|= tick_ns;
+    }
+
+    // 5. Cull finished / errored / cancelled from `decoding`. The slot
+    //    still belongs to its connection thread until that thread calls
+    //    `complete`; we just stop touching it.
+    {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        var i: usize = 0;
+        while (i < sch.decoding.items.len) {
+            const s = sch.decoding.items[i];
+            const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
+            const grown = if (s.legacy_gen) |*g| promiseMaterialized(g.completion_tokens) else false;
+            if (drop or grown) {
+                sch.promise_ledger.release(s.memory_promised);
+                s.memory_promised = 0;
+            }
+            if (drop) {
+                _ = sch.decoding.orderedRemove(i);
+            } else i += 1;
+        }
+        publishLiveKvResidency(sch, null);
+    }
+    return if (ran) .ran else .idle;
 }
 
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
@@ -5301,6 +5430,63 @@ fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) 
     req.done_cond.broadcast(sch.io);
 }
 
+/// Chat's share of wall time while a media job runs: equal, so neither side starves.
+const GEN_CHAT_SHARE: f32 = 0.5;
+
+/// Chat's turn while a media job owns the inference thread (`gen_sse.Yield`): at each
+/// step boundary chat runs for as long as the step took, and while a pure-CPU stage
+/// runs on a worker (`gen_sse.offload`) chat runs until it is done.
+const GenYield = struct {
+    sch: *Scheduler,
+    step_sw: io_util.Stopwatch,
+    engaged: bool = false,
+
+    fn pass(gy: *GenYield) ChatPassResult {
+        const r = chatPass(gy.sch, .yield);
+        if (r == .ran and !gy.engaged) {
+            gy.engaged = true;
+            log.debug("[gen-yield] engaged: chat runs between media steps\n", .{});
+        }
+        return r;
+    }
+
+    fn step(ctx: *anyopaque) void {
+        const gy: *GenYield = @ptrCast(@alignCast(ctx));
+        {
+            gy.sch.queue_mu.lockUncancelable(gy.sch.io);
+            defer gy.sch.queue_mu.unlock(gy.sch.io);
+            invalidateDecodeClocks(gy.sch.decoding.items);
+        }
+        const budget = decodeShareBudgetNs(gy.step_sw.read(), GEN_CHAT_SHARE);
+        const sw = io_util.Stopwatch.init(gy.sch.io);
+        while (sw.read() < budget and gy.pass() == .ran) {}
+        gy.step_sw.reset();
+    }
+
+    fn serveUntil(ctx: *anyopaque, done: *const std.atomic.Value(bool)) void {
+        const gy: *GenYield = @ptrCast(@alignCast(ctx));
+        const sch = gy.sch;
+        while (!done.load(.acquire)) {
+            if (gy.pass() == .ran) continue;
+            // Idle: park until a submission or the worker wakes us. The timeout covers a
+            // submission that landed between the pass and this lock.
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            if (done.load(.acquire)) break;
+            const deadline = (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }).toDeadline(sch.io);
+            sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, deadline) catch {};
+        }
+        gy.step_sw.reset();
+    }
+
+    fn wake(ctx: *anyopaque) void {
+        const sch = @as(*GenYield, @ptrCast(@alignCast(ctx))).sch;
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        sch.queue_cond.broadcast(sch.io);
+    }
+};
+
 /// Run one media-generation job on the inference thread. The job body
 /// (`req.run`) does all mlx work + writes the HTTP/SSE response to the parked
 /// connection. We bracket it with the model's `gen_busy` flag for visibility
@@ -5309,6 +5495,19 @@ fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) 
 fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     const req = reqs[0];
     req.model.gen_busy = true;
+    var gy = GenYield{ .sch = sch, .step_sw = io_util.Stopwatch.init(sch.io) };
+    const hook = gen_sse.Yield{ .ctx = &gy, .step = GenYield.step, .serve_until = GenYield.serveUntil, .wake = GenYield.wake };
+    gen_sse.gen_yield = &hook;
+    // The whole estimated peak, though live memory already holds part of it: the side that
+    // cannot OOM.
+    sch.gen_reserve_bytes = sch.mediaPeakFor(req.model);
+    defer {
+        gen_sse.gen_yield = null;
+        sch.gen_reserve_bytes = 0;
+        sch.queue_mu.lockUncancelable(sch.io);
+        invalidateDecodeClocks(sch.decoding.items);
+        sch.queue_mu.unlock(sch.io);
+    }
     // On small-RAM machines (≤16 GB — mini class; also the phone), bound
     // MLX's buffer-cache growth DURING the generation: the post-request
     // clear below can't help mid-loop, and a diffusion denoise + VAE decode
@@ -6477,6 +6676,19 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     ic.chunk_sw.reset();
 }
 
+/// The interval since these slots' previous tick held other work (a prefill chunk, a media
+/// step); the serial cell and the round-cost table must not fold it as a token's wall time.
+/// Drop it; the next tick seeds afresh.
+fn invalidateDecodeClocks(slots: []const *Slot) void {
+    for (slots) |s| {
+        if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+        if (s.legacy_gen) |*g| {
+            g.invalidateSerialClock();
+            g.invalidateRoundClock();
+        }
+    }
+}
+
 /// One decode tick for the streams currently decoding, run from INSIDE a
 /// prefill (between chunks, and between the slots of one admitted batch).
 /// Returns the tick's wall-clock ns (0 when no stream is active). The
@@ -6498,14 +6710,7 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
         _ = s.in_pass.fetchSub(1, .acq_rel);
     };
     if (n == 0) return 0;
-    // The interval since these slots' previous tick contains a prefill chunk; the serial
-    // cell must not fold it as a token's wall time. Drop it; the next tick seeds afresh.
-    for (buf[0..n]) |s| {
-        if (s.legacy_gen) |*g| {
-            g.invalidateSerialClock();
-            g.invalidateRoundClock();
-        }
-    }
+    invalidateDecodeClocks(buf[0..n]);
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
         log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
@@ -6767,6 +6972,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             if (!fits) if (slot.model.vision_encoder) |ve| if (ve.emb_cache.bytes > 0) {
                 log.info("[scheduler] prefill does not fit: dropping {d}MB of cached media embeddings\n", .{ve.emb_cache.bytes / (1024 * 1024)});
                 ve.emb_cache.clear();
+                fits = Probe.call(&probe);
+            };
+            // A resident video pack is memory its next request can reload: give it back before refusing.
+            if (!fits) if (gen_mod.releaseMediaResidency() > 0) {
+                log.info("[scheduler] prefill does not fit: released the resident media cache\n", .{});
                 fits = Probe.call(&probe);
             };
             // A shared restore is billed a whole second copy; taking the entry over moves it instead.
@@ -7120,12 +7330,14 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // how many still fit; the tail decodes serially this tick.
         if (group.len >= 2) {
             var kv_lens: [32]u32 = undefined;
+            var ctx_max: u32 = 0;
             {
                 var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
                 for (group, 0..) |g, i| {
                     caches_buf[i] = &g.cache;
                 }
                 fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, kv_lens[0..group.len]);
+                ctx_max = groupCtxMax(caches_buf[0..group.len]);
                 // Stable insertion sort, ascending, slots and lengths moving together.
                 var i: usize = 1;
                 while (i < group.len) : (i += 1) {
@@ -7140,7 +7352,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
                     kv_lens[j] = len_i;
                 }
             }
-            const keep = groupKeepCount(kv_lens[0..group.len], groupAttendsPerSlot(group[0]));
+            const keep = groupKeepCount(kv_lens[0..group.len], groupAttendsPerSlot(group[0]), ctx_max);
             if (keep < group.len) {
                 if (!kv_skew_split_logged) {
                     kv_skew_split_logged = true;
@@ -7696,12 +7908,15 @@ test "the inference loop parks without holding the sleep-inhibition assertion" {
     const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
     const body = source[start..end];
-    const drop = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
-    const park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
-    const hold = std.mem.indexOfPos(u8, body, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    const pass_start = std.mem.indexOf(u8, source, "fn chatPass(") orelse return error.MissingChatPass;
+    const pass_end = std.mem.indexOfPos(u8, source, pass_start + 1, "\nfn ") orelse return error.MissingChatPassEnd;
+    const pass = source[pass_start..pass_end];
+    const drop = std.mem.indexOf(u8, pass, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
+    const park = std.mem.indexOf(u8, pass, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
+    const hold = std.mem.indexOfPos(u8, pass, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
     try testing.expect(drop < park);
     try testing.expect(park < hold);
-    try testing.expect(std.mem.indexOf(u8, body, "while (!hasWorkPendingLocked(sch)") != null);
+    try testing.expect(std.mem.indexOf(u8, pass, "while (!hasWorkPendingLocked(sch)") != null);
     const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
     const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
     try testing.expect(boot_arm < boot_load);
@@ -7887,11 +8102,11 @@ fn slotMtpGroupable(slot: *const Slot) bool {
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.mtp.?.moduleOwned()) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
-    if (gen.ctx.ssm_entries == null) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
     if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedGdnDecode()) return false;
+    if (gen.ctx.ssm_entries == null and t.hasRecurrentLayers()) return false;
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
 }
 
@@ -8319,10 +8534,15 @@ var merged_verify_decline_logged: bool = false;
 
 fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
+    // A stateless trunk (MiMo) has no grouped verify: its MTP rounds run alone.
+    if (!t.hasRecurrentLayers()) return true;
     return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
 }
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
+    // Solo MTP rounds interleave one slot at a time, so any company decodes
+    // faster as plain batched ticks.
+    if (slot.model.transformer) |t| if (!t.hasRecurrentLayers()) return 2;
     return if (mtpRoundsStaySolo(slot)) 3 else mtpCrowdThreshold();
 }
 
@@ -8480,6 +8700,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 caches_buf[i] = &g.cache;
             }
             fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 2, kv_lens[0..group.len]);
+            const ctx_max = groupCtxMax(caches_buf[0..group.len]);
             var i: usize = 1;
             while (i < group.len) : (i += 1) {
                 const slot_i = group[i];
@@ -8492,7 +8713,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 group[j] = slot_i;
                 kv_lens[j] = len_i;
             }
-            const keep = groupKeepCount(kv_lens[0..group.len], groupAttendsPerSlot(group[0]));
+            const keep = groupKeepCount(kv_lens[0..group.len], groupAttendsPerSlot(group[0]), ctx_max);
             for (group[keep..]) |s| {
                 noteSerial(sch, s, .pad_waste);
                 try runSingleDecodeTick(sch, s);
@@ -9203,10 +9424,20 @@ test "the batched group is capped by padding waste before it is dispatched" {
 
 test "groupKeepCount: a group that attends per slot pads nothing, so the cap is the stacked arm's" {
     const skew = [_]u32{ 1000, 1000, 1000, 100_000 };
-    try testing.expectEqual(@as(usize, 3), groupKeepCount(&skew, false));
-    try testing.expectEqual(@as(usize, 4), groupKeepCount(&skew, true));
+    try testing.expectEqual(@as(usize, 3), groupKeepCount(&skew, false, 0));
+    try testing.expectEqual(@as(usize, 4), groupKeepCount(&skew, true, 0));
     // Below the per-slot floor the stacked arm runs and its cap holds.
-    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 10, 900 }, true));
+    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 10, 900 }, true, 0));
+}
+
+test "groupKeepCount: the small-pad floor keeps a group whole only at long context" {
+    // A long stream billed at the gather arm's 2052-row cap beside two short sub-agents: 3x pad.
+    const billed = [_]u32{ 10, 10, 2052 };
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&billed, false, PAD_FREE_MIN_CTX - 1));
+    try testing.expectEqual(@as(usize, 3), groupKeepCount(&billed, false, PAD_FREE_MIN_CTX));
+    // Past the floor's billed bound the cap holds at any context.
+    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV + 1 }, false, 300_000));
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV }, false, 300_000));
 }
 
 test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
@@ -10685,4 +10916,15 @@ test "applyModelSettings: --no-mtp stamps the head off unless the model's own se
         applyModelSettings(&cfg, &cc, &o, c.flag);
         try testing.expectEqual(c.want, cfg.mtp_override);
     }
+}
+
+test "availForLoad: only a load that would be refused makes media residency let go" {
+    var held = @import("minimax_h3.zig").Resident.init(std.testing.allocator);
+    held.bytes = 1000;
+    @import("minimax_h3.zig").registerResident(&held);
+    defer @import("minimax_h3.zig").unregisterResident(&held);
+    _ = availForLoad(1); // fits anywhere: the cache stays
+    try std.testing.expectEqual(@as(u64, 1000), held.bytes);
+    _ = availForLoad(1 << 50); // can never fit: the cache is released before the refusal
+    try std.testing.expectEqual(@as(u64, 0), held.bytes);
 }

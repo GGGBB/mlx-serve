@@ -106,7 +106,7 @@ struct LayaDecisionsPane: View {
                                     ForEach(Question.Kind.allCases, id: \.self) { Text($0.rawValue) }.font(.app(.body))
                                 }.frame(width: 100)
                                 Spacer()
-                                Button { questions.removeAll { $0.id == q.id } } label: { Image(systemName: "minus.circle") }
+                                Button { [id = q.id] in questions.removeAll { $0.id == id } } label: { Image(systemName: "minus.circle") }
                                     .buttonStyle(.plain).foregroundStyle(.secondary).font(.app(.body))
                             }
                             TextField("instructions", text: $q.instructions).font(.app(.body))

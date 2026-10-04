@@ -31,6 +31,13 @@ test {
     _ = @import("lane_qmm.zig");
     _ = @import("lane_attn.zig");
     _ = @import("add_norm.zig");
+    _ = @import("moe_fp4.zig");
+    _ = @import("mimo_mtp.zig");
+    _ = @import("glm_mtp.zig");
+    _ = @import("dec_attn.zig");
+    _ = @import("nax_attention.zig");
+    _ = @import("glm5_next.zig");
+    _ = @import("kda_recurrence.zig");
     _ = @import("gdn_decode.zig");
     _ = @import("row_attn.zig");
     _ = @import("keyed_sample.zig");
@@ -102,7 +109,9 @@ test {
     _ = @import("hunyuan3d.zig");
     _ = @import("acestep.zig");
     _ = @import("music3.zig");
+    _ = @import("stable_audio.zig");
     _ = @import("uvwrap.zig");
+    _ = @import("mesh_simplify.zig");
     _ = @import("hunyuan3d_paint.zig");
     _ = @import("hunyuan3d_paint_unet.zig");
     _ = @import("rasterize.zig");

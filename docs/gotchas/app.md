@@ -856,3 +856,7 @@ the guard green. A font is inherited through the trailing-modifier idiom: the
 block's own last line, or the couple of lines after its closing brace. Scanning
 only there surfaced every one of them, and a probe injected into a view the old
 window waved through now fails.
+
+## Deleting a provider crashed Settings
+
+Defect: the trash button on the last Providers row crashed the app (`Array._checkSubscript` under `Binding.subscript.getter`, `SettingsView.swift:991`). Cause: rows come from `ForEach($formState.providerEntries) { $entry in }`, whose `entry` reads the array BY INDEX; the delete closure removed the row and then read `entry.id` again (inside `removeAll`'s predicate and for the field-text map). The last row's index no longer existed; on any other row the read returned the NEXT provider and cleared its text. Fix: the closure captures the id when it is built (`[id = entry.id]`) and calls `SettingsFormState.removeProvider(id:)`; the Laya question list had the same shape. Guard: `SettingsFormStateProviderTests`.

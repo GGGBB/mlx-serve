@@ -8,6 +8,7 @@
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
 | **DiffusionGemma** | `diffusion_gemma` | `diffusiongemma-26B-A4B-it-4bit` | Gemma turns (block diffusion) | -- |
 | **Qwen 2 / 3 / 3.5 / 3.6 / 3.8** | `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-27B`, `Qwen3.6-35B-A3B`, [`Qwen3.8-27B`](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit) (18.2 GB, draft head baked in, effort levels `xhigh`/`medium`/`low`) | ChatML | Qwen3-VL |
+| **MiMo V2.6 Flash** | `mimo_v2`, `mimo_v2_flash` | Xiaomi MiMo-V2.6-Flash (309B-A15B): `mlx-community/MiMo-V2.6-Flash-RL-mxfp4-q8` and the other mlx-lm-layout packs, or the MOPD release via `tests/convert_mimo_v2.py` (158 GB: the release's MXFP4 experts unchanged, 8-bit trunk) | ChatML + XML tool calls, thinking default on | -- |
 | **Muse-Glimmer** | `muse_glimmer` | Meta's Muse-Glimmer-30B ([4-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit) / [8-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit), DFlash draft companion built in, up to 75 tok/s on M4 Max) | Harmony channels + ATEM tools | Muse ViT (images) |
 | **Ling 3.0** | `bailing_hybrid` | inclusionAI Ling 3.0, e.g. `rapid-mlx/Ling-3.0-tiny-MLX-4bit` (4.2 GB, KDA + MLA hybrid MoE) | GLM tags, thinking default on | -- |
 | **DeepSeek V4 Flash** | `deepseek_v4` | DeepSeek-V4-Flash-0731 (284B-A13B, 1M ctx) — **native MLX** for safetensors builds, embedded [ds4](https://github.com/antirez/ds4) for `.gguf` | DSV4 + DSML tools | -- |

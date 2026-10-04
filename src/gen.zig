@@ -23,6 +23,7 @@ const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
+const stable_audio = @import("stable_audio.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
 const kev = @import("kev.zig");
@@ -30,6 +31,7 @@ const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const minimax_h3 = @import("minimax_h3.zig");
+const ane = @import("ane.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
 const glb_mod = @import("glb.zig");
@@ -101,8 +103,8 @@ pub const Modality = enum {
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image", "laya",
-    "kev",
+    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
+    "laya",      "kev",        "stable_audio3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -114,6 +116,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
+    if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
@@ -121,13 +124,14 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     return null;
 }
 
-/// Endpoint-level media route. `.speech` and `.music` share the `.audio`
+/// Endpoint-level media route. `.speech`, `.music` and `.sound` share the `.audio`
 /// modality/engine slot — the loaded `AudioBackend` arm decides which endpoint
 /// is valid (wrong pairing → explicit 400, never a silent misinterpretation).
 pub const GenRoute = enum {
     image,
     speech,
     music,
+    sound,
     video,
     mesh,
     decisions,
@@ -135,7 +139,7 @@ pub const GenRoute = enum {
     pub fn modality(self: GenRoute) Modality {
         return switch (self) {
             .image => .image,
-            .speech, .music => .audio,
+            .speech, .music, .sound => .audio,
             .video => .video,
             .mesh => .mesh,
             .decisions => .decision,
@@ -149,6 +153,7 @@ pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "acestep")) return .music;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
+    if (std.mem.eql(u8, model_type, "stable_audio3")) return .sound;
     return .tts;
 }
 
@@ -162,6 +167,8 @@ pub const AudioBackendKind = enum {
     music,
     music3,
     kokoro,
+    /// Stable Audio 3: text-to-audio on /v1/audio/sound-generations ("sound").
+    sound,
 
     /// Music-generation backends serve /v1/audio/music-generations and
     /// advertise "music" beside "audio"; the TTS arms never do.
@@ -193,7 +200,16 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // An mlx-community-style Qwen-Image-2.1 repo likewise: no root
     // config.json, model_index.json's `_class_name` the only marker.
     if (isQwenImage21Repo(io, allocator, model_dir)) return allocator.dupe(u8, "qwen_image21") catch null;
+    // Stable Audio 3 as Stability publishes it: stable-audio-tools' model_config.json.
+    if (isStableAudio3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "stable_audio3") catch null;
     return null;
+}
+
+/// Thin path→Dir wrapper over `model_discovery.peekStableAudio3Config`.
+fn isStableAudio3Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekStableAudio3Config(io, allocator, dir);
 }
 
 fn isKevPack(io: std.Io, model_dir: []const u8) bool {
@@ -862,6 +878,7 @@ pub const AudioBackend = union(enum) {
     music: *acestep.Engine,
     music3: *music3.Engine,
     kokoro: *kokoro.Engine,
+    sound: *stable_audio.Engine,
 };
 
 /// Audio engine — a tagged-union owner, dispatched on `config.json`'s
@@ -887,6 +904,11 @@ pub const AudioEngine = struct {
             log.info("[audio] MiniMax Music 3 engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .sound) {
+            self.backend = .{ .sound = try stable_audio.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] Stable Audio 3 engine ready\n", .{});
+            return self;
+        }
         if (mt != null and audioBackendKindForType(mt.?) == .kokoro) {
             const ks = mlx.mlx_default_gpu_stream_new();
             self.backend = .{ .kokoro = try kokoro.Engine.load(io, allocator, model_dir, ks) };
@@ -905,6 +927,7 @@ pub const AudioEngine = struct {
             .music => |e| e.deinit(),
             .music3 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
+            .sound => |e| e.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -1341,6 +1364,9 @@ pub const H3VideoEngine = struct {
     /// list at load — the file layout is identical either way).
     supports_refs: bool = false,
 
+    /// The text encoder and DiT kept loaded between requests while memory allows.
+    resident: minimax_h3.Resident,
+
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
         const self = try allocator.create(H3VideoEngine);
         errdefer allocator.destroy(self);
@@ -1348,11 +1374,15 @@ pub const H3VideoEngine = struct {
             .allocator = allocator,
             .model_dir = try allocator.dupe(u8, model_dir),
             .supports_refs = h3DirDeclaresRef2va(io, allocator, model_dir),
+            .resident = minimax_h3.Resident.init(allocator),
         };
+        minimax_h3.registerResident(&self.resident);
         return self;
     }
 
     pub fn deinit(self: *H3VideoEngine) void {
+        minimax_h3.unregisterResident(&self.resident);
+        _ = self.resident.release();
         self.allocator.free(self.model_dir);
         self.allocator.destroy(self);
     }
@@ -1378,6 +1408,40 @@ pub const H3VideoEngine = struct {
         return st.size > 0;
     }
 };
+
+/// Size of one pack file, 0 when it is absent.
+fn packFileBytes(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, name: []const u8) u64 {
+    const p = std.fs.path.join(a, &.{ model_dir, name }) catch return 0;
+    defer a.free(p);
+    const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
+    return @intCast(st.size);
+}
+
+/// The cache to hand `generate`, or null for the staged plan. Residency needs the whole set to
+/// fit in the memory that is free right now plus what the cache already holds; when it does not,
+/// whatever was held is released first, so the staged peak starts from a clean slate.
+pub const H3Plan = struct { resident: *minimax_h3.Resident, bytes: u64 };
+
+pub fn h3ResidentFor(engine: *H3VideoEngine, io: std.Io, a: std.mem.Allocator) ?H3Plan {
+    const dir = engine.model_dir;
+    const need = h3ResidentBytes(
+        packFileBytes(io, a, dir, "text_encoder.safetensors"),
+        packFileBytes(io, a, dir, "transformer.safetensors"),
+        packFileBytes(io, a, dir, "video_vae.safetensors") + packFileBytes(io, a, dir, "audio_vae.safetensors"),
+        packFileBytes(io, a, dir, "turbo_lora.safetensors"),
+    );
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    const avail = h3AvailBytes(metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active);
+    const keep = h3ResidentEnabled() and !ane.media_offload.video and
+        h3KeepResident(avail, engine.resident.bytes, need, h3ResidentMargin(metrics.getTotalMemBytes()));
+    if (!keep) {
+        const freed = engine.resident.release();
+        if (freed > 0) log.info("[minimax-h3] residency released ({d:.1} GB): the resident set no longer fits\n", .{@as(f64, @floatFromInt(freed)) / (1024.0 * 1024.0 * 1024.0)});
+        return null;
+    }
+    return .{ .resident = &engine.resident, .bytes = need };
+}
 
 pub const LtxVideoEngine = struct {
     allocator: std.mem.Allocator,
@@ -2495,7 +2559,10 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // error — refuse by NAME with the number we compared.
     if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len != 0) {
         const bill = qwenImageEditTransientBytes(
-            @intCast(gen_opts.edit_image_bytes.len), gen_opts.ref_resolution, width, height,
+            @intCast(gen_opts.edit_image_bytes.len),
+            gen_opts.ref_resolution,
+            width,
+            height,
         );
         if (bill > QWEN_IMAGE_EDIT_TRANSIENT_BYTES) {
             var active: usize = 0;
@@ -2551,7 +2618,8 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const synth = switch (engine.backend) {
         .tts => |*t| t,
-        .music, .music3 => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
+        .music, .music3 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
+        .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
     // Pre-warm (docs/qwentts-cache.md): `{"warm_only":true,"ref_audio":...}`
@@ -2618,6 +2686,10 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     if (want_stream) try conn.writeAll(sse.headers);
 
     const wav = synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[audio] synthesis cancelled — client disconnected\n", .{});
+            return;
+        }
         log.err("[audio] synthesis failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "synthesis failed");
@@ -2627,20 +2699,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     };
     defer allocator.free(wav);
     log.info("[audio] -> {d} WAV bytes\n", .{wav.len});
-    if (want_stream) {
-        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
-        const b64 = try allocator.alloc(u8, b64_len);
-        defer allocator.free(b64);
-        _ = std.base64.standard.Encoder.encode(b64, wav);
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(allocator);
-        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
-        try out.appendSlice(allocator, b64);
-        try out.appendSlice(allocator, "\"}\n\n");
-        try conn.writeAll(out.items);
-        return;
-    }
-    return sendBytes(conn, allocator, "audio/wav", wav);
+    return sendWav(allocator, conn, wav, want_stream);
 }
 
 /// `POST /v1/audio/speech` on a Kokoro checkpoint.
@@ -2746,8 +2805,113 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     switch (engine.backend) {
         .music => |m| return handleMusicAcestep(allocator, conn, body, m),
         .music3 => |m| return handleMusic3(allocator, conn, body, m),
-        .tts, .kokoro => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
+        .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
+        .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
     }
+}
+
+const MUSIC_ROUTE_HINT = "loaded audio model is a music generator; POST /v1/audio/music-generations";
+const TTS_ROUTE_HINT = "loaded audio model is a TTS voice; POST /v1/audio/speech";
+const SOUND_ROUTE_HINT = "loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations";
+
+/// The numeric fields of a sound-generation body, or the 400 naming the bad one.
+pub const SoundParams = struct { seconds: f32 = 10, steps: u32 = stable_audio.DEFAULT_STEPS, seed: u64 = 42 };
+
+/// Parsed as real JSON: a negative, fractional or quoted value is refused by
+/// name rather than read as a default or truncated.
+pub fn parseSoundParams(a: std.mem.Allocator, body: []const u8) union(enum) { ok: SoundParams, bad: []const u8 } {
+    var parsed = std.json.parseFromSlice(std.json.Value, a, body, .{}) catch return .{ .bad = "invalid JSON body" };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .bad = "invalid JSON body" };
+    const o = parsed.value.object;
+    var p = SoundParams{};
+    if (o.get("duration_seconds")) |v| {
+        const d: f64 = switch (v) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => return .{ .bad = "'duration_seconds' must be a number in (0,120]" },
+        };
+        if (!(d > 0 and d <= stable_audio.MAX_SECONDS)) return .{ .bad = "'duration_seconds' must be a number in (0,120]" };
+        p.seconds = @floatCast(d);
+    }
+    if (o.get("steps")) |v| {
+        const n = jsonWholeNumber(v) orelse return .{ .bad = "'steps' must be an integer in [1,50]" };
+        if (n < 1 or n > stable_audio.MAX_STEPS) return .{ .bad = "'steps' must be an integer in [1,50]" };
+        p.steps = @intCast(n);
+    }
+    if (o.get("seed")) |v| {
+        const n = jsonWholeNumber(v) orelse return .{ .bad = "'seed' must be a non-negative integer" };
+        if (n < 0) return .{ .bad = "'seed' must be a non-negative integer" };
+        p.seed = @intCast(n);
+    }
+    return .{ .ok = p };
+}
+
+/// An integer, or a float with no fractional part; null for anything else.
+fn jsonWholeNumber(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |i| i,
+        .float => |f| if (@trunc(f) == f and @abs(f) < 9e18) @intFromFloat(f) else null,
+        else => null,
+    };
+}
+
+/// `POST /v1/audio/sound-generations` — Stable Audio 3 text-to-audio.
+/// `{"model", "prompt" (REQUIRED, a description of the sound),
+/// "duration_seconds" (default 10, (0,120]), "steps" (ping-pong steps,
+/// default 8, 1-50), "seed" (default 42), "stream"}`. Response mirrors the
+/// music endpoint: raw `audio/wav` (44.1 kHz stereo PCM16) non-stream, SSE
+/// progress + a base64 `complete` event when streaming.
+pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
+    const sa = switch (engine.backend) {
+        .sound => |e| e,
+        .music, .music3 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
+        .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
+    };
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (a description of the sound)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+    const p = switch (parseSoundParams(allocator, body)) {
+        .ok => |v| v,
+        .bad => |m| return sendError(conn, 400, m),
+    };
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    if (want_stream) try conn.writeAll(sse.headers);
+    const wav = sa.generateWav(allocator, .{ .prompt = prompt, .seconds = p.seconds, .steps = p.steps, .seed = p.seed }, sctx.progress()) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[sa3] generation cancelled by client\n", .{});
+            return;
+        }
+        log.err("[sa3] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "sound generation failed");
+            return;
+        }
+        return sendError(conn, 500, "sound generation failed");
+    };
+    defer allocator.free(wav);
+    log.info("[sa3] -> {d} WAV bytes\n", .{wav.len});
+    return sendWav(allocator, conn, wav, want_stream);
+}
+
+/// A generated WAV: raw `audio/wav`, or the base64 SSE `complete` event.
+fn sendWav(allocator: std.mem.Allocator, conn: *Conn, wav: []const u8, want_stream: bool) !void {
+    if (want_stream) {
+        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
+        const b64 = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64);
+        _ = std.base64.standard.Encoder.encode(b64, wav);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, b64);
+        try out.appendSlice(allocator, "\"}\n\n");
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytes(conn, allocator, "audio/wav", wav);
 }
 
 fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, music: *acestep.Engine) !void {
@@ -2906,20 +3070,7 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     };
     defer allocator.free(wav);
     log.info("[music] -> {d} WAV bytes\n", .{wav.len});
-    if (want_stream) {
-        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
-        const b64 = try allocator.alloc(u8, b64_len);
-        defer allocator.free(b64);
-        _ = std.base64.standard.Encoder.encode(b64, wav);
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(allocator);
-        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
-        try out.appendSlice(allocator, b64);
-        try out.appendSlice(allocator, "\"}\n\n");
-        try conn.writeAll(out.items);
-        return;
-    }
-    return sendBytes(conn, allocator, "audio/wav", wav);
+    return sendWav(allocator, conn, wav, want_stream);
 }
 
 /// `POST /v1/audio/music-generations` — MiniMax Music 3 text2music.
@@ -3045,20 +3196,7 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     };
     defer allocator.free(wav);
     log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
-    if (want_stream) {
-        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
-        const b64 = try allocator.alloc(u8, b64_len);
-        defer allocator.free(b64);
-        _ = std.base64.standard.Encoder.encode(b64, wav);
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(allocator);
-        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
-        try out.appendSlice(allocator, b64);
-        try out.appendSlice(allocator, "\"}\n\n");
-        try conn.writeAll(out.items);
-        return;
-    }
-    return sendBytes(conn, allocator, "audio/wav", wav);
+    return sendWav(allocator, conn, wav, want_stream);
 }
 
 /// POST /v1/video/generations — base64 RGB8 frames (or SSE progress + complete).
@@ -3685,7 +3823,10 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         if (paths.turbo_lora) |p| allocator.free(p);
     }
 
+    const plan = h3ResidentFor(engine, io, allocator);
     var res = minimax_h3.generate(allocator, io, paths, .{
+        .resident = if (plan) |p| p.resident else null,
+        .resident_bytes = if (plan) |p| p.bytes else 0,
         .prompt = prompt,
         .width = width,
         .height = height,
@@ -4452,6 +4593,46 @@ pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u
     return stagedPeakBytes(0, &.{ te, generating + H3_ACTIVATION_BYTES });
 }
 
+/// What MiniMax-H3 holds when it keeps every piece loaded between requests: the text encoder, the
+/// WHOLE DiT (the AdaLN weights stay, since they serve any schedule), both VAEs, the LoRA and one
+/// request's activations. Zero when a size is unknown, which never keeps anything.
+pub fn h3ResidentBytes(te: u64, dit_file: u64, vaes: u64, lora: u64) u64 {
+    if (te == 0 or dit_file == 0) return 0;
+    return te + dit_file + vaes + lora + H3_ACTIVATION_BYTES;
+}
+
+/// Frees every H3 engine's resident cache; returns the bytes released. For a load that would
+/// otherwise be refused for memory.
+pub fn releaseMediaResidency() u64 {
+    return minimax_h3.releaseAllResidents();
+}
+
+/// Memory the next request can still use: the tighter of host RAM that is free and the GPU
+/// working-set room. Both exclude what the cache already holds. Zero when host RAM is unknown.
+pub fn h3AvailBytes(host_avail: u64, gpu_limit: u64, gpu_active: u64) u64 {
+    if (host_avail == 0) return 0;
+    if (gpu_limit == 0) return host_avail;
+    return @min(host_avail, gpu_limit -| gpu_active);
+}
+
+/// Headroom kept free beyond the resident set: an eighth of the RAM it does not need, floored.
+pub fn h3ResidentMargin(total_ram: u64) u64 {
+    return @max(10 * 1024 * 1024 * 1024, total_ram / 16);
+}
+
+/// `MLX_SERVE_H3_RESIDENT=0` turns residency off (the A/B arm and the kill switch).
+fn h3ResidentEnabled() bool {
+    const raw = std.c.getenv("MLX_SERVE_H3_RESIDENT") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
+/// Keep H3 resident only while it fits: what is free right now plus what the cache already holds
+/// must cover the whole set and a margin. All or nothing, because a half-resident set breaks the
+/// staged plan's disjoint-stage peak. `avail` excludes the cache's own bytes.
+pub fn h3KeepResident(avail: u64, cache_now: u64, need: u64, margin: u64) bool {
+    return need != 0 and avail +| cache_now >= need +| margin;
+}
+
 /// Per-backend generation-peak estimate for the media load preflight. A
 /// backend with a STAGED residency plan declares it here; every other type
 /// keeps the sum-of-safetensors default — over-billing fails safe (a refused
@@ -4568,6 +4749,7 @@ fn sendBytesJson(conn: *Conn, allocator: std.mem.Allocator, json: []const u8) !v
     try hdr.appendSlice(allocator, ns);
     try hdr.appendSlice(allocator, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
     try conn.writeAllNoFlush(hdr.items);
+    conn.length_framed = true;
     try conn.writeAll(json);
 }
 
@@ -4582,6 +4764,7 @@ fn sendBytes(conn: *Conn, allocator: std.mem.Allocator, content_type: []const u8
     try hdr.appendSlice(allocator, ns);
     try hdr.appendSlice(allocator, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
     try conn.writeAllNoFlush(hdr.items);
+    conn.length_framed = true;
     try conn.writeAll(payload);
 }
 
@@ -4600,6 +4783,7 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     var hdr: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{ code, body.len }) catch return;
     try conn.writeAllNoFlush(head);
+    conn.length_framed = true;
     try conn.writeAll(body);
 }
 
@@ -5293,6 +5477,31 @@ test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(AudioBackendKind.music3.servesMusic());
     try testing.expect(!AudioBackendKind.tts.servesMusic());
     try testing.expect(!AudioBackendKind.kokoro.servesMusic());
+}
+
+test "stable_audio3 is a sound backend on its own route, with named bounds" {
+    try testing.expectEqual(Modality.audio, modalityFromType("stable_audio3").?);
+    try testing.expect(audioBackendKindForType("stable_audio3") == .sound);
+    try testing.expect(!AudioBackendKind.sound.servesMusic());
+    try testing.expectEqual(Modality.audio, GenRoute.sound.modality());
+
+    const a = testing.allocator;
+    try testing.expectEqual(SoundParams{}, parseSoundParams(a, "{\"prompt\":\"rain\"}").ok);
+    try testing.expectEqual(SoundParams{ .seconds = 2.5, .steps = 4, .seed = 7 }, parseSoundParams(a, "{\"duration_seconds\":2.5,\"steps\":4,\"seed\":7}").ok);
+    // Real JSON numbers: an exponent is a number, an integral float is an integer.
+    try testing.expectEqual(SoundParams{ .seconds = 15, .steps = 8 }, parseSoundParams(a, "{\"duration_seconds\":1.5e1,\"steps\":8.0}").ok);
+    // Every field the endpoint cannot honor is a 400 naming it, never a silent default.
+    const bad = [_][2][]const u8{
+        .{ "{\"duration_seconds\":0}", "duration_seconds" },   .{ "{\"duration_seconds\":121}", "duration_seconds" },
+        .{ "{\"duration_seconds\":\"10\"}", "duration_seconds" }, .{ "{\"steps\":0}", "steps" },
+        .{ "{\"steps\":51}", "steps" },                     .{ "{\"steps\":-5}", "steps" },
+        .{ "{\"steps\":4.9}", "steps" },                    .{ "{\"seed\":-1}", "seed" },
+        .{ "{\"seed\":\"x\"}", "seed" },                    .{ "not json", "JSON" },
+    };
+    for (bad) |c| {
+        const msg = parseSoundParams(a, c[0]).bad;
+        try testing.expect(std.mem.indexOf(u8, msg, c[1]) != null);
+    }
 }
 
 test "estimatePeakResidentBytes: minimax_music3 bills the sum plus its AR working set" {
@@ -6219,4 +6428,34 @@ test "decision limits: one set for every backend, named in the 400 text" {
     try testing.expect(std.mem.indexOf(u8, l.message(&buf, error.TooManyQuestions).?, "limit 3") != null);
     try testing.expect(std.mem.indexOf(u8, l.message(&buf, error.TooManyInputTokens).?, "10 input tokens") != null);
     try testing.expect(l.message(&buf, error.TooManyOptions) == null);
+}
+
+test "h3 residency: keeps the whole set only while it fits, counting what the cache already holds" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    const need = h3ResidentBytes(28 * gb, 35 * gb, 6 * gb, gb);
+    try std.testing.expectEqual(76 * gb, need); // te + dit + vaes + lora + the 6 GiB activation term
+    const margin = 12 * gb;
+    try std.testing.expect(h3KeepResident(150 * gb, 0, need, margin)); // a big Mac
+    try std.testing.expect(h3KeepResident(88 * gb, 0, need, margin)); // exactly enough
+    try std.testing.expect(!h3KeepResident(80 * gb, 0, need, margin)); // 128 GB class with other models loaded
+    // The cache's own bytes are available to the next request, or a resident set would evict itself.
+    try std.testing.expect(h3KeepResident(20 * gb, 70 * gb, need, margin));
+    // An unknown size never claims residency.
+    try std.testing.expect(!h3KeepResident(500 * gb, 0, h3ResidentBytes(0, 35 * gb, 6 * gb, 0), margin));
+    try std.testing.expect(!h3KeepResident(500 * gb, 0, h3ResidentBytes(28 * gb, 0, 6 * gb, 0), margin));
+}
+
+test "h3 residency: free memory is the tighter of host RAM and the GPU working-set room" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(100 * gb, h3AvailBytes(100 * gb, 192 * gb, 40 * gb)); // host binds
+    try std.testing.expectEqual(30 * gb, h3AvailBytes(100 * gb, 192 * gb, 162 * gb)); // GPU room binds
+    try std.testing.expectEqual(100 * gb, h3AvailBytes(100 * gb, 0, 40 * gb)); // no GPU limit known
+    try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(0, 192 * gb, 0)); // host unknown never keeps
+    try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(100 * gb, 192 * gb, 200 * gb)); // over the limit
+}
+
+test "h3 residency: the margin scales with RAM and never drops below 10 GiB" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(10 * gb, h3ResidentMargin(64 * gb));
+    try std.testing.expectEqual(16 * gb, h3ResidentMargin(256 * gb));
 }

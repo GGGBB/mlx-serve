@@ -194,6 +194,8 @@ pub const ModelConfig = struct {
     // config.json says "silu" and is never read by the reference.
     swiglu_limit: f32 = 0.0,
     swiglu_alpha: f32 = 1.702,
+    /// GLM-5-Next's form under the same limit: silu(min(gate, limit)) * clip(up, ±limit).
+    swiglu_clamp: bool = false,
 
     // MoE
     num_experts: u32 = 0,
@@ -253,6 +255,16 @@ pub const ModelConfig = struct {
     mla_qk_rope_head_dim: u32 = 0,
     mla_v_head_dim: u32 = 0,
     mla_head_gate: bool = false,
+    // GLM-5-Next DeepSeek sparse attention: absorbed NoPE MLA over a `dsa_kv_lora_rank`
+    // latent (per-head q/k and v widths `dsa_head_dim`) plus a pooled indexer that picks
+    // `dsa_index_topk` tokens in `dsa_index_kpool`-token pools.
+    dsa_q_lora_rank: u32 = 0,
+    dsa_kv_lora_rank: u32 = 0,
+    dsa_head_dim: u32 = 0,
+    dsa_index_topk: u32 = 0,
+    dsa_index_kpool: u32 = 0,
+    dsa_index_heads: u32 = 0,
+    dsa_index_head_dim: u32 = 0,
     // RoPE rotates ADJACENT PAIRS (x[2i], x[2i+1]) instead of halves — mlx's
     // `traditional` rope. Set by rope_interleave.
     rope_interleaved_pairs: bool = false,
@@ -596,6 +608,8 @@ pub const ModelConfig = struct {
 
     // Gemma 4: dual head dimensions and KV sharing
     global_head_dim: u32 = 0, // 0 = same as head_dim
+    v_head_dim: u32 = 0, // 0 = same as the layer's head_dim (MiMo: K 192 / V 128)
+    attention_value_scale: f32 = 1.0, // V multiplied before caching (MiMo-V2.6: 0.707)
     num_global_key_value_heads: u32 = 0, // 0 = same as num_key_value_heads
     num_kv_shared_layers: u32 = 0,
     final_logit_softcapping: f32 = 0.0, // 0 = disabled
@@ -723,6 +737,17 @@ pub const ModelConfig = struct {
         return self.num_attention_heads;
     }
 
+    /// The cached V width of a layer (MiMo stores K 192 / V 128).
+    pub fn layerVHeadDim(self: ModelConfig, layer_idx: u32) u32 {
+        return if (self.v_head_dim > 0) self.v_head_dim else self.layerHeadDim(layer_idx);
+    }
+
+    /// Leading channels of a head that RoPE rotates: `int(head_dim * partial)`.
+    pub fn layerRopeDims(self: ModelConfig, layer_idx: u32) u32 {
+        const partial = if (self.isGlobalLayer(layer_idx)) self.partial_rotary_factor_global else self.partial_rotary_factor;
+        return @intFromFloat(@as(f32, @floatFromInt(self.layerHeadDim(layer_idx))) * partial);
+    }
+
     /// Get effective num_kv_heads for a layer.
     pub fn layerKVHeads(self: ModelConfig, layer_idx: u32) u32 {
         if (self.num_global_key_value_heads > 0 and self.isGlobalLayer(layer_idx)) {
@@ -814,7 +839,48 @@ pub const ModelConfig = struct {
         return self.longCtxGated();
     }
 
+    /// Rows a sliding layer keeps past its window on an arch that caches only the window
+    /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
+    pub const SLIDING_RING_SLACK: u32 = 2048;
+
+    /// Sliding layers cache a bounded ring of rows, as mlx-lm's `RotatingKVCache`, not every token.
+    pub fn slidingRing(self: *const ModelConfig) bool {
+        return self.isMimo();
+    }
+
+    pub fn slidingKeepRows(self: *const ModelConfig) u32 {
+        return self.sliding_window + SLIDING_RING_SLACK;
+    }
+
+    /// Dense bytes of ONE row across every ring layer (0 off `slidingRing`).
+    pub fn slidingRowBytes(self: *const ModelConfig) u64 {
+        if (!self.slidingRing()) return 0;
+        var sum: u64 = 0;
+        for (0..self.num_hidden_layers) |i| {
+            const li: u32 = @intCast(i);
+            if (!self.isGlobalLayer(li)) sum += self.layerKvRowBytes(li);
+        }
+        return sum;
+    }
+
+    fn layerKvRowBytes(self: *const ModelConfig, li: u32) u64 {
+        return @as(u64, self.layerKVHeads(li)) * (@as(u64, self.layerHeadDim(li)) + self.layerVHeadDim(li)) * 2;
+    }
+
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        // GLM-5-Next stores one latent row plus the indexer's key and gate per token.
+        if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * (self.dsa_kv_lora_rank + 2 * self.dsa_index_head_dim) * 2;
+        // An arch that declares its own V width (MiMo) also varies KV heads per
+        // layer type: billed layer by layer. Ring layers are a fixed per-slot term.
+        if (self.v_head_dim > 0) {
+            var sum: u64 = 0;
+            for (0..self.num_hidden_layers) |i| {
+                const li: u32 = @intCast(i);
+                if (self.slidingRing() and !self.isGlobalLayer(li)) continue;
+                sum += self.layerKvRowBytes(li);
+            }
+            return sum;
+        }
         const widths: u64 = if (self.isMla())
             @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
         else
@@ -892,7 +958,7 @@ pub const ModelConfig = struct {
     /// GatedDeltaNet recurrent state dtype: f32 on Hadamard packs, as the
     /// reference runtime keeps it; bf16 elsewhere.
     pub fn ssmStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
-        return if (self.hadamard_block > 0) .float32 else .bfloat16;
+        return if (self.hadamard_block > 0 or self.isGlm5()) .float32 else .bfloat16;
     }
 
     /// Configured MTP depth (0 = auto). Hadamard packs run a grafted head that
@@ -903,6 +969,9 @@ pub const ModelConfig = struct {
         // round cost climbs with depth while the head's acceptance decays;
         // depth 2 beats both 1 and 3+, the adaptive default cap (6) loses.
         if (configured == 0 and std.mem.eql(u8, self.model_type, "nemotron_h")) return 2;
+        // glm5_next: the head's acceptance decays past three drafts while every verify row
+        // costs a MoE expert read; the adaptive default settled at one draft and lost.
+        if (configured == 0 and self.isGlm5()) return 3;
         return configured;
     }
 
@@ -911,6 +980,8 @@ pub const ModelConfig = struct {
     /// marker gives it a fresh root. Null keeps every other arch's root.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
+        // A pool's completing indexer row stores the pool's key in its gate half.
+        if (self.isGlm5()) return "glm5-pooled-keys-v1";
         return null;
     }
 
@@ -937,7 +1008,7 @@ pub const ModelConfig = struct {
     /// The MTP head's hidden input is the trunk's final-normed hidden, not the
     /// residual (Nemotron-H: more drafts kept at depth 1 and 2).
     pub fn mtpReadsFinalNorm(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "nemotron_h");
+        return std.mem.eql(u8, self.model_type, "nemotron_h") or self.isMimo();
     }
 
     /// Vocab rows a spec drafter proposes from (0 = all): Qwen3.8's tokenizer
@@ -946,6 +1017,14 @@ pub const ModelConfig = struct {
     pub fn draftVocab(self: *const ModelConfig) c_int {
         if (self.rowExactDecode() and std.mem.startsWith(u8, self.model_type, "qwen3_5") and self.vocab_size >= 248320) return 98304;
         return 0;
+    }
+
+    pub fn isGlm5(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "glm5_next");
+    }
+
+    pub fn isMimo(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1060,6 +1139,8 @@ pub const ModelConfig = struct {
     /// Says nothing about MoE/hybrid archs that merely share the same
     /// forward — those stay serial, by name, in both callers.
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
+        // MiMo: attention + row-generic MoE with no per-slot recurrent state to merge.
+        if (self.isMimo()) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
@@ -1186,7 +1267,13 @@ pub const ModelConfig = struct {
     /// an arch under the `<= 128` "fused SDPA covers it" early-out, so the
     /// score budget that exists for exactly this materializing path never
     /// applies. A new arch scoring wider than it stores adds its arm here.
+    /// 0 = no score tensor at all: MiMo's prefill attention is always a fused
+    /// kernel (`fusedSinkAttnPrefill`), whatever its width.
     pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
+        if (self.isMimo()) return 0;
+        // GLM-5-Next: the sparse rows never form a score matrix (indexed kernel), and the
+        // dense ones end at the indexer budget (~2k), whatever the chunk.
+        if (self.isGlm5()) return 0;
         if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }
@@ -1232,9 +1319,13 @@ pub const ModelConfig = struct {
         // without reasoning ("17 - 9 = 8" where the thinking arm works the
         // word problem and answers "9 sheep are left").
         if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
+        // mimo_v2: the template thinks unless told `enable_thinking` false.
+        if (self.isMimo()) return true;
         // k2_horizon: the template opens a think marker on every assistant
         // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
         if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
+        // glm5_next: the template opens `<think>` on every assistant turn too.
+        if (self.isGlm5()) return true;
 
         return false;
     }
@@ -1875,6 +1966,16 @@ fn mergeObjects(a: std.mem.Allocator, dst: *std.json.ObjectMap, src: std.json.Ob
         // Keys and values are arena-owned by the override document, which
         // outlives this merge.
         try dst.put(a, e.key_ptr.*, e.value_ptr.*);
+    }
+}
+
+/// The MiMo release (FP8 trunk, per-expert MXFP4 bytes) is not a pack; mlx packs
+/// carry an mlx-style quantization_config with no `quant_method`.
+fn refuseUnconvertedMimo(cfg_obj: std.json.ObjectMap) !void {
+    const qc = jsonField(cfg_obj, "quantization_config") orelse return;
+    if (qc == .object and jsonField(qc.object, "quant_method") != null) {
+        log.err("mimo_v2: this is the original release; convert it first with tests/convert_mimo_v2.py\n", .{});
+        return error.UnconvertedMimoCheckpoint;
     }
 }
 
@@ -2666,6 +2767,214 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
         }
         config.ensureGptOssTerminators();
+    } else if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5_next_text")) {
+        // Z.ai GLM-5.3-Flash (Glm5NextForConditionalGeneration) in mlx-vlm's glm5_next layout
+        // (TensorFold's MLX packs). Three Kimi-Delta-Attention layers per DeepSeek sparse
+        // attention layer, every sublayer inside DeepSeek-V4's 4-stream Sinkhorn
+        // hyper-connection. The sparse attention is absorbed NoPE MLA over a 512 latent; a
+        // pooled indexer picks the tokens each query reads. Sigmoid noaux_tc MoE with one
+        // ungated shared expert and a clamped SwiGLU; dense MLP on the leading layers.
+        config.model_type = "glm5_next";
+        config.weight_prefix = if (jsonField(root, "text_config") != null) "language_model.model" else "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        config.moe_sigmoid_router = true;
+        if (jsonField(cfg_obj, "n_routed_experts")) |v| config.num_experts = try jsonU32(v);
+        if (jsonField(cfg_obj, "norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (jsonField(cfg_obj, "routed_scaling_factor")) |v| config.router_scaling_factor = try jsonFloat(v);
+        if (jsonField(cfg_obj, "n_group")) |v| config.moe_n_group = try jsonU32(v);
+        if (jsonField(cfg_obj, "topk_group")) |v| config.moe_topk_group = try jsonU32(v);
+        if (jsonField(cfg_obj, "n_shared_experts")) |v| {
+            if (v == .integer) config.shared_expert_intermediate_size =
+                std.math.mul(u32, try jsonU32(v), config.moe_intermediate_size) catch return error.InvalidConfigField;
+        }
+        if (jsonField(cfg_obj, "swiglu_limit")) |v| {
+            if (v != .null) config.swiglu_limit = try jsonFloat(v);
+        }
+        config.swiglu_clamp = true;
+
+        // Sparse attention: NoPE, q/k and v at one width.
+        if (jsonField(cfg_obj, "qk_rope_head_dim")) |v| {
+            if (v == .integer and v.integer != 0) {
+                log.err("glm5_next: qk_rope_head_dim {d} (only NoPE sparse attention is served)\n", .{v.integer});
+                return error.UnsupportedGlm5Config;
+            }
+        }
+        if (jsonField(cfg_obj, "q_lora_rank")) |v| config.dsa_q_lora_rank = try jsonU32(v);
+        if (jsonField(cfg_obj, "kv_lora_rank")) |v| config.dsa_kv_lora_rank = try jsonU32(v);
+        if (jsonField(cfg_obj, "qk_nope_head_dim")) |v| config.dsa_head_dim = try jsonU32(v);
+        if (jsonField(cfg_obj, "v_head_dim")) |v| {
+            if ((try jsonU32(v)) != config.dsa_head_dim) {
+                log.err("glm5_next: v_head_dim differs from qk_nope_head_dim (not supported)\n", .{});
+                return error.UnsupportedGlm5Config;
+            }
+        }
+        config.head_dim = config.dsa_head_dim;
+        if (config.num_key_value_heads != config.num_attention_heads) config.num_key_value_heads = config.num_attention_heads;
+        if (jsonField(cfg_obj, "index_topk")) |v| config.dsa_index_topk = try jsonU32(v);
+        if (jsonField(cfg_obj, "index_kpool")) |v| config.dsa_index_kpool = try jsonU32(v);
+        if (jsonField(cfg_obj, "index_n_heads")) |v| config.dsa_index_heads = try jsonU32(v);
+        if (jsonField(cfg_obj, "index_head_dim")) |v| config.dsa_index_head_dim = try jsonU32(v);
+        inline for (.{ "index_kpool_compress", "index_kpool_always_select_tail", "mla_use_nope" }) |key| {
+            if (jsonField(cfg_obj, key)) |v| {
+                if (v == .bool and !v.bool) {
+                    log.err("glm5_next: {s}=false (not supported)\n", .{key});
+                    return error.UnsupportedGlm5Config;
+                }
+            }
+        }
+        if (config.dsa_index_kpool == 0 or config.dsa_index_topk % config.dsa_index_kpool != 0) {
+            log.err("glm5_next: index_topk must be a multiple of index_kpool\n", .{});
+            return error.UnsupportedGlm5Config;
+        }
+        // Every indexer scores its own layer (`shared` reuses the previous one's top-k).
+        if (jsonField(cfg_obj, "indexer_types")) |v| {
+            for ((try jsonValue(.array, v)).items) |t| {
+                if (!std.mem.eql(u8, try jsonValue(.string, t), "full")) {
+                    log.err("glm5_next: a shared indexer layer (not supported)\n", .{});
+                    return error.UnsupportedGlm5Config;
+                }
+            }
+        }
+
+        // Layer pattern: sparse attention every 4th layer, the rest KDA.
+        config.full_attention_interval = 4;
+        if (jsonField(cfg_obj, "layer_types")) |v| {
+            for ((try jsonValue(.array, v)).items, 0..) |t, i| {
+                const name = try jsonValue(.string, t);
+                const sparse = std.mem.eql(u8, name, "deepseek_sparse_attention") or std.mem.eql(u8, name, "full_attention");
+                if (sparse != !config.isLinearLayer(@intCast(i))) {
+                    log.err("glm5_next: layer {d} is {s}, off the every-4th pattern (not supported)\n", .{ i, name });
+                    return error.UnsupportedGlm5Config;
+                }
+            }
+        }
+        if (jsonField(cfg_obj, "mlp_layer_types")) |v| {
+            config.first_k_dense_replace = 0;
+            for ((try jsonValue(.array, v)).items, 0..) |t, i| {
+                if (std.mem.eql(u8, try jsonValue(.string, t), "dense")) {
+                    if (config.first_k_dense_replace != i) {
+                        log.err("glm5_next: dense layer {d} after a MoE layer (not supported)\n", .{i});
+                        return error.UnsupportedGlm5Config;
+                    }
+                    config.first_k_dense_replace += 1;
+                }
+            }
+        } else if (jsonField(cfg_obj, "first_k_dense_replace")) |v| config.first_k_dense_replace = try jsonU32(v);
+
+        // KDA: per-channel bounded gate, sigmoid output gate, low-rank gate projections.
+        config.linear_num_key_heads = config.num_attention_heads;
+        config.linear_key_head_dim = 128;
+        if (jsonField(cfg_obj, "linear_attn_config")) |lac_v| {
+            const lac = try jsonValue(.object, lac_v);
+            if (jsonField(lac, "num_heads")) |v| config.linear_num_key_heads = try jsonU32(v);
+            if (jsonField(lac, "head_dim")) |v| config.linear_key_head_dim = try jsonU32(v);
+            if (jsonField(lac, "short_conv_kernel_size")) |v| config.linear_conv_kernel_dim = try jsonU32(v);
+            if (jsonField(lac, "gate_lower_bound")) |v| {
+                if (v != .null) config.kda_gate_lower_bound = try jsonFloat(v);
+            }
+        }
+        if (config.kda_gate_lower_bound == 0.0) config.kda_gate_lower_bound = -5.0;
+        config.linear_num_value_heads = config.linear_num_key_heads;
+        config.linear_value_head_dim = config.linear_key_head_dim;
+        config.kda_vector_gate = true;
+        config.kda_sigmoid_out_gate = true;
+
+        // DeepSeek-V4's Sinkhorn hyper-connection around every sublayer.
+        config.dsv4_hc_mult = 4;
+        if (jsonField(cfg_obj, "hc_mult")) |v| config.dsv4_hc_mult = try jsonU32(v);
+        if (config.dsv4_hc_mult != 4) {
+            log.err("glm5_next: hc_mult {d} (only 4 is served)\n", .{config.dsv4_hc_mult});
+            return error.UnsupportedGlm5Config;
+        }
+        config.dsv4_hc_sinkhorn_iters = 20;
+        if (jsonField(cfg_obj, "hc_sinkhorn_iters")) |v| config.dsv4_hc_sinkhorn_iters = try jsonU32(v);
+        if (jsonField(cfg_obj, "hc_eps")) |v| config.dsv4_hc_eps = try jsonFloat(v);
+        // The GLM-5-Next vision tower is not wired.
+        config.has_vision = false;
+    } else if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "mimo_v2_flash")) {
+        // Xiaomi MiMo-V2.6-Flash (309B-A15B) in the mlx-lm layout (tests/convert_mimo_v2.py,
+        // the community packs); `mimo_v2_flash` is MiMo-V2-Flash and TensorFold's V2.6 label.
+        // gpt_oss-shaped attention (learned sinks, 128-token sliding window) with
+        // per-layer-type geometry: global layers 4 KV heads at theta 1e7, sliding
+        // layers 8 KV heads at theta 1e4 with sinks; K 192 / V 128, RoPE on the
+        // first int(192 * 0.334) = 64 channels. Experts: laguna's sigmoid routing
+        // with a selection-only bias and no shared expert; dense layers lead.
+        try refuseUnconvertedMimo(cfg_obj);
+        config.model_type = "mimo_v2";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.has_attn_sinks = true;
+        config.moe_sigmoid_router = true;
+        if (jsonField(cfg_obj, "layernorm_epsilon")) |v| config.rms_norm_eps = try jsonFloat(v);
+        if (jsonField(cfg_obj, "attention_value_scale")) |v| {
+            if (v != .null) config.attention_value_scale = try jsonFloat(v);
+        }
+        if (jsonField(cfg_obj, "n_routed_experts")) |v| config.num_experts = try jsonU32(v);
+        if (jsonField(cfg_obj, "norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (jsonField(cfg_obj, "routed_scaling_factor")) |v| {
+            if (v != .null) config.router_scaling_factor = try jsonFloat(v);
+        }
+        if (jsonField(cfg_obj, "n_group")) |v| config.moe_n_group = try jsonU32(v);
+        if (jsonField(cfg_obj, "topk_group")) |v| config.moe_topk_group = try jsonU32(v);
+        if (jsonField(cfg_obj, "n_shared_experts")) |v| {
+            if (v == .integer and v.integer != 0) {
+                log.err("mimo_v2: n_shared_experts {d} not supported\n", .{v.integer});
+                return error.UnsupportedMimoConfig;
+            }
+        }
+
+        // Pattern 0 = global, 1 = sliding; the dense MLP layers lead the stack.
+        const pattern = try jsonValue(.array, jsonField(cfg_obj, "hybrid_layer_pattern") orelse return error.UnsupportedMimoConfig);
+        const freq = try jsonValue(.array, jsonField(cfg_obj, "moe_layer_freq") orelse return error.UnsupportedMimoConfig);
+        if (pattern.items.len != config.num_hidden_layers or freq.items.len != config.num_hidden_layers or config.num_hidden_layers > 128) {
+            log.err("mimo_v2: hybrid_layer_pattern/moe_layer_freq must list all {d} layers\n", .{config.num_hidden_layers});
+            return error.UnsupportedMimoConfig;
+        }
+        config.has_explicit_layer_types = true;
+        for (pattern.items, freq.items, 0..) |p, f, i| {
+            config.layer_is_global[i] = (try jsonU32(p)) == 0;
+            const moe = (try jsonU32(f)) != 0;
+            if (!moe and config.first_k_dense_replace != i) {
+                log.err("mimo_v2: dense layer {d} after a MoE layer is not supported\n", .{i});
+                return error.UnsupportedMimoConfig;
+            }
+            if (!moe) config.first_k_dense_replace += 1;
+        }
+
+        // Root KV heads / theta are the GLOBAL layers'; `swa_*` the sliding ones.
+        config.num_global_key_value_heads = config.num_key_value_heads;
+        if (jsonField(cfg_obj, "swa_num_key_value_heads")) |v| config.num_key_value_heads = try jsonU32(v);
+        if (jsonField(cfg_obj, "swa_rope_theta")) |v| config.rope_local_base_freq = try jsonFloat(v);
+        if (jsonField(cfg_obj, "v_head_dim")) |v| config.v_head_dim = try jsonU32(v);
+        const same = .{ .{ "swa_head_dim", config.head_dim }, .{ "swa_v_head_dim", config.v_head_dim }, .{ "swa_num_attention_heads", config.num_attention_heads } };
+        inline for (same) |kv| {
+            if (jsonField(cfg_obj, kv[0])) |v| {
+                if ((try jsonU32(v)) != kv[1]) {
+                    log.err("mimo_v2: {s} differs from the global layers' (not supported)\n", .{kv[0]});
+                    return error.UnsupportedMimoConfig;
+                }
+            }
+        }
+        config.partial_rotary_factor_global = config.partial_rotary_factor;
+        config.query_pre_attn_scalar = config.head_dim;
+        config.rope_scaling_factor = 1.0;
+        // The MiMo-ViT tower is not wired: the generic vision_config block must not arm SigLIP.
+        config.has_vision = false;
     } else if (std.mem.eql(u8, model_type, "hy_v3")) {
         // Tencent Hunyuan 3 (Hy3, 295B-A21B MoE; July 2026). Pure
         // full-attention MoE that rides the qwen3_moe forward arms: GQA with
@@ -3953,6 +4262,46 @@ pub fn reportF16Narrowing() void {
     narrowed_1d = 0;
 }
 
+/// Load ONE safetensors file into a Weights map, tensors as stored (lazy).
+/// Safetensors load runs on a CPU stream (Load::eval_gpu is Not Implemented —
+/// the GPU-stream path kills the whole server). The iterator hands a +1
+/// reference in `value`; it transfers straight into the map.
+pub fn loadWeightsFile(allocator: std.mem.Allocator, model_dir: []const u8, file: []const u8) !Weights {
+    var w = Weights.init(allocator);
+    errdefer w.deinit();
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, file }, 0);
+    defer allocator.free(path);
+
+    var tensor_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+    var meta_map = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, mlx.mlx_default_cpu_stream_new()));
+
+    const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
+    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
+    while (true) {
+        var key: ?[*:0]const u8 = null;
+        var value = mlx.mlx_array_new();
+        const rc = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
+        if (rc != 0 or key == null) {
+            _ = mlx.mlx_array_free(value);
+            break;
+        }
+        const owned_key = allocator.dupe(u8, std.mem.span(key.?)) catch |e| {
+            _ = mlx.mlx_array_free(value);
+            return e;
+        };
+        w.map.put(owned_key, value) catch |e| {
+            allocator.free(owned_key);
+            _ = mlx.mlx_array_free(value);
+            return e;
+        };
+    }
+    log.info("[weights] loaded {d} tensors from {s}\n", .{ w.count(), file });
+    return w;
+}
+
 pub fn loadSafetensorsFile(
     allocator: std.mem.Allocator,
     weights: *Weights,
@@ -4921,6 +5270,171 @@ test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softpl
     try testing.expectEqual(@as(usize, 2), eos.len);
     try testing.expectEqual(@as(u32, 2), eos[0]);
     try testing.expectEqual(@as(u32, 24), eos[1]);
+}
+
+/// MiMo-V2.6-Flash in the mlx-lm layout (`tests/convert_mimo_v2.py`, mlx-community's
+/// mxfp4-q8), layers trimmed to 6.
+const mimo_v2_pack_json =
+    \\{
+    \\  "model_type": "mimo_v2",
+    \\  "add_full_attention_sink_bias": false, "add_swa_attention_sink_bias": true,
+    \\  "attention_projection_layout": "fused_qkv", "attention_value_scale": 0.707,
+    \\  "eos_token_id": 151645, "head_dim": 192, "hidden_size": 4096,
+    \\  "hybrid_layer_pattern": [0, 1, 1, 1, 1, 0],
+    \\  "intermediate_size": 16384, "layernorm_epsilon": 1e-06,
+    \\  "max_position_embeddings": 1048576, "moe_intermediate_size": 2048,
+    \\  "moe_layer_freq": [0, 1, 1, 1, 1, 1],
+    \\  "n_group": 1, "n_routed_experts": 256, "n_shared_experts": null, "norm_topk_prob": true,
+    \\  "num_attention_heads": 64, "num_experts_per_tok": 8, "num_hidden_layers": 6,
+    \\  "num_key_value_heads": 4, "num_nextn_predict_layers": 3, "partial_rotary_factor": 0.334,
+    \\  "rope_parameters": {"partial_rotary_factor": 0.334, "rope_theta": 10000000.0, "rope_type": "default"},
+    \\  "rope_theta": 10000000.0, "routed_scaling_factor": null, "scoring_func": "sigmoid",
+    \\  "sliding_window": 128, "swa_head_dim": 192, "swa_num_attention_heads": 64,
+    \\  "swa_num_key_value_heads": 8, "swa_rope_theta": 10000.0, "swa_v_head_dim": 128,
+    \\  "tie_word_embeddings": false, "topk_group": 1, "topk_method": "noaux_tc",
+    \\  "v_head_dim": 128, "vocab_size": 152576,
+    \\  "quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"},
+    \\  "quantization_config": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    \\}
+;
+
+test "ModelConfig: mimo_v2 pack config parse" {
+    const config = try parseConfigFromJson(testing.allocator, mimo_v2_pack_json);
+    try testing.expectEqualStrings("mimo_v2", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expect(!config.norm_has_offset and !config.scale_embeddings and !config.has_pre_ff_norm and !config.has_qk_norm);
+    try testing.expectEqual(QuantMode.mxfp4, config.quant_mode);
+    // Experts: sigmoid scores, selection-only bias, renormalized top-8; layer 0 dense.
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 2048), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 1), config.first_k_dense_replace);
+    try testing.expect(config.moe_sigmoid_router and config.moe_route_norm);
+    try testing.expectEqual(@as(f32, 1.0), config.router_scaling_factor);
+    // Pattern 0 = global (4 KV heads, theta 1e7), 1 = sliding (8 KV heads, theta 1e4, sinks).
+    try testing.expect(config.isGlobalLayer(0) and !config.isGlobalLayer(1) and config.isGlobalLayer(5));
+    try testing.expectEqual(@as(u32, 4), config.layerKVHeads(0));
+    try testing.expectEqual(@as(u32, 8), config.layerKVHeads(1));
+    try testing.expectEqual(@as(u32, 128), config.sliding_window);
+    try testing.expect(config.has_attn_sinks);
+    try testing.expectEqual(@as(f32, 1e7), config.rope_theta);
+    try testing.expectEqual(@as(f32, 1e4), config.rope_local_base_freq);
+    // K 192 / V 128; rope covers int(192 * 0.334) = 64 dims; scale on the 192-wide key.
+    try testing.expectEqual(@as(u32, 192), config.layerHeadDim(1));
+    try testing.expectEqual(@as(u32, 128), config.layerVHeadDim(1));
+    try testing.expectEqual(@as(u32, 64), config.layerRopeDims(0));
+    try testing.expectEqual(@as(u32, 64), config.layerRopeDims(1));
+    try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
+    // V is scaled before caching, at runtime, as mlx-lm does.
+    try testing.expectEqual(@as(f32, 0.707), config.attention_value_scale);
+    // KV per token: the global layers only; a sliding layer holds a bounded ring of rows.
+    try testing.expectEqual(@as(u64, 2 * 4 * (192 + 128) * 2), config.kvBytesPerToken());
+    try testing.expectEqual(@as(u64, 4 * 8 * (192 + 128) * 2), config.slidingRowBytes());
+    try testing.expectEqual(@as(u32, 128 + ModelConfig.SLIDING_RING_SLACK), config.slidingKeepRows());
+}
+
+/// GLM-5.3-Flash (TensorFold's MLX packs), layers trimmed to 8.
+const glm5_next_pack_json =
+    \\{
+    \\  "model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"],
+    \\  "tie_word_embeddings": false,
+    \\  "text_config": {
+    \\    "model_type": "glm5_next_text", "vocab_size": 154880, "hidden_size": 4096,
+    \\    "intermediate_size": 12288, "moe_intermediate_size": 2048, "num_hidden_layers": 8,
+    \\    "num_nextn_predict_layers": 1, "num_attention_heads": 64, "num_key_value_heads": 64,
+    \\    "n_shared_experts": 1, "n_routed_experts": 288, "routed_scaling_factor": 2.5,
+    \\    "kv_lora_rank": 512, "q_lora_rank": 1536, "qk_rope_head_dim": 0, "v_head_dim": 256,
+    \\    "qk_nope_head_dim": 256, "qk_head_dim": 256, "head_dim": 0, "n_group": 1, "topk_group": 1,
+    \\    "num_experts_per_tok": 8, "norm_topk_prob": true, "max_position_embeddings": 1048576,
+    \\    "rms_norm_eps": 1e-05, "eos_token_id": [154820, 154827, 154829], "pad_token_id": 154820,
+    \\    "mlp_layer_types": ["dense", "dense", "dense", "sparse", "sparse", "sparse", "sparse", "sparse"],
+    \\    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention",
+    \\                    "linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention"],
+    \\    "indexer_types": ["full", "full", "full", "full", "full", "full", "full", "full"],
+    \\    "index_topk": 2048, "index_head_dim": 128, "index_n_heads": 32, "index_kpool": 4,
+    \\    "index_kpool_always_select_tail": true, "index_kpool_compress": true, "mla_use_nope": true,
+    \\    "swiglu_limit": 10.0, "hc_mult": 4, "hc_eps": 1e-06, "hc_sinkhorn_iters": 20, "mhc": true,
+    \\    "first_k_dense_replace": 3, "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+    \\    "moe_router_dtype": "float32",
+    \\    "linear_attn_config": {"num_heads": 64, "head_dim": 128, "gate_lower_bound": -5.0,
+    \\                           "short_conv_kernel_size": 4, "full_attn_layers": [3, 7]}
+    \\  },
+    \\  "vision_config": {"model_type": "glm5_next_vision", "depth": 24}
+    \\}
+;
+
+test "ModelConfig: glm5_next binds KDA, sparse latent attention, mHC and the clamped SwiGLU" {
+    var config = try parseConfigFromJson(testing.allocator, glm5_next_pack_json);
+    defer config.deinit(testing.allocator);
+    try testing.expect(config.isGlm5());
+    // Its indexer rows carry pooled keys: an older SSD cache root never restores into it.
+    try testing.expectEqualStrings("glm5-pooled-keys-v1", config.cacheLayoutNamespace().?);
+    try testing.expect(!config.isMla());
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    // Layers 3 and 7 are sparse attention, the rest KDA.
+    try testing.expect(config.isLinearLayer(0) and config.isLinearLayer(2) and !config.isLinearLayer(3) and !config.isLinearLayer(7));
+    try testing.expectEqual(@as(u32, 2), config.attnCacheLayerCount());
+    try testing.expectEqual(@as(u32, 64), config.linear_num_key_heads);
+    try testing.expectEqual(@as(u32, 128), config.linear_key_head_dim);
+    try testing.expect(config.kda_vector_gate and config.kda_sigmoid_out_gate and config.kdaUsesBoundedGate());
+    try testing.expectEqual(@as(f32, -5.0), config.kda_gate_lower_bound);
+    try testing.expectEqual(@as(u32, 1536), config.dsa_q_lora_rank);
+    try testing.expectEqual(@as(u32, 512), config.dsa_kv_lora_rank);
+    try testing.expectEqual(@as(u32, 256), config.dsa_head_dim);
+    try testing.expectEqual(@as(u32, 2048), config.dsa_index_topk);
+    try testing.expectEqual(@as(u32, 4), config.dsa_index_kpool);
+    try testing.expectEqual(@as(u32, 32), config.dsa_index_heads);
+    try testing.expectEqual(@as(u32, 128), config.dsa_index_head_dim);
+    try testing.expectEqual(@as(u32, 4), config.dsv4_hc_mult);
+    try testing.expectEqual(@as(u32, 20), config.dsv4_hc_sinkhorn_iters);
+    try testing.expect(config.swiglu_clamp);
+    try testing.expectEqual(@as(f32, 10.0), config.swiglu_limit);
+    try testing.expectEqual(@as(u32, 288), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 3), config.first_k_dense_replace);
+    try testing.expectEqual(@as(u32, 2048), config.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(f32, 2.5), config.router_scaling_factor);
+    try testing.expect(config.moe_sigmoid_router and config.moe_route_norm);
+    // Per sparse-attention layer per token: the 512 latent plus the indexer's key and gate.
+    try testing.expectEqual(@as(u64, 2 * (512 + 128 + 128) * 2), config.kvBytesPerToken());
+    try testing.expect(!config.has_vision);
+    // The template opens `<think>` on every assistant turn.
+    try testing.expect(config.defaultEnableThinking(false) and config.defaultEnableThinking(true));
+    // The reference keeps the KDA state in f32.
+    try testing.expectEqual(mlx.mlx_dtype.float32, config.ssmStateDtype());
+}
+
+test "ModelConfig: glm5_next refuses what it does not serve, by name" {
+    for ([_][]const u8{ "\"shared\", \"full\"", "\"full\", \"shared\"" }) |types| {
+        var buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"model_type\": \"glm5_next_text\", \"num_hidden_layers\": 2, \"kv_lora_rank\": 64, \"indexer_types\": [{s}]}}", .{types});
+        try testing.expectError(error.UnsupportedGlm5Config, parseConfigFromJson(testing.allocator, body));
+    }
+    try testing.expectError(error.UnsupportedGlm5Config, parseConfigFromJson(testing.allocator, "{\"model_type\": \"glm5_next_text\", \"num_hidden_layers\": 2, \"kv_lora_rank\": 64, \"qk_rope_head_dim\": 64}"));
+}
+
+test "ModelConfig: mimo_v2 source release is refused with the converter's name" {
+    // The release stores FP8 + per-expert MXFP4 (`quant_method: fp8`); mlx packs
+    // carry an mlx-style quantization_config and load.
+    const src = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json,
+        \\"quantization_config": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    ,
+        \\"quantization_config": {"quant_method": "fp8", "store_dtype": "mxfp4"}
+    );
+    defer testing.allocator.free(src);
+    try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, src));
+}
+
+test "ModelConfig: mimo_v2_flash (MiMo-V2-Flash, TensorFold/Vontra V2.6 packs) parses as mimo_v2" {
+    const flash = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json, "\"model_type\": \"mimo_v2\"", "\"model_type\": \"mimo_v2_flash\"");
+    defer testing.allocator.free(flash);
+    const config = try parseConfigFromJson(testing.allocator, flash);
+    try testing.expect(config.isMimo());
+    try testing.expectEqual(@as(f32, 0.707), config.attention_value_scale);
+    // MiMo-V2-Flash itself declares no V scale.
+    const v2 = try std.mem.replaceOwned(u8, testing.allocator, flash, "\"attention_value_scale\": 0.707,", "");
+    defer testing.allocator.free(v2);
+    try testing.expectEqual(@as(f32, 1.0), (try parseConfigFromJson(testing.allocator, v2)).attention_value_scale);
 }
 
 test "ModelConfig: gpt_oss (OpenAI gpt-oss-20b) config parse" {

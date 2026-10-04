@@ -848,3 +848,26 @@ has tools and otherwise pass the text through.
 Fix: the non-stream split keeps markup when the request has no tools (chat,
 messages, responses), matching the stream and the other engines.
 Guard: `tests/test_no_tools_markup_passthrough.sh`.
+
+## Tool results were rewritten into user turns on a generic role header (MiMo, 2026-10-02)
+
+MiMo-V2.6's template renders every non-assistant turn as
+`<|im_start|>{{ message.role }}`, so it never spells `'tool'`. Our literal
+check read that as "no tool role" and rewrote each tool result into a user
+turn wrapped in `<tool_response>`, a format the model was not trained on.
+
+Cause: `templateReferencesToolRole` looked for the `'tool'` string only.
+
+Fix: a template that renders assistant `tool_calls` but names no tool role is
+probe-rendered with one tool message (`templateRendersToolTurn`); when its
+content survives, tool turns render natively. Templates without tool-call
+support keep the rewrite.
+Guard: `renderChatTemplate: a tool-aware template with a generic role header
+renders tool turns natively` in `chat.zig`.
+
+## jinja.cpp read `x.0` as a name, and GLM-5 tool history fell back
+
+GLM-5.3-Flash's template renders tool-call history through `tc.arguments.items()` reached via an integer property (`obj.0`). jinja.cpp parsed the `0` after the dot as an identifier, the lookup raised, and every conversation with a tool turn went to the generic fallback: the model saw Gemma-style turns, wrote `<end_of_turn>` into its reply and lost its own stop token.
+
+Fix: `parser.cpp` marks a member access whose property is an integer literal as computed, so `x.0` indexes like `x[0]`.
+Guard: the GLM tool-history render test in `chat.zig` (native `<tool_call>` turns, no fallback markers) and `tests/test_glm5_next.sh` [4].

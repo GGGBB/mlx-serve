@@ -288,5 +288,62 @@ else
 fi
 echo ""
 
+# ── Test G: a reader that lags the end of the stream gets EOF, not a reset ──
+# The SSE body ends when the server closes. A socket closed under a reader that
+# has not caught up is dropped by the kernel with an RST once its FIN_WAIT_2
+# timer runs out (net.inet.tcp.fin_timeout, 60 s), so the client read the whole
+# body and then ECONNRESET instead of EOF. The reader here waits out that timer
+# after the server has finished (this test takes over a minute).
+echo "--- Test G: tools + reasoning budget — a lagging reader ends with EOF, not a reset ---"
+G_OUT=$(python3 - "$PORT" <<'PY'
+import json, socket, subprocess, sys, time
+
+port = int(sys.argv[1])
+fin_timeout = int(subprocess.check_output(["sysctl", "-n", "net.inet.tcp.fin_timeout"]).strip()) / 1000
+body = json.dumps({
+    "model": "mlx-serve",
+    "input": "What is the weather in Paris? Think about which unit to use first.",
+    "tools": [{"type": "function", "name": "get_weather", "description": "Get the current weather for a city",
+               "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
+    "reasoning": {"effort": "high"}, "reasoning_budget_tokens": 24,
+    "max_output_tokens": 512, "temperature": 0, "stream": True,
+}).encode()
+sock = socket.create_connection(("127.0.0.1", port))
+sock.sendall((f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+              f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body)
+client_port = sock.getsockname()[1]
+
+def server_closed():
+    rows = subprocess.run(["netstat", "-an", "-p", "tcp"], capture_output=True, text=True).stdout.splitlines()
+    return any(len(c) >= 6 and c[3].endswith(f".{port}") and c[4].endswith(f".{client_port}") and c[5] == "FIN_WAIT_2"
+               for c in (r.split() for r in rows))
+
+deadline = time.time() + 180
+while time.time() < deadline and not server_closed():
+    time.sleep(1)
+time.sleep(fin_timeout + 5)
+
+data, end = b"", "eof"
+try:
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+except ConnectionResetError:
+    end = "reset"
+text = data.decode("utf-8", errors="replace")
+print(f"g end={end} completed={int('response.completed' in text)} done={int('data: [DONE]' in text)} "
+      f"budget_closed={int('Considering the limited time' in text)} bytes={len(data)}")
+PY
+) || G_OUT="g end=exception"
+echo "  $G_OUT"
+if echo "$G_OUT" | grep -q "end=eof completed=1 done=1"; then
+    run_test "lagging reader: whole body, then EOF" "PASS" ""
+else
+    run_test "lagging reader: whole body, then EOF" "FAIL" "$G_OUT"
+fi
+echo ""
+
 echo "=== Result: $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ]

@@ -152,6 +152,9 @@ pub const ChatConfig = struct {
     /// only when a request names neither (`server.resolveChatThinking`).
     default_enable_thinking: ?bool = null,
     default_reasoning_effort: ?[]const u8 = null,
+    /// `templateRendersToolTurn` for this template, probed ONCE at load (a probe render
+    /// per request is a second parse of a multi-KB template); null = unknown, probe.
+    renders_tool_turn: ?bool = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
@@ -246,21 +249,24 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
     {   // no "default" named: fall back to the first usable entry
-        const json = \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
+        const json =
+            \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
     {   // the ordinary string shape is untouched
-        const json = \\{"chat_template":"BARE"}
+        const json =
+            \\{"chat_template":"BARE"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
     {   // junk shapes return null so the caller uses its jinja/family fallback
-        const json = \\{"chat_template":[{"name":"x"},{"nope":1}]}
+        const json =
+            \\{"chat_template":[{"name":"x"},{"nope":1}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -274,21 +280,24 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         // taking the pointer literally fails the render and SILENTLY drops to
         // the generic fallback — wrong-family markers the model then echoes.
         // Read it as "no inline template" so the sidecar file is used.
-        const json = \\{"chat_template":"{% include 'chat_template.jinja' %}"}
+        const json =
+            \\{"chat_template":"{% include 'chat_template.jinja' %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
     {   // whitespace/dash variants are the same pointer
-        const json = \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
+        const json =
+            \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
     {   // a real template that merely CONTAINS the word include is untouched
-        const json = \\{"chat_template":"{% if x %}include{% endif %}"}
+        const json =
+            \\{"chat_template":"{% if x %}include{% endif %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -358,12 +367,14 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     else
         false;
 
+    const renders_tool_turn: ?bool = templateRendersToolTurn(allocator, chat_template) catch null;
     return .{
         .chat_template = chat_template,
         .bos_token = bos_token,
         .eos_token = eos_token,
         .add_bos_token = add_bos_token,
         .allocator = allocator,
+        .renders_tool_turn = renders_tool_turn,
     };
 }
 
@@ -384,7 +395,6 @@ pub fn formatChat(
 ) ![]u32 {
     const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
-
 
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
@@ -614,9 +624,11 @@ fn renderChatTemplate(
     // form so the model still sees the tool context.
     const tpl = chat_config.chat_template;
     const tpl_has_tools = std.mem.indexOf(u8, tpl, "tools") != null;
-    const tpl_has_tool_role = templateReferencesToolRole(tpl);
+    const has_tool_content = messagesHaveToolContent(msgs);
+    const tpl_has_tool_role = templateReferencesToolRole(tpl) or
+        (has_tool_content and (chat_config.renders_tool_turn orelse try templateRendersToolTurn(allocator, tpl)));
     const needs_inject_tools = tools_json != null and !tpl_has_tools;
-    const needs_rewrite_tool_role = !tpl_has_tool_role and messagesHaveToolContent(msgs);
+    const needs_rewrite_tool_role = !tpl_has_tool_role and has_tool_content;
 
     var fallback_arena: ?std.heap.ArenaAllocator = null;
     defer if (fallback_arena) |*a| a.deinit();
@@ -816,6 +828,20 @@ fn templateReferencesToolRole(tpl: []const u8) bool {
         if (std.mem.indexOf(u8, tpl, p) != null) return true;
     }
     return false;
+}
+
+/// A template that renders tool CALLS but names no 'tool' role (MiMo's generic
+/// `<|im_start|>{{ role }}` header) was trained on tool turns: probe-render one
+/// and keep it native when its content survives.
+fn templateRendersToolTurn(allocator: std.mem.Allocator, tpl: []const u8) !bool {
+    if (std.mem.indexOf(u8, tpl, "tool_calls") == null) return false;
+    const marker = "__mlx_serve_tool_turn_probe__";
+    const tpl_z = try allocator.dupeSentinel(u8, tpl, 0);
+    defer allocator.free(tpl_z);
+    var len: usize = 0;
+    const out = jinja_c.jinja_render_chat(tpl_z.ptr, "[{\"role\":\"tool\",\"content\":\"" ++ marker ++ "\"}]", null, "{}", 0, &len) orelse return false;
+    defer jinja_c.jinja_str_free(out);
+    return std.mem.indexOf(u8, out[0..len], marker) != null;
 }
 
 /// True if any message has `role: "tool"` or an assistant message with tool_calls.
@@ -1162,6 +1188,14 @@ pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
     return "low";
 }
 
+/// OpenAI's effort vocabulary -> GLM-5-Next's low|high|max (the template's default is max).
+fn glm5EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "max";
+    if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) return "low";
+    if (std.mem.eql(u8, e, "medium") or std.mem.eql(u8, e, "high")) return "high";
+    return "max";
+}
+
 /// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
 /// raise_exception's on any other string and its own default is xhigh, so an
 /// absent or unrecognized effort keeps the checkpoint default. Thinking-off
@@ -1300,6 +1334,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     } else if (qwen38_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, qwen38EffortFor(effort, enable_thinking));
+        try buf.append(allocator, '"');
+    } else if (std.mem.indexOf(u8, chat_config.chat_template, "reasoning_effort in ['low', 'high']") != null) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, glm5EffortFor(effort));
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
@@ -2926,13 +2964,22 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         // 14185 decode to exactly `<funct`); omitting that one rung flushed the
         // fragment and leaked the rest of the tag. The rungs are DERIVED in the
         // test, so a future gap fails there instead of shipping.
-        "<f", "<fu", "<fun", "<func", "<funct", "<functi", "<functio", "<function",
+        "<f",
+        "<fu",      "<fun",      "<func",     "<funct",     "<functi",
+        "<functio", "<function",
         // Muse ATEM (a fused multi-char BPE fragment can end mid-marker)
-        "<a", "<at", "<ate", "<atem", "<atem:",
+        "<a",        "<at",        "<ate",
+        "<atem",    "<atem:",
         // DSML fullwidth-bar prefixes (`｜` = 3 bytes; cover mid-codepoint
         // splits too in case the tokenizer spells the marker in pieces)
-        "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
-        "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
+           "<\xef",     "<\xef\xbd",
+        "<｜",
+        "<｜D",
+        "<｜DS",
+        "<｜DSM",
+        "<｜DSML",
+        "<｜DSML\xef",
+        "<｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -3368,10 +3415,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         }
         // Gemma 4 close marker: `<tool_call|>`. Detected when after `<tool`
         // we see `_call|`. Let the Gemma 4 branch below pick this up.
-        if (next == '_'
-            and after_tool + 6 <= effective_text.len
-            and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|"))
-        {
+        if (next == '_' and after_tool + 6 <= effective_text.len and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|")) {
             search_pos = after_tool + 6;
             continue;
         }
@@ -7144,8 +7188,7 @@ test "collapseDoubledThinkTags leaves single </think> unchanged" {
 }
 
 test "collapseDoubledThinkTags handles multiple separated doublings" {
-    const out = try collapseDoubledThinkTags(testing.allocator,
-        "A</think></think>B</think></think>C");
+    const out = try collapseDoubledThinkTags(testing.allocator, "A</think></think>B</think></think>C");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("A</think>B</think>C", out);
 }
@@ -9536,6 +9579,31 @@ test "appendJsonString escapes ALL control characters (2026-06-11 ESC-byte regre
     try testing.expectEqualStrings(&input, parsed.value.string);
 }
 
+test "renderChatTemplate: a tool-aware template with a generic role header renders tool turns natively" {
+    // MiMo's template names no 'tool' literal: every non-assistant turn is
+    // `<|im_start|>{{ role }}`. It renders tool CALLS, so tool results are its
+    // own turns; a template that renders no tool calls keeps the rewrite.
+    const a = testing.allocator;
+    const generic = "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}" ++
+        "{%- if m.tool_calls is defined and m.tool_calls -%}{%- for tc in m.tool_calls -%}<tool_call>{{ tc.function.name }}</tool_call>{%- endfor -%}{%- endif -%}<|im_end|>{%- endfor -%}";
+    const calls = [_]ToolCall{.{ .id = "c1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Weather?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "18C", .tool_call_id = "c1" },
+    };
+    var config = ChatConfig{ .chat_template = generic, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+    const native = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(native);
+    try testing.expect(std.mem.indexOf(u8, native, "<|im_start|>tool\n18C<|im_end|>") != null);
+    try testing.expect(std.mem.indexOf(u8, native, "<tool_response>") == null);
+
+    config.chat_template = "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{%- endfor -%}";
+    const plain = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "<|im_start|>user\n<tool_response>\n18C\n</tool_response>") != null);
+}
+
 test "renderChatTemplate: tool result with raw ANSI escapes still renders via Jinja" {
     // Regression for the 2026-06-11 pi/gemma-4-31b session: the third request
     // was the first whose history held a tool result with a raw ESC byte (the
@@ -9862,8 +9930,7 @@ test "templateConsumesEffort: the real templates that READ the effort word" {
     try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
     // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, laguna, Ling,
     // Nemotron, llama, mistral) reads neither: thinking is a bool there.
-    try testing.expect(!templateConsumesEffort(
-        "{%- if enable_thinking %}<think>\n{%- endif %}"));
+    try testing.expect(!templateConsumesEffort("{%- if enable_thinking %}<think>\n{%- endif %}"));
     try testing.expect(!templateConsumesEffort(""));
 }
 
@@ -10079,6 +10146,34 @@ test "serializeExtraContext with thinking disabled" {
     const result = try serializeExtraContext(allocator, &config, false, null);
     defer allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":false") != null);
+}
+
+test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
+    // The template reads low|high and renders anything else as Max.
+    const allocator = testing.allocator;
+    var glm = ChatConfig{
+        .chat_template = @embedFile("fixtures/glm5_next_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const cases = [_]struct { in: ?[]const u8, out: []const u8 }{
+        .{ .in = null, .out = "max" },
+        .{ .in = "none", .out = "low" },
+        .{ .in = "minimal", .out = "low" },
+        .{ .in = "low", .out = "low" },
+        .{ .in = "medium", .out = "high" },
+        .{ .in = "high", .out = "high" },
+        .{ .in = "xhigh", .out = "max" },
+        .{ .in = "max", .out = "max" },
+    };
+    for (cases) |c| {
+        const r = try serializeExtraContext(allocator, &glm, true, c.in);
+        defer allocator.free(r);
+        var want: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
+    }
 }
 
 test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max" {
@@ -11756,8 +11851,10 @@ const adversarial_strings = [_][]const u8{
     "false",      "true",         "False",   "True",    "null",   "None",
     "42",         "-7",           "3.14",    "0",       "1",      "",
     "[1,2]",      "{\"k\":1}",    "nan",     "inf",     "  ",     "yes",
-    "a\"b",       "line\nline",   "tab\there", "back\\slash", "café ☕", "0x1f",
-    "{not json",  "[unclosed",    "1e400",   "00",      "+5",     "-",
+    "a\"b",  "line\nline", "tab\there", "back\\slash",
+    "café ☕",
+    "0x1f",  "{not json",  "[unclosed", "1e400",       "00",   "+5",
+    "-",
 };
 
 test "fuzz: a conforming tool call round-trips byte-identical through parse+coerce" {
@@ -11822,8 +11919,7 @@ test "fuzz: a conforming tool call round-trips byte-identical through parse+coer
 
         // Serialize as a canonical Hermes JSON call — always VALID input.
         const args_json = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = args }, .{});
-        const raw = try std.fmt.allocPrint(arena,
-            "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
+        const raw = try std.fmt.allocPrint(arena, "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
 
         const calls = (try parseToolCalls(allocator, raw)) orelse {
             std.debug.print("\n[fuzz iter {d}] valid tool call did not parse\n  {s}\n", .{ iter, raw });
@@ -13806,7 +13902,6 @@ test "streamContentLead never touches whitespace inside the answer" {
     try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", false));
 }
 
-
 test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} (never a fragment)" {
     // A 4 KB edit call that hit EOS inside a string value. The object never
     // balances, so the balanced-snap arm declines; without a name salvage the
@@ -14781,4 +14876,20 @@ test "answerStopIndex: a stop after trailing whitespace in the answer still cuts
     try t.expectEqual(@as(?usize, std.mem.indexOf(u8, hard_break, "  \n").? + 2), answerStopIndex(hard_break, 0, "\n", true));
     // Whitespace leading the answer is never delivered, so it never matches.
     try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
+}
+
+test "renderChatTemplate: GLM-5-Next tool history renders natively (jinja `obj.0` is `obj[0]`)" {
+    // The template probes `m.content.0.output`; jinja.cpp refused a numeric attribute and the
+    // whole turn fell back to the generic format, which the model answered with `<end_of_turn>`.
+    const cfg = ChatConfig{ .chat_template = @embedFile("fixtures/glm5_next_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const calls = [_]ToolCall{.{ .id = "a", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "{\"temp_c\": 21}", .tool_call_id = "a" },
+    };
+    const out = try renderChatTemplate(testing.allocator, &messages, &cfg, null, null, true, null, false);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<|observation|><tool_response>{\"temp_c\": 21}</tool_response><|assistant|><think>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<start_of_turn>") == null);
 }

@@ -377,19 +377,6 @@ final class MusicGenService: ObservableObject {
     /// Slug + dated `.wav` path under `musicRoot`, mirroring the audio output
     /// layout. `internal static` so a unit test can pin the slug contract.
     nonisolated static func makeOutputPath(prompt: String) -> String {
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd"
-        let day = df.string(from: Date())
-        let dayDir = (MediaStorage.musicRoot as NSString).appendingPathComponent(day)
-        try? FileManager.default.createDirectory(atPath: dayDir, withIntermediateDirectories: true)
-        let tf = DateFormatter()
-        tf.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let slug = prompt
-            .lowercased()
-            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-            .prefix(40)
-        let filename = "\(tf.string(from: Date()))_\(slug).wav"
-        return (dayDir as NSString).appendingPathComponent(filename)
+        MediaStorage.datedPath(root: MediaStorage.musicRoot, prompt: prompt, ext: "wav")
     }
 }

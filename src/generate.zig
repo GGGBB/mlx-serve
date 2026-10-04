@@ -15,6 +15,8 @@ const pld_index = @import("pld_index.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const mimo_mtp = @import("mimo_mtp.zig");
+const glm_mtp = @import("glm_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const round_cost = @import("round_cost.zig");
 const group_cost = @import("mtp_group_cost.zig");
@@ -42,6 +44,9 @@ const KVCache = transformer_mod.KVCache;
 /// `serve()` runs. Per-request reads happen on the same thread that did the
 /// CLI parse, so no atomicity needed.
 pub var prefill_chunk_override: usize = 8192;
+/// Default chunk of an arch that builds no prefill score tensor (score width 0):
+/// only its MoE gather transient grows with the chunk, and the guard bills that.
+pub const WIDE_PREFILL_CHUNK: usize = 16384;
 
 /// Set by `--prefill-chunk` in main.zig. An operator-chosen width outranks the
 /// per-model chunk the memory sizer pins (`ModelConfig.pinned_prefill_chunk`);
@@ -224,10 +229,11 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     // the widest chunk whose one-off transient reserve still leaves this box a
     // real KV budget. It NARROWS, never raises, and an explicit
     // `--prefill-chunk` outranks it — the operator asked for a width.
+    const launch: usize = if (head_dim == 0 and !prefill_chunk_explicit) WIDE_PREFILL_CHUNK else prefill_chunk_override;
     const base: usize = if (prefill_chunk_explicit or pinned_chunk == 0)
-        prefill_chunk_override
+        launch
     else
-        @min(prefill_chunk_override, pinned_chunk);
+        @min(launch, pinned_chunk);
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
@@ -297,12 +303,19 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// gate, `mtpBatchedAcceptGraph`, the pre-draft and the horizon valve all work
 /// in tokens and probabilities — so the split is exactly these five operations
 /// and nothing else.
+/// Most drafts one MTP round verifies: the head chain or a prompt-lookup run.
+const MAX_ROUND_DRAFTS: usize = @max(mtp_mod.MAX_DEPTH, mtp_lookup.MAX_DRAFT_STRONG);
+
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
     /// qwen4_exp: the head and its history live on the Transformer
     /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
     /// (pre-mixer stream at position r, token r+1), query position r+1.
     qwen4: *Transformer,
+    /// mimo_v2: the checkpoint's own heads; per-request rows live in `mimo_mtp.State`.
+    mimo: *mimo_mtp.Head,
+    /// glm5_next: the checkpoint's `mtp.0` NextN layer; per-request state is a one-layer `KVCache`.
+    glm: *glm_mtp.Head,
 
     /// Is this head's decode state module-owned (one per model, `Qwen4Mtp.cache`) rather
     /// than per-request? Both the scheduler and the sticky-serial arm ask this.
@@ -310,7 +323,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => false,
             // Per-request state swaps onto the module (`Qwen4MtpState`); nothing is shared.
-            .qwen4 => false,
+            .qwen4, .mimo, .glm => false,
         };
     }
 
@@ -324,6 +337,8 @@ pub const MtpHeadRef = union(enum) {
                 t.qwen4MtpActivate(st);
                 break :blk .{ .qwen4 = .{ .t = t, .st = st, .allocator = allocator } };
             },
+            .mimo => |h| .{ .mimo = .{ .st = try h.newState(allocator) } },
+            .glm => |h| .{ .glm = try h.makeCache(allocator) },
         };
     }
 
@@ -348,7 +363,9 @@ pub const MtpHeadRef = union(enum) {
     /// One head forward over L positions. `.logits` returns the LAST row only,
     /// on both arms. `.mixed` asks for the lm_head's INPUT vector instead: on
     /// the sidecar that is `hidden_next` and nothing extra is produced, on
-    /// qwen4_exp it is the mixer output, returned in `rerank_x`.
+    /// qwen4_exp it is the mixer output, returned in `rerank_x`. `host_ids` are
+    /// `id_arr`'s values when it carries committed rows (null on a chained draft
+    /// step); the MiMo arm keeps them on the host.
     pub fn forward(
         self: MtpHeadRef,
         target: *Transformer,
@@ -358,8 +375,11 @@ pub const MtpHeadRef = union(enum) {
         rope_offset: c_int,
         want: mtp_mod.StepWant,
         mrope_ctx: ?mtp_mod.MropeContext,
+        host_ids: ?[]const u32,
     ) !mtp_mod.StepOut {
         return switch (self) {
+            .mimo => |h| mimoStep(h, target, &cache.mimo, id_arr, hidden, @intCast(rope_offset), want, host_ids),
+            .glm => |h| h.forward(target, &cache.glm, id_arr, hidden, want),
             .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want == .logits, mrope_ctx),
             .qwen4 => |t| blk: {
                 cache.activate();
@@ -371,7 +391,7 @@ pub const MtpHeadRef = union(enum) {
     /// One draft row past a padded history append (`Transformer.HeadPlace`); qwen4 only.
     pub fn forwardPlaced(self: MtpHeadRef, cache: *MtpCacheRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, place: *const Transformer.HeadPlace, want: mtp_mod.StepWant) !mtp_mod.StepOut {
         const t = switch (self) {
-            .qwen => return error.MtpPlacement,
+            .qwen, .mimo, .glm => return error.MtpPlacement,
             .qwen4 => |t| t,
         };
         cache.activate();
@@ -382,6 +402,37 @@ pub const MtpHeadRef = union(enum) {
         };
         const out = try t.qwen4MtpForwardPlaced(hidden, id_arr, place, project);
         return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
+    }
+
+    /// MiMo heads chain no hidden: a step carrying committed rows (`host_ids`) opens
+    /// the round at head 0, each later step runs the next head on its draft.
+    /// `hidden_next` hands the trunk hidden on unchanged.
+    fn mimoStep(h: *mimo_mtp.Head, target: *Transformer, ref: *MtpCacheRef.MimoRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: usize, want: mtp_mod.StepWant, host_ids: ?[]const u32) !mtp_mod.StepOut {
+        var hidden_next = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(hidden_next);
+        try mlx.check(mlx.mlx_array_set(&hidden_next, hidden));
+        if (want == .none) {
+            try h.appendHistory(target, ref.st, host_ids orelse return error.MimoMtpNeedsHostIds, hidden, rope_offset);
+            return .{ .logits = .{ .ctx = null }, .hidden_next = hidden_next };
+        }
+        const step_i: usize = if (host_ids == null) ref.next_step else 0;
+        const last = if (host_ids) |ids|
+            try h.draftStep(target, ref.st, 0, null, ids, hidden, rope_offset)
+        else
+            try h.draftStep(target, ref.st, step_i, id_arr, &.{}, null, rope_offset);
+        ref.next_step = step_i + 1;
+        if (want == .mixed) return .{ .logits = .{ .ctx = null }, .hidden_next = hidden_next, .rerank_x = last };
+        defer _ = mlx.mlx_array_free(last);
+        return .{ .logits = try target.lmHeadForDraft(last), .hidden_next = hidden_next };
+    }
+
+    /// Deepest draft the head can make: a MiMo draft past its last head re-runs
+    /// that head at the same position and is never accepted.
+    pub fn maxDepth(self: MtpHeadRef) u32 {
+        return switch (self) {
+            .mimo => |h| @intCast(h.heads),
+            .qwen, .qwen4, .glm => std.math.maxInt(u32),
+        };
     }
 
     /// Append committed history without projecting logits.
@@ -397,6 +448,8 @@ pub const MtpHeadRef = union(enum) {
     ) !void {
         switch (self) {
             .qwen => |h| try mtp_mod.appendHistoryWithMrope(h, target, &cache.qwen, token_ids, hidden, rope_offset, mrope_ctx),
+            .mimo => |h| try h.appendHistory(target, cache.mimo.st, token_ids, hidden, @intCast(rope_offset)),
+            .glm => |h| try h.appendHistory(target, &cache.glm, token_ids, hidden),
             .qwen4 => |t| {
                 const ids_i32 = try allocator.alloc(i32, token_ids.len);
                 defer allocator.free(ids_i32);
@@ -421,6 +474,8 @@ pub const MtpHeadRef = union(enum) {
             // Transformer is still under construction and its lm_head — the
             // very weight the coarse head is a copy of — is not assigned yet.
             .qwen4 => |t| t.qwen4DraftRerankReady(),
+            .mimo => |h| h.canRerankDrafts(),
+            .glm => |h| h.canRerankDrafts(),
         };
     }
 
@@ -436,6 +491,8 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftSelect(x, suppress_mask),
+            .mimo => |h| h.draftSelect(target, x, suppress_mask),
+            .glm => |h| h.draftSelect(target, x, suppress_mask),
         };
     }
 
@@ -451,6 +508,8 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftShortlist(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftShortlist(x, suppress_mask),
+            .mimo => |h| h.draftShortlist(target, x, suppress_mask),
+            .glm => |h| h.draftShortlist(target, x, suppress_mask),
         };
     }
 
@@ -459,6 +518,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftSelectBatched(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftSelectBatched(x, suppress_mask),
+            .mimo, .glm => mtp_mod.fullReadoutArgmax(target.s, target, x, suppress_mask),
         };
     }
 
@@ -467,6 +527,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftShortlistsBatched(target, x, suppress_mask, out),
             .qwen4 => |t| t.qwen4DraftShortlistsBatched(x, suppress_mask, out),
+            .mimo, .glm => mtp_mod.exactShortlistsBatched(target.s, target, x, suppress_mask, out),
         };
     }
 
@@ -479,6 +540,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.m5NaxCostProfile(target),
             .qwen4 => |t| mtp_mod.qwen4G17CostProfileForKv(t, kv),
+            .mimo, .glm => .generic,
         };
     }
 
@@ -489,6 +551,8 @@ pub const MtpHeadRef = union(enum) {
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {
             .qwen => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
+            .mimo => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
+            .glm => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
             .qwen4 => |t| blk: {
                 if (t.qwen4_mtp) |*m| {
                     if (m.ev_seed_accept) |a| break :blk .{ .accept = a, .m_lo = m.ev_seed_m_lo };
@@ -501,6 +565,14 @@ pub const MtpHeadRef = union(enum) {
     pub fn setEvSeed(self: MtpHeadRef, accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32) void {
         switch (self) {
             .qwen => |h| {
+                h.ev_seed_accept = accept;
+                h.ev_seed_m_lo = m_lo;
+            },
+            .mimo => |h| {
+                h.ev_seed_accept = accept;
+                h.ev_seed_m_lo = m_lo;
+            },
+            .glm => |h| {
                 h.ev_seed_accept = accept;
                 h.ev_seed_m_lo = m_lo;
             },
@@ -535,6 +607,12 @@ pub fn mtpHeadPersistEnabled() bool {
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
     qwen4: Qwen4Ref,
+    mimo: MimoRef,
+    /// The GLM head's one-layer latent + indexer cache, driven like `.qwen`.
+    glm: KVCache,
+
+    /// A MiMo request's head rows, and the draft step its next chained forward runs.
+    pub const MimoRef = struct { st: *mimo_mtp.State, next_step: usize = 0 };
 
     /// The in-checkpoint head plus this request's own half of it.
     pub const Qwen4Ref = struct { t: *Transformer, st: *transformer_mod.Transformer.Qwen4MtpState, allocator: std.mem.Allocator };
@@ -542,7 +620,7 @@ pub const MtpCacheRef = union(enum) {
     /// Install this request's state on the qwen4 head; no-op on the sidecar arm.
     pub fn activate(self: *const MtpCacheRef) void {
         switch (self.*) {
-            .qwen => {},
+            .qwen, .mimo, .glm => {},
             .qwen4 => |r| r.t.qwen4MtpActivate(r.st),
         }
     }
@@ -555,11 +633,12 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
-            .qwen => |*c| c.step,
+            .qwen, .glm => |*c| c.step,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk r.t.qwen4_mtp.?.seq_offset;
             },
+            .mimo => |r| r.st.step(),
         };
     }
 
@@ -568,18 +647,20 @@ pub const MtpCacheRef = union(enum) {
     /// pointer must also carry `head()`. Null when head persistence is off.
     pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
-            .qwen => |*c| c,
+            .qwen, .glm => |*c| c,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk if (mtpHeadPersistEnabled()) &r.t.qwen4_mtp.?.cache else null;
             },
+            // The heads only ever read the last window of rows, rebuilt from the uncached tail.
+            .mimo => null,
         };
     }
 
     /// The Transformer owning the in-checkpoint head; null on the sidecar arm and whenever `kv()` is null.
     pub fn head(self: *MtpCacheRef) ?*Transformer {
         return switch (self.*) {
-            .qwen => null,
+            .qwen, .mimo, .glm => null,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk if (mtpHeadPersistEnabled()) r.t else null;
@@ -589,21 +670,30 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
-            .qwen => |*c| try c.truncate(len, s),
+            .qwen, .glm => |*c| try c.truncate(len, s),
             .qwen4 => |r| {
                 r.t.qwen4MtpActivate(r.st);
                 try r.t.qwen4MtpTruncate(len);
+            },
+            .mimo => |*r| {
+                try r.st.truncate(s, len);
+                r.next_step = 0;
             },
         }
     }
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
-            .qwen => |*c| c.deinit(),
+            .qwen, .glm => |*c| c.deinit(),
             .qwen4 => |r| {
                 r.t.qwen4MtpRelease(r.st);
                 r.st.deinit();
                 r.allocator.destroy(r.st);
+            },
+            .mimo => |r| {
+                const allocator = r.st.allocator;
+                r.st.deinit();
+                allocator.destroy(r.st);
             },
         }
     }
@@ -613,11 +703,12 @@ pub const MtpCacheRef = union(enum) {
     /// across the whole prompt.
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
-            .qwen => |*c| c.appendEvalArrays(vec),
+            .qwen, .glm => |*c| c.appendEvalArrays(vec),
             .qwen4 => |r| {
                 r.t.qwen4MtpActivate(r.st);
                 r.t.qwen4_mtp.?.cache.appendEvalArrays(vec);
             },
+            .mimo => |r| r.st.appendEvalArrays(vec),
         }
     }
 };
@@ -1171,23 +1262,19 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
-/// Tokens of KV capacity this prefill reserves up front (#353): removes the grow transient a
-/// long prefill pays, at the price of allocating generation headroom early. Gated on
-/// `longCtxGated`; every other arch keeps proportional growth (`reserve_tokens` stays 0).
-/// `MLX_SERVE_KV_RESERVE=0` turns it off inside the gate. `server.prefillRequestTerms` bills it.
+/// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
+/// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
+/// cache; generation headroom is pre-bought only under `longCtxGated`. `MLX_SERVE_KV_RESERVE=0`
+/// turns it off.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
     max_tokens: u64,
     chunk: u64,
 ) u64 {
-    if (!config.longCtxGated()) return 0;
-    return transformer_mod.KVCache.reservedTokens(
-        seq,
-        max_tokens,
-        chunk,
-        config.max_position_embeddings,
-    );
+    const prompt = if (seq > chunk) seq +| chunk else 0;
+    if (!config.longCtxGated()) return prompt;
+    return @max(prompt, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
 }
 
 /// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
@@ -3311,7 +3398,7 @@ pub const Generator = struct {
                 .mtp_serial_accept = mtp_active and xfm.config.rowExactDecode() and std.meta.activeTag(options.mtp_acceptance) == .exact,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
-                .mtp_depth = resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile),
+                .mtp_depth = @min(resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile), if (options.mtp) |h| h.maxDepth() else std.math.maxInt(u32)),
                 .mtp_depth_free = if (xfm.mtp_depth_free != 0) xfm.mtp_depth_free else mtpDepthCapFree(xfm.config.mtpDepth(options.mtp_depth)),
                 .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
                 // Start at depth 1 and climb with evidence: the cheap depth
@@ -5911,6 +5998,8 @@ pub const Generator = struct {
     pub const MtpHistStash = struct {
         /// `[n]` int32 committed token ids: `[t1, drafts[0..accepted]]`.
         ids: mlx.mlx_array,
+        /// `ids` on the host.
+        host_ids: [MAX_ROUND_DRAFTS + 1]u32 = undefined,
         /// `[1, n, H]` trunk hiddens paired 1:1 with `ids` (a lazy concat of
         /// last_hidden + a verify-capture slice — the handle pins the ~90 KB
         /// parent until consumed, deliberately NOT a deep copy).
@@ -6510,7 +6599,7 @@ pub const Generator = struct {
         errdefer _ = mlx.mlx_array_free(live_end);
         const mc = &self.mtp_cache.?;
         try mc.truncate(off0, self.xfm.s);
-        const out = try self.mtp.?.forward(self.xfm, mc, ids, hidden, @intCast(off0), .none, null);
+        const out = try self.mtp.?.forward(self.xfm, mc, ids, hidden, @intCast(off0), .none, null, null);
         if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
         if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
         if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
@@ -6592,8 +6681,11 @@ pub const Generator = struct {
                     _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                     try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                 }
-                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx);
-            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx);
+                var merged_host: [MAX_ROUND_DRAFTS + 2]u32 = undefined;
+                @memcpy(merged_host[0..st.n], st.host_ids[0..st.n]);
+                merged_host[st.n] = chain.t1;
+                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx, merged_host[0 .. st.n + 1]);
+            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx, if (i == 0) &.{chain.t1} else null);
             errdefer {
                 if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
                 _ = mlx.mlx_array_free(step_out.hidden_next);
@@ -6939,6 +7031,10 @@ pub const Generator = struct {
             if (g.mtpMropeContext() != null) any_mrope = true;
             switch (g.mtp.?) {
                 .qwen4 => one_sidecar = false,
+                .mimo, .glm => {
+                    all_qwen4 = false;
+                    one_sidecar = false;
+                },
                 .qwen => |h| {
                     all_qwen4 = false;
                     if (h != gens[0].mtp.?.qwen) one_sidecar = false;
@@ -7609,6 +7705,7 @@ pub const Generator = struct {
             @intCast(st.off0),
             .none,
             self.mtpMropeContext(),
+            st.host_ids[0..st.n],
         );
         if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
         if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
@@ -8125,10 +8222,12 @@ pub const Generator = struct {
         // target is qwen3_5-family hybrid) rollback needs only the pre-verify
         // LENGTH (KV truncate is offset-only; the stale tail past it is
         // unreachable) plus the verify pass's per-position SSM capture, so no
-        // snapshot is taken at all. A hypothetical pure-attention target
-        // (ssm_entries == null) keeps the proven snapshot + re-forward path.
+        // snapshot is taken at all; nor on MiMo, whose attention-only trunk
+        // rolls back by the same truncate. Any other pure-attention target
+        // keeps the proven snapshot + re-forward path.
         const kv_step_snap = self.ctx.cache.step;
-        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null) null else try self.ctx.cache.snapshot();
+        const truncate_only = self.xfm.config.isMimo();
+        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null or truncate_only) null else try self.ctx.cache.snapshot();
         errdefer if (kv_snap) |*snap| snap.deinit();
         const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
@@ -8209,6 +8308,8 @@ pub const Generator = struct {
         self.ctx.ple_defer = true;
         self.ctx.pipeline_build = if (self.mtp_serial_accept) VERIFY_PIPELINE_LAYERS else 0;
         defer self.ctx.pipeline_build = 0;
+        self.ctx.spec_verify = true;
+        defer self.ctx.spec_verify = false;
         const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
@@ -8894,6 +8995,7 @@ pub const Generator = struct {
                 .off0 = mtp_off0,
                 .pad = pad,
             };
+            for (ids_i32, 0..) |id, idx| self.mtp_hist_stash.?.host_ids[idx] = @intCast(id);
         }
         if (tracing) {
             self.mtp_trace.add(.hist, ph.read());
@@ -8967,16 +9069,16 @@ pub const Generator = struct {
 
         var re_new_hidden = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(re_new_hidden);
-        if (gdn_captured) {
+        if (gdn_captured or xfm.config.isMimo()) {
             const accepted_len: usize = 1 + @as(usize, accepted);
-            // `truncate` overwrites cache.step with its length arg; on this
-            // family cache.step is a stale counter the model never reads
-            // (positioning is moe_seq_offset), so preserve the pre-verify
-            // value — keeps prefix-cache kv_step bookkeeping identical to
-            // the restore-based fallback (same rule as nextPld).
+            // `truncate` overwrites cache.step with its length arg. On a GDN
+            // trunk cache.step is a stale counter the model never reads
+            // (positioning is moe_seq_offset), so keep the pre-verify value
+            // (same rule as nextPld); MiMo's attention trunk keeps a LIVE step,
+            // which truncate leaves where the re-forward fallback would.
             try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
-            self.ctx.cache.step = kv_step_snap;
-            try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, st.verify_len, s);
+            if (gdn_captured) self.ctx.cache.step = kv_step_snap;
+            if (gdn_captured) try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, st.verify_len, s);
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
 
             const vh_shape = mlx.getShape(verify_hidden_all);
@@ -11106,7 +11208,7 @@ pub const Generator = struct {
         if (self.mtp_cache == null) return null;
         const mc = &self.mtp_cache.?;
         return switch (mc.*) {
-            .qwen => 0,
+            .qwen, .mimo, .glm => 0,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 const m = &(r.t.qwen4_mtp orelse break :blk 0);
@@ -16133,6 +16235,31 @@ test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE cap
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false, false, false));
 }
 
+test "boundedPrefillChunk: MiMo builds no prefill score tensor, so its chunk never shrinks with the prompt" {
+    const cfg: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .head_dim = 192, .num_attention_heads = 64, .has_sliding_window = true };
+    try testing.expectEqual(@as(u32, 0), cfg.prefillScoreHeadDim());
+    for ([_]usize{ 8192, 32768, 262_144 }) |ctx| try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, cfg.prefillScoreHeadDim(), 64, ctx, true, true, false));
+    try testing.expect(transformer_mod.prefillHeadDimFused(cfg.prefillScoreHeadDim()));
+}
+
+test "effectivePrefillChunk: an arch with no prefill score tensor defaults to the wide chunk, still under the pin and an explicit width" {
+    const saved = .{ prefill_chunk_override, prefill_chunk_explicit };
+    defer {
+        prefill_chunk_override = saved[0];
+        prefill_chunk_explicit = saved[1];
+    }
+    prefill_chunk_override = 8192;
+    prefill_chunk_explicit = false;
+    try testing.expectEqual(WIDE_PREFILL_CHUNK, effectivePrefillChunk(0, 64, 32768, true, true, false, 0));
+    try testing.expectEqual(WIDE_PREFILL_CHUNK, effectivePrefillChunk(0, 64, 32768, true, true, false, WIDE_PREFILL_CHUNK));
+    try testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(0, 64, 32768, true, true, false, 8192));
+    // Every other arch keeps the launch width.
+    try testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(128, 32, 32768, false, false, false, WIDE_PREFILL_CHUNK));
+    prefill_chunk_override = 4096;
+    prefill_chunk_explicit = true;
+    try testing.expectEqual(@as(usize, 4096), effectivePrefillChunk(0, 64, 32768, true, true, false, WIDE_PREFILL_CHUNK));
+}
+
 test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 rung, an ungated one caps at 4096" {
     std.debug.assert(transformer_mod.fused256_override == null);
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, true, true));
@@ -20092,9 +20219,8 @@ test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first
     try testing.expectEqual(@as(u8, 1), t.serial_probes[b]);
 }
 
-test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; every other arch keeps proportional growth" {
-    // The reservation pre-buys prompt + generation headroom + slack past 32k; a pure cost on an
-    // arch nobody measured, so it is gated.
+test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-buys generation headroom" {
+    // Headroom is a pure cost on an arch nobody measured, so it is gated; the prompt is written anyway.
     const t = std.testing;
     const chunk: u64 = 4096;
     const seq: u64 = 200_000;
@@ -20108,10 +20234,11 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     );
     try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk) > seq);
 
-    // Every other arch: zero, which leaves `nextCapacityReserved` == `nextCapacity`.
-    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama" }) |mt| {
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mimo_v2" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
-        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+        try t.expectEqual(seq + chunk, reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+        // One chunk never grows mid-prefill: nothing to reserve.
+        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, chunk, max_tokens, chunk));
     }
 
     var cache = try KVC.init(t.allocator, 4);
