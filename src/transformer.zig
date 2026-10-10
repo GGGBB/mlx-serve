@@ -14006,6 +14006,19 @@ pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, pr
     return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, 0);
 }
 
+/// `ssmCheckpointDropIndex` with the first `low_anchors` positions protected from
+/// thinning (mediafix3 §2: generation-side retention must let the dense low grid
+/// anchors survive the per-prefill cap, or the persist-side `ssm_low_anchors` has
+/// nothing left to protect). 0 = the plain policy, byte-identical to before.
+pub fn ssmCheckpointDropIndexLowAnchored(
+    cps: []const SSMCheckpoint,
+    policy: ThinPolicy,
+    protect: ?usize,
+    low_anchors: usize,
+) usize {
+    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, low_anchors);
+}
+
 /// `spanPreservingDropIndex` over a bare ascending position list.
 pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
     return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null, 0);

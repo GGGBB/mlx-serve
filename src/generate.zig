@@ -1221,11 +1221,20 @@ pub fn nextChunkEnd(
         const abs_pos = pos + ssm_cp_offset;
         const abs_end = end + ssm_cp_offset;
         const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
-        if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
-            // A stride boundary lands inside this chunk — end exactly on it
-            // (never tail-merge past it; the boundary IS the snapshot point).
-            return next_boundary_abs - ssm_cp_offset;
-        }
+        // A stride boundary lands inside this chunk — end exactly on it
+        // (never tail-merge past it; the boundary IS the snapshot point).
+        var cut_abs: usize = if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) next_boundary_abs else 0;
+        // mediafix3 §2: a dense low anchor inside the chunk cuts the boundary
+        // there too (the snapshot may only stamp evaluated positions), so the
+        // first 65536 always lands cp at 8192/16384/24576/32768 no matter how
+        // coarse the stride got coarsened to. An anchor that comes BEFORE the
+        // stride boundary wins the cut — otherwise a wide chunk jumps over it.
+        // 0 whenever stride <= 8192: the fine-stride chunking is byte-identical
+        // to before.
+        const low_anchor = ssmLowAnchorEnd(pos, end, ssm_cp_offset, ssm_cp_stride);
+        if (low_anchor > pos and low_anchor < end and (cut_abs == 0 or low_anchor + ssm_cp_offset < cut_abs))
+            cut_abs = low_anchor + ssm_cp_offset;
+        if (cut_abs != 0) return cut_abs - ssm_cp_offset;
     }
     if (end < prefix_len and prefix_len - end < tailMergeMaxFor(default_chunk, adaptive_width)) {
         // Absorb a tiny tail instead of paying a full graph build + eval
@@ -1271,6 +1280,43 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     if (!want_ssm_cp) return 0;
     if (prefix_len <= SSM_SNAPSHOT_BACKOFF) return if (restored) prefix_len else 0;
     return SSM_SNAPSHOT_BACKOFF;
+}
+
+/// mediafix3 §2: the coarse strides that the per-request prefill widths coarsen
+/// the checkpoint grid to (16384/32768) leave NO snapshot below their first
+/// multiple, so a request that forked at ~30k (a client injection block in the
+/// early history) finds no `highestSsmPosAtOrBelow` on any disk entry and the
+/// whole deep match is skipped (2026-10-10: 31,739 skip lines for one session).
+/// Lay dense anchors every 8192 through the first 65536 regardless of the
+/// request's stride. At stride <= 8192 the grid already has this spacing, so
+/// every path below is a no-op — v8's dense grids are the legacy of this
+/// property, and v9's empty low segment is where it regressed.
+pub const SSM_GRID_LOW_DENSE_STRIDE: usize = 8192;
+pub const SSM_GRID_LOW_DENSE_TOP: usize = 65_536;
+
+/// PURE: must the chunk loop snapshot a chunk that ends exactly at absolute
+/// position `abs_end`? The stride multiples plus the dense low anchors. A
+/// snapshot may only stamp a position the chunk actually evaluated (the same
+/// contract the stride boundary has), so the anchors are realised by cutting
+/// the chunk at them in `nextChunkEnd` — never by stamping a future state at
+/// an earlier position.
+pub fn ssmCapturePos(stride: usize, abs_end: usize) bool {
+    if (stride == 0) return false;
+    if (abs_end % stride == 0) return true;
+    return abs_end % SSM_GRID_LOW_DENSE_STRIDE == 0 and abs_end <= SSM_GRID_LOW_DENSE_TOP;
+}
+
+/// PURE: end the chunk at the first dense low anchor strictly inside
+/// `(pos, end)` (relatives to `prompt_ids[0]`, i.e. what `nextChunkEnd`
+/// returns). 0 when there is none or the stride is already dense — chunk
+/// boundaries stay byte-identical at stride <= 8192.
+pub fn ssmLowAnchorEnd(pos: usize, end: usize, offset: usize, stride: usize) usize {
+    if (stride <= SSM_GRID_LOW_DENSE_STRIDE) return 0;
+    const abs_pos = pos + offset;
+    const abs_end = end + offset;
+    const a: usize = (abs_pos / SSM_GRID_LOW_DENSE_STRIDE + 1) * SSM_GRID_LOW_DENSE_STRIDE;
+    if (a > SSM_GRID_LOW_DENSE_TOP or a <= abs_pos or a >= abs_end) return 0;
+    return a - offset;
 }
 
 /// Effective SSM-checkpoint stride for a model, given the base (configured)
@@ -2411,6 +2457,11 @@ pub const Generator = struct {
         /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
         /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
         ssm_checkpoint_max: u32 = 16,
+        /// mediafix3 §2: protect the first N positions (the lowest grid points) when
+        /// thinning the capture list to its cap — they are the only restore anchor
+        /// for a request that forked early in the early-history injection region.
+        /// 0 = the plain thinning (upstream behaviour, byte-identical).
+        ssm_low_anchors: usize = 0,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
         /// scheduler restored some prefix and now forwards only the tail),
@@ -3092,7 +3143,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
+                if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2)) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -3113,7 +3164,12 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
+                                ssm_checkpoints.items,
+                                cp_thin,
+                                null,
+                                options.ssm_low_anchors,
+                            ),
                         );
                         dropped.deinit(allocator);
                     }
@@ -3230,7 +3286,12 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
+                                ssm_checkpoints.items,
+                                cp_thin,
+                                null,
+                                options.ssm_low_anchors,
+                            ),
                         );
                         dropped.deinit(allocator);
                     }
@@ -16886,6 +16947,76 @@ test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     // prefix tail of 200 (abs 2000..2200), stride 256 -> boundary 2048/2304? only
     // 2048 falls inside (2000..2200) -> 2 chunks.
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false));
+}
+
+test "mediafix3: the dense low grid anchors the first 65536 under a coarse stride" {
+    // The 2026-10-10 incident: a 32768 stride left NO snapshot below 32768, so a
+    // prompt that forked at 30060 (an early client injection block) had nothing to
+    // restore from and the disk cache skipped every deep entry despite a
+    // 30060-token prefix match (MEDIAFIX3_TURN_BOUNDARY.md §7). The capture
+    // predicate is stride multiples plus the 8192 anchors under the dense low top.
+    try testing.expect(ssmCapturePos(32_768, 8_192));
+    try testing.expect(ssmCapturePos(32_768, 24_576));
+    try testing.expect(ssmCapturePos(32_768, 32_768)); // stride multiple — same point as before
+    try testing.expect(ssmCapturePos(32_768, 65_536)); // the top itself still counts
+    try testing.expect(!ssmCapturePos(32_768, 40_959));
+    try testing.expect(!ssmCapturePos(32_768, 73_728)); // the high band keeps the coarse spacing
+    try testing.expect(!ssmCapturePos(0, 8_192)); // checkpointing off stays off
+    // A stride at or under 8192 (v8's dense grid) captures EXACTLY what it always
+    // did: the dense rule adds no point to a grid that already has this spacing.
+    for ([_]usize{ 256, 512, 1024, 2048, 4096, 8192 }) |fine| {
+        var x: usize = 0;
+        while (x <= 70_000) : (x += 1_023) {
+            try testing.expectEqual(x % fine == 0, ssmCapturePos(fine, x));
+        }
+    }
+    // Chunking drives the grid: a cold 40k prefill at width 4096 under stride
+    // 32768 (the production boot's coarsening) now snapshots exactly the four low
+    // points — driven through `nextChunkEnd`, the same fn the real prefill loop
+    // runs. (A prompt ending within the tail-merge floor of a multiple merges
+    // that boundary into the always-on end-of-prompt snapshot instead — the
+    // end snapshot at `prefix_len - 30` covers every fork the swallowed point
+    // could have served, which is the mediafix2 `already_have` design.)
+    var grid: [64]u32 = undefined;
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (true) {
+        const end = nextChunkEnd(pos, 40_000, 4_096, true, 32_768, 0, false);
+        if (ssmCapturePos(32_768, end)) {
+            grid[n] = @intCast(end);
+            n += 1;
+        }
+        pos = end;
+        if (pos >= 40_000) break;
+    }
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqual(@as(u32, 8_192), grid[0]);
+    try testing.expectEqual(@as(u32, 16_384), grid[1]);
+    try testing.expectEqual(@as(u32, 24_576), grid[2]);
+    try testing.expectEqual(@as(u32, 32_768), grid[3]);
+    // The coarse-stride prefill chunks EXACTLY like the v8 fine grid for this
+    // prompt: same boundaries, so the dense anchors cost zero extra chunks.
+    try testing.expectEqual(
+        prefillChunkCount(40_000, 4_096, true, 8_192, 0, false),
+        prefillChunkCount(40_000, 4_096, true, 32_768, 0, false),
+    );
+    // A chunk WIDER than the anchor spacing gets cut at the anchor (the snapshot
+    // may only stamp evaluated positions): a 32k-wide chunk from 6k ends at 8192.
+    try testing.expectEqual(@as(usize, 8_192), nextChunkEnd(6_000, 40_000, 32_768, true, 32_768, 0, false));
+    try testing.expectEqual(@as(usize, 16_384), nextChunkEnd(8_192, 40_000, 32_768, true, 32_768, 0, false));
+    // Inside the dense band the FIRST anchor wins the cut, ahead of any later
+    // stride boundary: a 32k-wide chunk from 40k ends at 40960, not 65536.
+    try testing.expectEqual(@as(usize, 40_960), nextChunkEnd(40_000, 100_000, 32_768, true, 32_768, 0, false));
+    // Past the top the cut stops and the high band keeps the coarse stride alone.
+    try testing.expectEqual(@as(usize, 98_304), nextChunkEnd(65_536, 100_000, 32_768, true, 32_768, 0, false));
+    // Fine strides never get an extra cut: the helper answers 0 at every stride
+    // the dense rule is inactive for, whatever the chunk geometry.
+    for ([_]usize{ 0, 256, 512, 1024, 2048, 4096, 8192 }) |fine| {
+        var p: usize = 1_234;
+        while (p < 70_000) : (p += 3_037) {
+            try testing.expectEqual(@as(usize, 0), ssmLowAnchorEnd(p, p + 4_096, 61, fine));
+        }
+    }
 }
 
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {

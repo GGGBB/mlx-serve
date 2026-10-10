@@ -8087,6 +8087,90 @@ test "hybrid lookup: a long match with no checkpoint below the fork is skipped, 
     try testing.expect(hybridSkipDiagnosis(deep_e, 4_096, 4_096, HYBRID_SKIP_DIAG_MIN_TOKENS) == null);
 }
 
+test "mediafix3: a persisted 75k entry keeps 24576 and 32768 in its checkpoint set" {
+    // Task 3a. Generation (mediafix3's dense low grid) delivers the first 65536 at
+    // 8192 spacing; turn appends then add end-of-prompt snapshots on top. Retention
+    // still caps one entry at SSM_DISK_MAX_PER_ENTRY=16 — the dense low points
+    // 24576/32768 must SURVIVE the thinning next to the anchor pair (replace-and-
+    // retain, not net-new), so a prompt that forked at ~30k still finds a deep
+    // enough cp on disk.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-densegrid", 0, 1024);
+    defer tier.deinit();
+    tier.cp_thin = .min_span_recency;
+    tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+    tier.ssm_low_anchors = SSM_DISK_LOW_ANCHORS;
+
+    // 8 dense grid points through 65536 + 10 per-turn end snapshots to 75302 = 18.
+    const L: u32 = 75_332;
+    const generated = [_]u32{
+        8_192,  16_384, 24_576, 32_768, 40_960, 49_152, 57_344, 65_536,
+        66_560, 67_584, 68_608, 69_632, 70_656, 71_680, 72_704, 73_728,
+        74_752, 75_302,
+    };
+    const kept = try tier.ssmTargetPositions(&generated, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(kept);
+    // Disk red line: never more than the per-entry cap.
+    try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), kept.len);
+    // The dense low grid survives: 24576 and 32768 are both on disk, the anchor
+    // pair holds the floor, and the newest snapshot is always kept.
+    try testing.expect(std.mem.indexOfScalar(u32, kept, 24_576) != null);
+    try testing.expect(std.mem.indexOfScalar(u32, kept, 32_768) != null);
+    try testing.expectEqual(@as(u32, 8_192), kept[0]);
+    try testing.expectEqual(@as(u32, 16_384), kept[1]);
+    try testing.expectEqual(@as(u32, 75_302), kept[kept.len - 1]);
+}
+
+test "mediafix3: the 30060 fork restores at 24576 once the dense low grid is persisted" {
+    // Task 3b, the §7.3 skip test with the fix in place: the same incident fork
+    // (30060 — the collaboration_mode/apps_instructions swap) against a deep entry
+    // that now persists the 8192-spaced low grid. `highestSsmPosAtOrBelow` answers
+    // 24576 instead of null, the entry is no longer skipped, and the restore depth
+    // is the dense anchor rather than nothing.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-fork24576", 0, 1024);
+    defer tier.deinit();
+
+    const fork: usize = 30_060;
+    const req_len: usize = 90_573;
+
+    const req = try testing.allocator.alloc(u32, req_len);
+    defer testing.allocator.free(req);
+    for (req, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // The same session, one turn later, persisted on the mediafix3 grid.
+    const deep_tokens = try testing.allocator.alloc(u32, 74_880);
+    for (deep_tokens[0..fork], req[0..fork]) |*d, r| d.* = r;
+    for (deep_tokens[fork..], fork..) |*d, i| d.* = @intCast(i + 500_000);
+    const deep_cp = try testing.allocator.alloc(u32, 6);
+    deep_cp[0] = 8_192;
+    deep_cp[1] = 16_384;
+    deep_cp[2] = 24_576;
+    deep_cp[3] = 32_768;
+    deep_cp[4] = 40_960;
+    deep_cp[5] = 65_536;
+
+    try tier.entries.append(testing.allocator, try syntheticEntry(1_459, deep_tokens, deep_cp));
+
+    // The predicate the skip hinged on: 24576 at or below 30060, not null.
+    try testing.expectEqual(@as(?u32, 24_576), tier.highestSsmPosAtOrBelow(0, @intCast(fork)));
+
+    const hm = tier.bestHybridMatchWithMedia(req[0..req_len], false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &.{}).?;
+    try testing.expectEqual(@as(usize, 0), hm.idx);
+    try testing.expectEqual(@as(u32, 24_576), hm.cp);
+    try testing.expectEqual(@as(u32, @intCast(fork)), hm.usable);
+}
+
 /// Release what a `syntheticEntry` owns when it never made it into the tier (an
 /// appended entry is released by `DiskTier.deinit` instead).
 fn freeSyntheticEntry(e: *IndexEntry) void {

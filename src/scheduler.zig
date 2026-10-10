@@ -4744,6 +4744,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
         entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated()) .min_span_recency else .min_span;
+        // Same gate, same constant as the disk tier below (mediafix2 §6.3 / mediafix3 §2):
+        // merge/shed thinning never migrates the grid floor upward on the long-context line,
+        // so the dense low anchors survive from generation all the way to disk.
+        entry.prefix_cache.?.ssm_low_anchors = if (params.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
@@ -7481,6 +7485,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp and !use_dflash,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
+            .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,
             .ssm_checkpoint_pos_offset = hot_matched,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.

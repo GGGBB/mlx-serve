@@ -425,6 +425,11 @@ pub const HotPrefixCache = struct {
     /// every turn of an agent conversation — gains one checkpoint per turn for
     /// the life of the session. 0 = unlimited.
     ssm_checkpoint_max: u32 = 0,
+    /// mediafix3 §2: protect the first N checkpoints in merge/shed thinning — they
+    /// are the only restore anchor for a request that forked in the early-history
+    /// injection region. 0 = plain thinning. The scheduler wires the long-context
+    /// gate to the same constant as `DiskTier.ssm_low_anchors`.
+    ssm_low_anchors: usize = 0,
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
     current_kv_bytes: u64,
@@ -2542,10 +2547,11 @@ pub const HotPrefixCache = struct {
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
-            const drop = transformer_mod.ssmCheckpointDropIndex(
+            const drop = transformer_mod.ssmCheckpointDropIndexLowAnchored(
                 merged.items,
                 self.cp_thin,
                 boundaryCheckpointIndex(merged.items, media_start),
+                self.ssm_low_anchors,
             );
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
@@ -2665,10 +2671,11 @@ pub const HotPrefixCache = struct {
         var n = cps.len;
         var shed: usize = 0;
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
-            const drop = transformer_mod.ssmCheckpointDropIndex(
+            const drop = transformer_mod.ssmCheckpointDropIndexLowAnchored(
                 cps[0..n],
                 self.cp_thin,
                 boundaryCheckpointIndex(cps[0..n], firstSpanStart(newest.media)),
+                self.ssm_low_anchors,
             );
             const freed = ssmCheckpointBytes(&cps[drop]);
             if (checkpointHasQsaPooled(&cps[drop])) {
