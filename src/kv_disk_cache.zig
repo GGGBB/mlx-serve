@@ -334,9 +334,8 @@ pub const HybridMatch = struct { idx: usize, usable: u32, cp: u32 };
 
 /// Why the hybrid lookup skipped an entry that DID share a long token prefix:
 /// nothing persisted is restorable below `usable`, so the request falls to a
-/// shallower donor. Silent in the 227558 regression (e1372 matched 31944 tokens
-/// with a checkpoint grid starting at 32768 and lost the race to a v8 entry's
-/// cp@24576 — the log said nothing about the discarded deep match).
+/// shallower donor (or a cold prefill). Reported for matches at or above
+/// `HYBRID_SKIP_DIAG_MIN_TOKENS`, where the skip costs a full re-prefill.
 pub const HybridSkipDiagnosis = struct {
     entry_id: u64,
     /// Raw token-prefix share, before the kv_len / lookup-limit / media clamps.
@@ -435,9 +434,9 @@ pub const DiskTier = struct {
     cp_thin: transformer_mod.ThinPolicy = .oldest,
     /// How many checkpoint positions one entry may keep on disk; the default is the previous cap.
     ssm_max_per_entry: usize = SSM_DISK_MAX_PER_ENTRY_LEGACY,
-    /// How many LOW checkpoint positions the thin must never remove (mediafix2
-    /// §6.3). Default 0 = today's pure span-preserving spread, which is what the
-    /// spacing tests price; the gated long-context wiring sets
+    /// How many LOW checkpoint positions the thin must never remove. Default
+    /// 0 = the pure span-preserving spread, which is what the spacing tests
+    /// price; the gated long-context wiring (#794) sets
     /// `SSM_DISK_LOW_ANCHORS` so a request that diverges early in the prompt
     /// still finds a shallow anchor instead of restoring nothing.
     ssm_low_anchors: usize = 0,
@@ -730,23 +729,12 @@ pub const DiskTier = struct {
 
     /// Longest usable shared prefix across persisted entries with a matching
     /// (has_tools, quant) key. Same filter semantics as the RAM cache: a
-    /// cross-config restore would hand SDPA a wrong buffer layout.
+    /// cross-config restore would hand SDPA a wrong buffer layout. An entry's
+    /// shared prefix also clamps at `mediaSharedBound(entry.media, media)`: a
+    /// re-sent turn with agreeing spans reads its media rows back, a divergent
+    /// list stops below the first item whose start or pixel key differs, and a
+    /// text turn (`media` empty) clamps at every media entry's first item.
     pub fn bestMatch(
-        self: *const DiskTier,
-        prompt_ids: []const u32,
-        has_tools: bool,
-        quant: kv_quant.KVQuantConfig,
-    ) ?Match {
-        return self.bestMatchWithMedia(prompt_ids, has_tools, quant, &.{});
-    }
-
-    /// `bestMatch` for a media-carrying request: an entry's shared prefix also
-    /// clamps at `mediaSharedBound(entry.media, media)`, so a re-sent turn with
-    /// identical spans reads the media rows back and any divergence lands below
-    /// the first item whose start or pixel key differs. An empty `media` is a
-    /// text turn: media entries clamp at their first item, exactly the pre-v9
-    /// `disk_limit` the lookup used to apply tier-wide.
-    pub fn bestMatchWithMedia(
         self: *const DiskTier,
         prompt_ids: []const u32,
         has_tools: bool,
@@ -776,21 +764,11 @@ pub const DiskTier = struct {
     /// highest SSM checkpoint at or below the usable prefix — not by the raw
     /// usable length (the RAM tier's #312 lesson: a longer raw match whose
     /// checkpoints sit past the divergence restores nothing, and must not
-    /// shadow a shorter entry with a higher restorable position). Entries
-    /// with no checkpoint at or below their usable prefix are skipped.
+    /// shadow a shorter entry with a higher restorable position). Entries with
+    /// no checkpoint at or below their usable prefix are skipped. The shared
+    /// prefix clamps at `mediaSharedBound(entry.media, media)` exactly as on
+    /// the pure-attention side.
     pub fn bestHybridMatch(
-        self: *const DiskTier,
-        prompt_ids: []const u32,
-        has_tools: bool,
-        quant: kv_quant.KVQuantConfig,
-        limit: u32,
-    ) ?HybridMatch {
-        return self.bestHybridMatchWithMedia(prompt_ids, has_tools, quant, limit, &.{});
-    }
-
-    /// `bestHybridMatch` with the request's media list; the per-entry shared
-    /// prefix clamps at `mediaSharedBound` exactly as on the pure-attention side.
-    pub fn bestHybridMatchWithMedia(
         self: *const DiskTier,
         prompt_ids: []const u32,
         has_tools: bool,
@@ -799,6 +777,12 @@ pub const DiskTier = struct {
         media: []const MediaSpan,
     ) ?HybridMatch {
         var best: ?HybridMatch = null;
+        // One aggregated info line per lookup for the deep matches the loop had
+        // to skip (the deepest plus a count): the observation an operator needs
+        // when restore depth collapses, without the per-entry log a deep-entry
+        // index would print on every lookup.
+        var skipped: usize = 0;
+        var deepest_skip: ?HybridSkipDiagnosis = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
@@ -808,18 +792,20 @@ pub const DiskTier = struct {
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
             const usable: u32 = @intCast(@min(@min(shared, e.kv_len), @as(usize, limit)));
             const cp = self.highestSsmPosAtOrBelow(i, usable) orelse {
-                // A long match with no restorable checkpoint is the one skip an
-                // operator needs to see: it is why the restore depth collapses.
                 if (hybridSkipDiagnosis(e, shared, usable, HYBRID_SKIP_DIAG_MIN_TOKENS)) |diag| {
-                    if (diag.lowest_cp) |low| {
-                        log.info("  [disk-cache] skip e{d}: {d}-token prefix match (usable {d}) but no ssm checkpoint at or below it — lowest grid cp {d}\n", .{ diag.entry_id, diag.shared, diag.usable, low });
-                    } else {
-                        log.info("  [disk-cache] skip e{d}: {d}-token prefix match (usable {d}) but no ssm checkpoints on disk\n", .{ diag.entry_id, diag.shared, diag.usable });
-                    }
+                    skipped += 1;
+                    if (deepest_skip == null or diag.usable > deepest_skip.?.usable) deepest_skip = diag;
                 }
                 continue;
             };
             if (best == null or cp > best.?.cp) best = .{ .idx = i, .usable = usable, .cp = cp };
+        }
+        if (deepest_skip) |dd| {
+            if (dd.lowest_cp) |low| {
+                log.info("  [disk-cache] {d} deep prefix matches skipped for want of a checkpoint at or below the match — deepest e{d}: {d}-token match (usable {d}), lowest grid cp {d}\n", .{ skipped, dd.entry_id, dd.shared, dd.usable, low });
+            } else {
+                log.info("  [disk-cache] {d} deep prefix matches skipped for want of a checkpoint at or below the match — deepest e{d}: {d}-token match (usable {d}), no checkpoints on disk\n", .{ skipped, dd.entry_id, dd.shared, dd.usable });
+            }
         }
         return best;
     }
@@ -1235,7 +1221,7 @@ pub const DiskTier = struct {
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         s: mlx.mlx_stream,
     ) !PersistOutcome {
-        return self.appendCommitWithSpec(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s);
+        return self.appendCommitWithSpec(kv_entries, step, config, tokens, has_tools, &.{}, ssm_checkpoints, null, null, s);
     }
 
     /// `appendCommit` with an explicit per-call flush bound (bytes): the loop stops after the
@@ -1255,29 +1241,14 @@ pub const DiskTier = struct {
     }
 
     /// `appendCommit` plus the v4 spec snapshots (dflash assistant context /
-    /// MTP committed history). Eligibility is enforced UPSTREAM, same as the
-    /// RAM tier: the caller passes only what `commitWithState` was handed.
+    /// MTP committed history) and the turn's media spans (v9 disk identity).
+    /// Eligibility is enforced UPSTREAM, same as the RAM tier: the caller
+    /// passes only what `commitWithState` was handed. The entry's record then
+    /// carries (tokens, spans); supersede, extend, chunk share and the
+    /// full-prefix promise all clamp at `mediaSharedBound`, so a later turn
+    /// with a different pixel key can never inherit its rows off a list that
+    /// disagrees below them.
     pub fn appendCommitWithSpec(
-        self: *DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
-        step: usize,
-        config: kv_quant.KVQuantConfig,
-        tokens: []const u32,
-        has_tools: bool,
-        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
-        dflash_snap: ?SpecCommit,
-        mtp_snap: ?SpecCommit,
-        s: mlx.mlx_stream,
-    ) !PersistOutcome {
-        return self.appendCommitWithSpecMedia(kv_entries, step, config, tokens, has_tools, &.{}, ssm_checkpoints, dflash_snap, mtp_snap, s);
-    }
-
-    /// `appendCommitWithSpec` with the turn's media spans (v9 disk identity). The
-    /// entry's record then carries (tokens, spans); supersede, extend, chunk
-    /// share and the full-prefix promise all clamp at `mediaSharedBound`, so a
-    /// later turn with a different pixel key can never inherit its rows off a
-    /// list that disagrees below them.
-    pub fn appendCommitWithSpecMedia(
         self: *DiskTier,
         kv_entries: []const transformer_mod.KVCacheEntry,
         step: usize,
@@ -1632,39 +1603,15 @@ pub const DiskTier = struct {
         tokens: []const u32,
         has_tools: bool,
         config: kv_quant.KVQuantConfig,
-    ) bool {
-        return self.fullPrefixEntryId(kv_entries, step, tokens, has_tools, config) != null;
-    }
-
-    /// `holdsFullPrefix` for a media turn: the tier holds a complete copy only
-    /// when a record also carries a span list agreeing across `tokens` — a
-    /// token-identical record under different pixels is not this turn's state.
-    pub fn holdsFullPrefixWithMedia(
-        self: *const DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
-        step: usize,
-        tokens: []const u32,
-        has_tools: bool,
-        config: kv_quant.KVQuantConfig,
         media: []const MediaSpan,
     ) bool {
-        return self.fullPrefixEntryIdWithMedia(kv_entries, step, tokens, has_tools, config, media) != null;
+        return self.fullPrefixEntryId(kv_entries, step, tokens, has_tools, config, media) != null;
     }
 
-    /// `holdsFullPrefix`, returning the entry's id so the caller can ask `entryWritesPending`.
+    /// `holdsFullPrefix`, returning the entry's id so the caller can ask
+    /// `entryWritesPending`. The record must carry a span list agreeing
+    /// across `tokens` (`media` empty = a text turn).
     pub fn fullPrefixEntryId(
-        self: *const DiskTier,
-        kv_entries: []const transformer_mod.KVCacheEntry,
-        step: usize,
-        tokens: []const u32,
-        has_tools: bool,
-        config: kv_quant.KVQuantConfig,
-    ) ?u64 {
-        return self.fullPrefixEntryIdWithMedia(kv_entries, step, tokens, has_tools, config, &.{});
-    }
-
-    /// `fullPrefixEntryId` with the turn's media list (v9 identity gate).
-    pub fn fullPrefixEntryIdWithMedia(
         self: *const DiskTier,
         kv_entries: []const transformer_mod.KVCacheEntry,
         step: usize,
@@ -3830,7 +3777,7 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
 
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 600), m.usable);
 
     var cache2 = try KVCache.init(testing.allocator, 3);
@@ -3859,8 +3806,8 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
     }
 
     // Mismatched key never matches.
-    try testing.expect(tier2.bestMatch(&tokens, true, kv_quant.KVQuantConfig.dense) == null);
-    try testing.expect(tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.affine(4)) == null);
+    try testing.expect(tier2.bestMatch(&tokens, true, kv_quant.KVQuantConfig.dense, &.{}) == null);
+    try testing.expect(tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.affine(4), &.{}) == null);
 }
 
 test "DiskTier: a sliding ring is never persisted (its rows start past position 0)" {
@@ -4071,7 +4018,7 @@ test "DiskTier: affine-quant cache round-trips all six buffers" {
 
     var cache2 = try KVCache.initWithConfig(testing.allocator, 2, qcfg);
     defer cache2.deinit();
-    const m = tier.bestMatch(&tokens, false, qcfg).?;
+    const m = tier.bestMatch(&tokens, false, qcfg, &.{}).?;
     try testing.expectEqual(@as(u32, 520), m.usable);
     const restored = try tier.restoreInto(&cache2, m.idx, s);
     try testing.expectEqual(@as(u32, 520), restored);
@@ -5054,7 +5001,7 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links qsa.safetensors"
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
     };
     defer freeHybridEntries(&dst);
-    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 256), try tier.restoreIntoHybrid(&cache2, &dst, m.idx, 256, s));
     try testing.expect(dst[2].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 256), dst[2].qsa_hist_rows);
@@ -5134,7 +5081,7 @@ test "DiskTier: an inherited QSA history is dropped on extend past the common pr
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
     };
     defer freeHybridEntries(&dst);
-    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 560), try tier.restoreIntoHybrid(&cache2, &dst, m.idx, 560, s));
     try testing.expect(dst[2].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 560), dst[2].qsa_hist_rows);
@@ -5354,6 +5301,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         .{ .entries = dfl.entries, .step = dfl.step, .config = dfl.config, .base_pos = 0 },
         .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
@@ -5365,7 +5313,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
 
     var loaded = tier2.loadSpecSnap(m.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
@@ -5407,7 +5355,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     var tokens_b: [600]u32 = undefined;
     for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
     _ = try tier2.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, null, s);
-    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expect(tier2.loadSpecSnap(mb.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) == null);
 
     // v3 entry (written by an older binary): rewrite the manifest to v3 with
@@ -5437,7 +5385,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
     defer tier3.deinit();
     try testing.expectEqual(@as(usize, 2), tier3.entryCount());
-    const m3 = tier3.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m3 = tier3.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 600), m3.usable);
     try testing.expect(tier3.loadSpecSnap(m3.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) == null);
     var cache3 = try KVCache.init(testing.allocator, 2);
@@ -5472,6 +5420,7 @@ test "DiskTier: a dense MTP sidecar is rewritten at affine-8 on the next commit"
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp_dense.entries, .step = mtp_dense.step, .config = mtp_dense.config, .base_pos = 0 },
@@ -5490,6 +5439,7 @@ test "DiskTier: a dense MTP sidecar is rewritten at affine-8 on the next commit"
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp_q.entries, .step = mtp_q.step, .config = mtp_q.config, .base_pos = 0 },
@@ -5528,6 +5478,7 @@ test "DiskTier: a quantized MTP sidecar is rewritten to dense on the next commit
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp_q.entries, .step = mtp_q.step, .config = mtp_q.config, .base_pos = 0 },
@@ -5545,6 +5496,7 @@ test "DiskTier: a quantized MTP sidecar is rewritten to dense on the next commit
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp_dense.entries, .step = mtp_dense.step, .config = mtp_dense.config, .base_pos = 0 },
@@ -5727,6 +5679,7 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{
@@ -5742,7 +5695,7 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
 
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head", 0, 128);
     defer tier2.deinit();
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
     defer loaded.snap.deinit();
@@ -5765,12 +5718,13 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
         cache.config,
         &tokens_b,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
         s,
     );
-    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     var kv_only = tier2.loadSpecSnap(mb.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
     defer kv_only.snap.deinit();
@@ -5820,6 +5774,7 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{
@@ -5837,7 +5792,7 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
     // A pooled bank without its raw history is not restorable: KV half only, head declined.
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
     defer tier2.deinit();
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
     defer loaded.snap.deinit();
@@ -5977,6 +5932,7 @@ test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{
@@ -5990,7 +5946,7 @@ test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
         s,
     );
 
-    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     var loaded = tier.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
     defer loaded.snap.deinit();
@@ -6049,6 +6005,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{
@@ -6066,7 +6023,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
     // A restart: the positions come back through meta.json, the rows through the sidecar.
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head-marks", 0, 128);
     defer tier2.deinit();
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(tier2.entries.items[m.idx]));
     var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
@@ -6091,6 +6048,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
         cache.config,
         &tokens_b,
         false,
+        &.{},
         null,
         null,
         .{
@@ -6103,7 +6061,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
         },
         s,
     );
-    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u8, 5), DiskTier.metaVersionFor(tier2.entries.items[mb.idx]));
     var no_marks = tier2.loadSpecSnap(mb.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
@@ -6911,7 +6869,7 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whol
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 2), tier2.entryCount());
     try testing.expectEqual(tier.total_bytes, tier2.total_bytes);
-    const m = tier2.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 600), m.usable);
     var out = try KVCache.init(testing.allocator, 3);
     defer out.deinit();
@@ -7209,6 +7167,7 @@ test "DiskTier: an ssm/spec-only append bills the SPEC sidecar's byte delta" {
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
@@ -7313,7 +7272,7 @@ test "DiskTier v9: media spans round-trip through meta and clamp matching per en
     // The second key carries the high bit, like half of all pixel hashes: the
     // meta round-trip has to prove it survives the JSON trip.
     const spans = [_]MediaSpan{ .{ .start = 100, .key = 0xA0 }, .{ .start = 300, .key = 0x8000_0000_0000_00B0 } };
-    _ = try tier.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     const dense = kv_quant.KVQuantConfig.dense;
 
@@ -7337,20 +7296,20 @@ test "DiskTier v9: media spans round-trip through meta and clamp matching per en
     }
 
     // Identical span list: full depth.
-    const deep = tier2.bestMatchWithMedia(&tokens, false, dense, &spans).?;
+    const deep = tier2.bestMatch(&tokens, false, dense, &spans).?;
     try testing.expectEqual(@as(u32, 600), deep.usable);
     // A re-sent later item with different pixels: clamps at its start.
-    try testing.expectEqual(@as(u32, 300), tier2.bestMatchWithMedia(&tokens, false, dense, &.{ spans[0], .{ .start = 300, .key = 0xB1 } }).?.usable);
+    try testing.expectEqual(@as(u32, 300), tier2.bestMatch(&tokens, false, dense, &.{ spans[0], .{ .start = 300, .key = 0xB1 } }).?.usable);
     // The same image at a different placeholder row: clamps at the earlier start.
-    try testing.expectEqual(@as(u32, 96), tier2.bestMatchWithMedia(&tokens, false, dense, &.{ .{ .start = 96, .key = 0xA0 }, spans[1] }).?.usable);
+    try testing.expectEqual(@as(u32, 96), tier2.bestMatch(&tokens, false, dense, &.{ .{ .start = 96, .key = 0xA0 }, spans[1] }).?.usable);
     // A re-sent list missing the second item: clamps at that item's start.
-    try testing.expectEqual(@as(u32, 300), tier2.bestMatchWithMedia(&tokens, false, dense, &.{spans[0]}).?.usable);
+    try testing.expectEqual(@as(u32, 300), tier2.bestMatch(&tokens, false, dense, &.{spans[0]}).?.usable);
     // A new item appended below the stored ones: clamps at the new start.
-    try testing.expectEqual(@as(u32, 450), tier2.bestMatchWithMedia(&tokens, false, dense, &.{ spans[0], spans[1], .{ .start = 450, .key = 0xC0 } }).?.usable);
+    try testing.expectEqual(@as(u32, 450), tier2.bestMatch(&tokens, false, dense, &.{ spans[0], spans[1], .{ .start = 450, .key = 0xC0 } }).?.usable);
     // A text-only request: clamps at the FIRST item — the old tier-wide cap.
-    try testing.expectEqual(@as(u32, 100), tier2.bestMatchWithMedia(&tokens, false, dense, &.{}).?.usable);
+    try testing.expectEqual(@as(u32, 100), tier2.bestMatch(&tokens, false, dense, &.{}).?.usable);
     // The legacy wrapper keeps its meaning for older call sites.
-    try testing.expectEqual(@as(u32, 100), tier2.bestMatch(&tokens, false, dense).?.usable);
+    try testing.expectEqual(@as(u32, 100), tier2.bestMatch(&tokens, false, dense, &.{}).?.usable);
 
     // The deep match serves the media rows themselves: spot-check KV values
     // across both boundaries against the original cache.
@@ -7387,15 +7346,15 @@ test "DiskTier v9: supersede and extend are media-gated; chunk share clamps at d
 
     const span_a = MediaSpan{ .start = 512, .key = 0xAA };
     const span_b = MediaSpan{ .start = 512, .key = 0xBB };
-    _ = try tier.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &tokens, false, &.{span_a}, null, null, null, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{span_a}, null, null, null, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
 
     // The identical token record under different pixels is a DIFFERENT entry:
     // supersede must not no-op the commit (its rows describe another image).
-    _ = try tier.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &tokens, false, &.{span_b}, null, null, null, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{span_b}, null, null, null, s);
     try testing.expectEqual(@as(usize, 2), tier.entryCount());
     // Under the same span list it is superseded again: still 2 entries.
-    const sup = try tier.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &tokens, false, &.{span_a}, null, null, null, s);
+    const sup = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{span_a}, null, null, null, s);
     try testing.expectEqual(PersistOutcome.persisted, sup);
     try testing.expectEqual(@as(usize, 2), tier.entryCount());
 
@@ -7403,16 +7362,16 @@ test "DiskTier v9: supersede and extend are media-gated; chunk share clamps at d
     // open) — never a second entry.
     var cont_a: [768]u32 = undefined;
     for (&cont_a, 0..) |*t, i| t.* = if (i < 640) tokens[i] else @intCast(50_000 + i);
-    _ = try tier.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &cont_a, false, &.{span_a}, null, null, null, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &cont_a, false, &.{span_a}, null, null, null, s);
     try testing.expectEqual(@as(usize, 2), tier.entryCount());
     // Chunk share, same span list: a twin commit diverging INSIDE the tail at
     // 740 hard-links all 5 whole chunks below the token divergence.
     var twin_a: [768]u32 = cont_a;
     twin_a[740] = 555_001;
-    _ = try tier.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &twin_a, false, &.{span_a}, null, null, null, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &twin_a, false, &.{span_a}, null, null, null, s);
     // The same tokens under B's pixels: rows 512.. up describe a different
     // image, so the share clamps to the 4 whole chunks below the span start.
-    _ = try tier.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &twin_a, false, &.{span_b}, null, null, null, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &twin_a, false, &.{span_b}, null, null, null, s);
     var inherited_a: ?u32 = null;
     var inherited_b: ?u32 = null;
     for (tier.entries.items) |*e| {
@@ -7428,18 +7387,18 @@ test "DiskTier v9: supersede and extend are media-gated; chunk share clamps at d
     // the B entry, never the token-prefix-matching A entry…
     var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-media-ex", 0, 128);
     defer tier3.deinit();
-    _ = try tier3.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &tokens, false, &.{span_b}, null, null, null, s);
+    _ = try tier3.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{span_b}, null, null, null, s);
     var ext: [700]u32 = undefined;
     for (&ext, 0..) |*t, i| t.* = if (i < 640) tokens[i] else @intCast(70_000 + i);
     // …the A entry shares the 640-token prefix but its span list diverges at
     // 512, so this media-B commit under span A must NOT extend it either:
     // it lands as a second entry.
-    _ = try tier3.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &ext, false, &.{span_a}, null, null, null, s);
+    _ = try tier3.appendCommitWithSpec(cache.entries, cache.step, cache.config, &ext, false, &.{span_a}, null, null, null, s);
     try testing.expectEqual(@as(usize, 2), tier3.entryCount());
     // The same growth under span B now extends the B entry (media gate open).
     var ext_b: [760]u32 = undefined;
     for (&ext_b, 0..) |*t, i| t.* = if (i < 640) tokens[i] else @intCast(71_000 + i);
-    _ = try tier3.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &ext_b, false, &.{span_b}, null, null, null, s);
+    _ = try tier3.appendCommitWithSpec(cache.entries, cache.step, cache.config, &ext_b, false, &.{span_b}, null, null, null, s);
     try testing.expectEqual(@as(usize, 2), tier3.entryCount());
     var grew = false;
     for (tier3.entries.items) |*e| {
@@ -7466,7 +7425,7 @@ test "DiskTier v9 scan: a media list on a pre-v9 stamp, or a v9 stamp without on
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     const spans = [_]MediaSpan{.{ .start = 100, .key = 0xA0 }};
-    _ = try tier.appendCommitWithSpecMedia(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s);
     const id = tier.entries.items[0].id;
     const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/fp-media-meta/e{d}/meta.json", .{ base, id });
     defer testing.allocator.free(meta_path);
@@ -7496,7 +7455,6 @@ test "DiskTier v9 scan: a media list on a pre-v9 stamp, or a v9 stamp without on
         try testing.expect(tier.loadEntry(id) == null);
     }
 }
-
 
 test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING_ROWS ring; v>8 is refused" {
     const io = std.testing.io;
@@ -7658,9 +7616,9 @@ test "DiskTier: a failed background write INVALIDATES the entry it belonged to (
     try testing.expectEqual(@as(usize, 1), tier.harvestWriteFailures());
     try testing.expect(tier.entries.items[0].poisoned);
     for (tier.entries.items[0].chunk_bytes) |b| try testing.expectEqual(@as(u64, 0), b);
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
-    try testing.expect(tier.fullPrefixEntryId(cache.entries, cache.step, &tokens, false, cache.config) == null);
-    try testing.expect(tier.bestMatch(&tokens, false, cache.config) == null);
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
+    try testing.expect(tier.fullPrefixEntryId(cache.entries, cache.step, &tokens, false, cache.config, &.{}) == null);
+    try testing.expect(tier.bestMatch(&tokens, false, cache.config, &.{}) == null);
     try testing.expect(!tier.entryWholeOnDisk(dead_id));
     // Attribution happens once.
     try testing.expectEqual(@as(usize, 0), tier.harvestWriteFailures());
@@ -7675,7 +7633,7 @@ test "DiskTier: a failed background write INVALIDATES the entry it belonged to (
     try testing.expect(live.id != dead_id);
     try testing.expect(!live.poisoned);
     try testing.expect(tier.entryWholeOnDisk(live.id));
-    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
 
     var back = try KVCache.init(testing.allocator, 2);
     defer back.deinit();
@@ -7706,10 +7664,10 @@ test "DiskTier: a poisoned entry is invisible to the hybrid lookup too" {
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
 
-    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600) != null);
+    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600, &.{}) != null);
     tier.entries.items[0].poisoned = true;
-    try testing.expect(tier.bestMatch(&tokens, false, cache.config) == null);
-    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600) == null);
+    try testing.expect(tier.bestMatch(&tokens, false, cache.config, &.{}) == null);
+    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600, &.{}) == null);
 }
 
 test "DiskTier: a manifest scalar that does not fit its field drops the record, never casts" {
@@ -7740,6 +7698,7 @@ test "DiskTier: a manifest scalar that does not fit its field drops the record, 
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
@@ -7834,7 +7793,7 @@ test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable 
         defer for (&cps) |*cp| cp.deinit(testing.allocator);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
         try testing.expectEqual(@as(usize, N), tier.entries.items[0].ssm_positions.len);
-        const warm = tier.bestHybridMatch(&tokens, false, cache.config, tokens.len).?;
+        const warm = tier.bestHybridMatch(&tokens, false, cache.config, tokens.len, &.{}).?;
         try testing.expectEqual(@as(u32, N * 128), warm.cp);
     }
 
@@ -7842,7 +7801,7 @@ test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable 
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
     try testing.expectEqual(@as(usize, N), tier2.entries.items[0].ssm_positions.len);
-    const cold = tier2.bestHybridMatch(&tokens, false, kv_quant.KVQuantConfig.dense, tokens.len).?;
+    const cold = tier2.bestHybridMatch(&tokens, false, kv_quant.KVQuantConfig.dense, tokens.len, &.{}).?;
     try testing.expectEqual(@as(u32, N * 128), cold.cp);
     try testing.expectEqual(@as(u32, N * 128), cold.usable);
 }
@@ -7866,7 +7825,7 @@ test "DiskTier: a restore wider than the fd limit closes each chunk as it goes" 
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     tier.drainEntry(tier.entries.items[m.idx].id);
 
     const saved = try std.posix.getrlimit(.NOFILE);
@@ -7905,7 +7864,7 @@ test "DiskTier: a failed restore drops the latch it raised and keeps a foreign o
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 13);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     const id = tier.entries.items[m.idx].id;
     tier.drainEntry(id);
     var path_buf: [1024]u8 = undefined;
@@ -7982,7 +7941,7 @@ test "DiskTier: in-place commits keep an entry's bytes equal to the files it own
     var mtp = try KVCache.init(testing.allocator, 1);
     defer mtp.deinit();
     try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
-    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, &more, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, &.{}, &more, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
     try testing.expect(tier.entries.items[0].spec_bytes > 0);
     try testing.expectEqual(@as(usize, 5), tier.entries.items[0].ssm_positions.len);
     try testing.expectEqual(try Owned.bytes(&tier, &tier.entries.items[0]), tier.entries.items[0].bytes);
@@ -7998,10 +7957,10 @@ test "DiskTier: in-place commits keep an entry's bytes equal to the files it own
 }
 
 test "mediaSharedBound: a repeated pixel key in a superset does not collapse the bound" {
-    // Recipe §7.1: the 227558 request re-sent a pixel key it already carried
-    // (span 5 == span 1, K1). Comparing positionally must walk past the repeat
-    // and clamp only where a start/key pair actually differs.
-    const K1: u64 = 8_376_670_522_757_638_769; // the real K1 from the post-mortem
+    // A pixel key may legally repeat across spans: the comparison is
+    // positional, so it must walk past the reuse and clamp only where a
+    // start/key pair actually differs.
+    const K1: u64 = 8_376_670_522_757_638_769;
     const K2: u64 = 0xB2;
     const a = [_]MediaSpan{ .{ .start = 100, .key = K1 }, .{ .start = 300, .key = K2 } };
     const b = [_]MediaSpan{ .{ .start = 100, .key = K1 }, .{ .start = 300, .key = K2 }, .{ .start = 500, .key = K1 } };
@@ -8021,11 +7980,12 @@ test "mediaSharedBound: a repeated pixel key in a superset does not collapse the
 }
 
 test "hybrid lookup: a long match with no checkpoint below the fork is skipped, and says why" {
-    // Recipe §7.3, the 24576 collapse at the exact post-mortem numbers. The deep
-    // v9 entry shares 31944 tokens with the request (an early client injection
-    // forked the prompt) and its grid starts at 32768, so nothing it persisted
-    // is restorable; the shallower v8 entry (fork at 31794, 8192 grid) wins with
-    // cp@24576 — the depth the server actually restored.
+    // A deep entry that shares a long token prefix but has no checkpoint at or
+    // below the shared prefix must lose the race to a shallower entry with a
+    // restorable checkpoint, and the skip must be reportable: a 222k-token entry
+    // matches 31944 tokens with its grid starting at 32768, so nothing it
+    // persisted is restorable; the 122k entry (fork at 31794, 8192 grid) wins
+    // with cp@24576.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8065,7 +8025,7 @@ test "hybrid lookup: a long match with no checkpoint below the fork is skipped, 
     try tier.entries.append(testing.allocator, try syntheticEntry(1_372, deep_tokens, deep_cp));
     try tier.entries.append(testing.allocator, try syntheticEntry(1_369, v8_tokens, v8_cp));
 
-    const hm = tier.bestHybridMatchWithMedia(req[0..req_len], false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &.{}).?;
+    const hm = tier.bestHybridMatch(req[0..req_len], false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &.{}).?;
     try testing.expectEqual(@as(usize, 1), hm.idx); // the v8 entry, not the deep one
     try testing.expectEqual(@as(u32, 24_576), hm.cp);
     try testing.expectEqual(@as(u32, @intCast(v8_fork)), hm.usable);
@@ -8087,13 +8047,12 @@ test "hybrid lookup: a long match with no checkpoint below the fork is skipped, 
     try testing.expect(hybridSkipDiagnosis(deep_e, 4_096, 4_096, HYBRID_SKIP_DIAG_MIN_TOKENS) == null);
 }
 
-test "mediafix3: a persisted 75k entry keeps 24576 and 32768 in its checkpoint set" {
-    // Task 3a. Generation (mediafix3's dense low grid) delivers the first 65536 at
-    // 8192 spacing; turn appends then add end-of-prompt snapshots on top. Retention
-    // still caps one entry at SSM_DISK_MAX_PER_ENTRY=16 — the dense low points
-    // 24576/32768 must SURVIVE the thinning next to the anchor pair (replace-and-
-    // retain, not net-new), so a prompt that forked at ~30k still finds a deep
-    // enough cp on disk.
+test "a persisted 75k entry keeps the dense low grid points 24576 and 32768" {
+    // Gated generation delivers the first 65536 at 8192 spacing; turn appends
+    // add end-of-prompt snapshots on top. Retention still caps one entry at
+    // SSM_DISK_MAX_PER_ENTRY=16 — the dense low points must SURVIVE the
+    // thinning next to the anchor pair (replace-and-retain, not net-new), so a
+    // prompt that forked below the coarse grid still finds a deep cp on disk.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8126,12 +8085,11 @@ test "mediafix3: a persisted 75k entry keeps 24576 and 32768 in its checkpoint s
     try testing.expectEqual(@as(u32, 75_302), kept[kept.len - 1]);
 }
 
-test "mediafix3: the 30060 fork restores at 24576 once the dense low grid is persisted" {
-    // Task 3b, the §7.3 skip test with the fix in place: the same incident fork
-    // (30060 — the collaboration_mode/apps_instructions swap) against a deep entry
-    // that now persists the 8192-spaced low grid. `highestSsmPosAtOrBelow` answers
-    // 24576 instead of null, the entry is no longer skipped, and the restore depth
-    // is the dense anchor rather than nothing.
+test "a fork below a coarse grid's first multiple restores at 24576 once the dense low grid is persisted" {
+    // The skip case with the fix in place: a request forking at 30060 against
+    // a deep entry that persists the 8192-spaced low grid. `highestSsmPosAtOrBelow`
+    // answers 24576 instead of null, the entry is no longer skipped, and the
+    // restore depth is the dense anchor rather than nothing.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8148,7 +8106,7 @@ test "mediafix3: the 30060 fork restores at 24576 once the dense low grid is per
     defer testing.allocator.free(req);
     for (req, 0..) |*t, i| t.* = @intCast(i + 1);
 
-    // The same session, one turn later, persisted on the mediafix3 grid.
+    // The same session, one turn later, persisted on the dense low grid.
     const deep_tokens = try testing.allocator.alloc(u32, 74_880);
     for (deep_tokens[0..fork], req[0..fork]) |*d, r| d.* = r;
     for (deep_tokens[fork..], fork..) |*d, i| d.* = @intCast(i + 500_000);
@@ -8165,7 +8123,7 @@ test "mediafix3: the 30060 fork restores at 24576 once the dense low grid is per
     // The predicate the skip hinged on: 24576 at or below 30060, not null.
     try testing.expectEqual(@as(?u32, 24_576), tier.highestSsmPosAtOrBelow(0, @intCast(fork)));
 
-    const hm = tier.bestHybridMatchWithMedia(req[0..req_len], false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &.{}).?;
+    const hm = tier.bestHybridMatch(req[0..req_len], false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &.{}).?;
     try testing.expectEqual(@as(usize, 0), hm.idx);
     try testing.expectEqual(@as(u32, 24_576), hm.cp);
     try testing.expectEqual(@as(u32, @intCast(fork)), hm.usable);
@@ -8204,11 +8162,10 @@ fn syntheticEntry(id: u64, tokens: []u32, ssm_positions: []u32) !IndexEntry {
 }
 
 test "DiskTier: checkpoint thinning never removes the low grid anchors" {
-    // Recipe §6.3. The span-preserving thin already kept index 0; when the cap
-    // forced more drops the survivors migrated upward and left a request that
-    // diverged early (a client injection at ~32k) with no anchor at all. The two
-    // lowest grid points now survive every thin; the legacy `.oldest` retention
-    // is untouched.
+    // When the cap forces drops, an unanchored thin migrates the grid floor
+    // upward and leaves a request that diverged early with no anchor at all.
+    // The two lowest grid points survive every thin (#794); the legacy
+    // `.oldest` retention is untouched.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

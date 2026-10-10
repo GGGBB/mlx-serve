@@ -13940,10 +13940,9 @@ pub fn spanPreservingDropIndex(
     /// selected. When it is the only candidate the oldest goes instead — that one sits below
     /// it, so the protected position survives either way.
     protect: ?usize,
-    /// How many LOW positions are anchored as well (mediafix2 §6.3: the first grid
-    /// points are the only restore anchor for a request that diverges early, so
-    /// thinning must not migrate the grid floor upward). 0 = the plain policy; a
-    /// caller that wants the legacy drop-oldest behaviour also passes 0.
+    /// How many LOW positions are anchored as well (#794: thinning must not
+    /// migrate the grid floor upward). 0 = the plain policy; a caller that
+    /// wants the legacy drop-oldest behaviour also passes 0.
     low_anchors: usize,
 ) usize {
     std.debug.assert(items.len > 0);
@@ -14006,10 +14005,10 @@ pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, pr
     return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, 0);
 }
 
-/// `ssmCheckpointDropIndex` with the first `low_anchors` positions protected from
-/// thinning (mediafix3 §2: generation-side retention must let the dense low grid
-/// anchors survive the per-prefill cap, or the persist-side `ssm_low_anchors` has
-/// nothing left to protect). 0 = the plain policy, byte-identical to before.
+/// `ssmCheckpointDropIndex` with the first `low_anchors` positions protected
+/// from thinning: generation-side retention must let the dense low grid anchors
+/// (#794) survive the per-prefill cap, or the persist-side `ssm_low_anchors`
+/// has nothing left to protect. 0 = the plain policy, byte-identical to before.
 pub fn ssmCheckpointDropIndexLowAnchored(
     cps: []const SSMCheckpoint,
     policy: ThinPolicy,
@@ -73203,7 +73202,7 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
     for ([_][4]u32{ .{ 0, 17, 4, 2560 }, .{ 3, 17, 4, 2560 }, .{ 1, 16, 4, 2560 }, .{ 1, 8704, 4, 2560 }, .{ 1, 17, 0, 2560 }, .{ 1, 17, 9, 2560 }, .{ 1, 17, 4, 64 }, .{ 1, 17, 4, 4097 }, .{ 1, 17, 4, 129 } }) |shape| {
         try testing.expect(!hp.eligible(@intCast(shape[0]), @intCast(shape[1]), shape[2], shape[3], inject, .bfloat16));
     }
-    try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), @import("generate.zig").nextChunkEnd(0, 8703, 8192, false, 0, 0, true));
+    try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), @import("generate.zig").nextChunkEnd(0, 8703, 8192, false, 0, 0, true, false));
 }
 
 test "hc prefill: incompatible read writes immediately" {

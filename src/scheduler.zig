@@ -4744,7 +4744,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
         entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated()) .min_span_recency else .min_span;
-        // Same gate, same constant as the disk tier below (mediafix2 §6.3 / mediafix3 §2):
+        // Same gate, same constant as the disk tier below (#794):
         // merge/shed thinning never migrates the grid floor upward on the long-context line,
         // so the dense low anchors survive from generation all the way to disk.
         entry.prefix_cache.?.ssm_low_anchors = if (params.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0;

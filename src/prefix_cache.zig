@@ -425,10 +425,10 @@ pub const HotPrefixCache = struct {
     /// every turn of an agent conversation — gains one checkpoint per turn for
     /// the life of the session. 0 = unlimited.
     ssm_checkpoint_max: u32 = 0,
-    /// mediafix3 §2: protect the first N checkpoints in merge/shed thinning — they
-    /// are the only restore anchor for a request that forked in the early-history
-    /// injection region. 0 = plain thinning. The scheduler wires the long-context
-    /// gate to the same constant as `DiskTier.ssm_low_anchors`.
+    /// How many LOW checkpoint positions merge/shed thinning must never remove
+    /// (#794): a request that forked below a coarse grid's first multiple needs
+    /// the shallow anchor. 0 = plain thinning. The scheduler wires the
+    /// long-context gate to the same constant as `DiskTier.ssm_low_anchors`.
     ssm_low_anchors: usize = 0,
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
@@ -651,22 +651,6 @@ pub const HotPrefixCache = struct {
             picked = i;
         }
         return picked;
-    }
-
-    /// The token record the SSD tier may hold. Its keys are token-only, so it stops at the first
-    /// media item; a hybrid restores only from a checkpoint, so it stops at the last one below that.
-    /// The token record the SSD tier may hold. Since v9 the record is
-    /// (tokens, spans): state past a media item is deterministic for the span
-    /// list, so a media turn persists the FULL record (KV rows and every
-    /// checkpoint, above the items included). The clamp moved to matching —
-    /// `bestMatchWithMedia` bounds each request at its own
-    /// `mediaSharedBound(entry.media, media)`: same spans read the media rows
-    /// back near the prompt tail, a divergent list stops below the first item
-    /// that differs, a text turn stops at the entry's first item. The old
-    /// commit-side clamp to the pre-media text floor is retired.
-    fn diskTokensFor(self: *const HotPrefixCache, tokens: []const u32, spans: []const MediaSpan, cps: ?[]const SSMCheckpoint) []const u32 {
-        _ = self; _ = spans; _ = cps;
-        return tokens;
     }
 
     /// The rows a restore will deliver, which is not the rows it matched: a hybrid restore is
@@ -1185,7 +1169,7 @@ pub const HotPrefixCache = struct {
         // and restores both.
         if (self.disk) |*d| disk: {
             // v9: the tier's records are (tokens, spans). The clamp moved
-            // per-entry — `bestMatchWithMedia` bounds each candidate at
+            // per-entry — `bestMatch` bounds each candidate at
             // `mediaSharedBound(entry.media, media)`: a request whose spans
             // agree reads its media rows back, one that diverges stops below
             // the first item whose start or pixel key differs, and a text turn
@@ -1193,7 +1177,7 @@ pub const HotPrefixCache = struct {
             // tier-wide `disk_limit` did. A row AT a placeholder is restored
             // only under an agreeing span list — the same pixels, so the
             // restored row IS what the vision splice would have produced.
-            const dm = d.bestMatchWithMedia(prompt_ids, has_tools, target_cache.config, media) orelse {
+            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config, media) orelse {
                 // Silent no-entry misses are why a 40 GB disk tier looked
                 // dead in a live post-mortem (2026-09-07): nothing in the
                 // log ever said the tier was consulted and found nothing.
@@ -1220,7 +1204,7 @@ pub const HotPrefixCache = struct {
                     break :blk cp.pos;
                 } else 0;
                 // A stored entry can carry a checkpoint at exactly this prompt's length; restoring it leaves nothing to forward.
-                const hm = d.bestHybridMatchWithMedia(prompt_ids, has_tools, target_cache.config, @as(u32, @intCast(prompt_ids.len -| 1)), media) orelse break :disk;
+                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @as(u32, @intCast(prompt_ids.len -| 1)), media) orelse break :disk;
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
@@ -1243,9 +1227,8 @@ pub const HotPrefixCache = struct {
                 target_moe_seq_offset.* = restored;
                 self.last_restored_disk_id = d.entries.items[hm.idx].id;
                 const ms = sw.read() / std.time.ns_per_ms;
-                // The donor identity and the raw match values ride along: without
-                // them a shallow restore is unattributable (the 227558 post-mortem
-                // had to reconstruct the donor from chunk-share lines).
+                // The donor identity and the raw match values ride along:
+                // without them a shallow restore is unattributable.
                 log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (entry e{d} ssm@{d}, prefix match {d}, media match {d})\n", .{ restored, prompt_ids.len, ms, d.entries.items[hm.idx].id, disk_cp, hm.usable, dm.usable });
                 const disk_mtp = diskRestoreSpec(d, hm.idx, mtp_target, restored, s, .mtp);
                 return .{
@@ -1640,7 +1623,7 @@ pub const HotPrefixCache = struct {
         // lookup by `mediaSharedBound`. The spec snapshots describe rows past
         // the first item under NO media key gate, so only a text-only commit
         // rides them to the tier.
-        const disk_tokens = self.diskTokensFor(tokens, eff_media, ssm_cps);
+        const disk_tokens = tokens;
         const disk_media = spansBelow(eff_media, disk_tokens.len);
         const disk_spec = eff_media.len == 0;
 
@@ -2148,7 +2131,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = d.appendCommitWithSpecMedia(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, null, null, mlx.gpuStream()) catch |err| {
+        const outcome = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, null, null, mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2277,7 +2260,7 @@ pub const HotPrefixCache = struct {
             // payloads describe rows past the first item under NO media key
             // gate, so they stay text-only rides (same rule as the commit path).
             const specs: EntrySpecs = if (e.media.len == 0) entrySpecCommits(e) else .{};
-            const outcome = d.appendCommitWithSpecMedia(
+            const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
                 e.snapshot.step,
                 e.snapshot.config,
@@ -2295,7 +2278,7 @@ pub const HotPrefixCache = struct {
             // Only `.persisted`: a silent skip or a `.partial` copy is not a copy.
             if (outcome != .persisted) continue;
             // `.persisted` is the write path's claim; the index has to agree.
-            const disk_id = d.fullPrefixEntryIdWithMedia(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config, e.media) orelse {
+            const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config, e.media) orelse {
                 log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix — entry stays resident\n", .{});
                 continue;
             };
@@ -2407,7 +2390,7 @@ pub const HotPrefixCache = struct {
                 .head_pos_base = mm.head_pos_base,
                 .head_marks = mm.head_marks.slice(),
             } else null;
-            const ok = d.appendCommitWithSpecMedia(
+            const ok = d.appendCommitWithSpec(
                 pending.snapshot.entries,
                 pending.snapshot.step,
                 pending.snapshot.config,
@@ -2443,9 +2426,9 @@ pub const HotPrefixCache = struct {
         const specs: EntrySpecs = if (newest.media.len == 0) entrySpecCommits(newest) else .{};
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
-        const flush_tokens = self.diskTokensFor(newest.tokens, newest.media, newest.ssm_checkpoints);
+        const flush_tokens = newest.tokens;
         const flush_media = spansBelow(newest.media, flush_tokens.len);
-        const complete = d.appendCommitWithSpecMedia(
+        const complete = d.appendCommitWithSpec(
             newest.snapshot.entries,
             newest.snapshot.step,
             newest.snapshot.config,
@@ -8037,24 +8020,24 @@ test "DiskTier.holdsFullPrefix: the INDEX must agree before a RAM copy is discar
     var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-holds", 0, 128);
     defer tier.deinit();
 
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     tier.drainWriter();
-    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, true, cache.config));
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, true, cache.config, &.{}));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, .{ .scheme = .affine, .bits = 4, .group_size = 64 }, &.{}));
 
     // A truncated tail chunk, the shape `scan` records after a kill -9.
     const cb = tier.entries.items[0].chunk_bytes;
     const keep = cb[cb.len - 1];
     cb[cb.len - 1] = 0;
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
     cb[cb.len - 1] = keep;
-    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
 
     tier.entries.items[0].kv_len = 400;
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
 }
 
 test "SSD-first: one resident session makes reclaimableBytes truthfully ZERO" {
@@ -8477,7 +8460,7 @@ test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flush
         const kv = d.entries.items[0].kv_len;
         try testing.expect(kv >= last_kv);
         if (hc.disk_dirty) try testing.expectEqual(@as(u32, 0), kv % 128);
-        const m = d.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+        const m = d.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
         try testing.expectEqual(kv, m.usable);
         last_kv = kv;
     }
@@ -8932,8 +8915,8 @@ test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry �
     // The failure names its entry, so a restore from it misses.
     try testing.expectEqual(@as(usize, 1), hc.disk.?.harvestWriteFailures());
     try testing.expect(hc.disk.?.entries.items[0].poisoned);
-    try testing.expect(hc.disk.?.bestMatch(&tok_a, false, cache.config) == null);
-    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
+    try testing.expect(hc.disk.?.bestMatch(&tok_a, false, cache.config, &.{}) == null);
+    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config, &.{}));
 
     // Pass N+1: A is not durable; the dead directory is reclaimed and the rebuild is staged.
     hc.disk.?.writer.?.setPaused(true);
@@ -8998,7 +8981,7 @@ test "SSD-first: a write failure inside the SAME pass still keeps the entry resi
     try testing.expect(hc.disk.?.writeErrors() > 0);
     try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
     try testing.expectEqual(@as(usize, 2), hc.entryCount());
-    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
+    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config, &.{}));
 }
 
 test "SSD-first: a spill pass probes the volume only for a store, never for a copy already on disk" {
@@ -9431,4 +9414,3 @@ test "HotPrefixCache v9: a media turn persists media-keyed deep state; same span
         try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm_t[0].conv_state, 0, s));
     }
 }
-
