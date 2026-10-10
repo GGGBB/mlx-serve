@@ -332,6 +332,48 @@ pub const Match = struct {
 /// restorable checkpoint position (≤ usable) that won it the race.
 pub const HybridMatch = struct { idx: usize, usable: u32, cp: u32 };
 
+/// Why the hybrid lookup skipped an entry that DID share a long token prefix:
+/// nothing persisted is restorable below `usable`, so the request falls to a
+/// shallower donor. Silent in the 227558 regression (e1372 matched 31944 tokens
+/// with a checkpoint grid starting at 32768 and lost the race to a v8 entry's
+/// cp@24576 — the log said nothing about the discarded deep match).
+pub const HybridSkipDiagnosis = struct {
+    entry_id: u64,
+    /// Raw token-prefix share, before the kv_len / lookup-limit / media clamps.
+    shared: u32,
+    /// The share a restore could have rebuilt (what the entry lost the race at).
+    usable: u32,
+    /// The entry's lowest persisted checkpoint; null = no checkpoints on disk.
+    /// This is the grid floor the request diverged below.
+    lowest_cp: ?u32,
+};
+
+/// Below this shared-prefix length a checkpoint-less skip is routine noise (a
+/// short probe grazing a deep entry); at or above it the skip costs a full
+/// re-prefill and has to reach the log.
+pub const HYBRID_SKIP_DIAG_MIN_TOKENS: u32 = 8192;
+
+/// The diagnosis for an entry the hybrid lookup is about to skip for want of a
+/// checkpoint at or below `usable`; null when the match is too short to report.
+/// Pure (no log, no tier state) so a test can assert the diagnosis path without
+/// capturing stderr.
+pub fn hybridSkipDiagnosis(e: *const IndexEntry, shared: usize, usable: u32, min_tokens: u32) ?HybridSkipDiagnosis {
+    if (shared < min_tokens) return null;
+    return .{
+        .entry_id = e.id,
+        .shared = @intCast(shared),
+        .usable = usable,
+        .lowest_cp = if (e.ssm_positions.len > 0) e.ssm_positions[0] else null,
+    };
+}
+
+/// The low grid points that checkpoint thinning must never remove (recipe
+/// §6.3). With a 16-checkpoint cap over a 383k entry the grid is ~25k apart; if
+/// thinning also migrates the floor upward, a request that diverges below it
+/// (early prompt injection, a re-sent header) has NO anchor left and restores
+/// nothing. The two lowest positions are the shallow-divergence anchor pair.
+pub const SSM_DISK_LOW_ANCHORS: usize = 2;
+
 fn nbytesOf(a: mlx.mlx_array) u64 {
     return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
 }
@@ -393,6 +435,12 @@ pub const DiskTier = struct {
     cp_thin: transformer_mod.ThinPolicy = .oldest,
     /// How many checkpoint positions one entry may keep on disk; the default is the previous cap.
     ssm_max_per_entry: usize = SSM_DISK_MAX_PER_ENTRY_LEGACY,
+    /// How many LOW checkpoint positions the thin must never remove (mediafix2
+    /// §6.3). Default 0 = today's pure span-preserving spread, which is what the
+    /// spacing tests price; the gated long-context wiring sets
+    /// `SSM_DISK_LOW_ANCHORS` so a request that diverges early in the prompt
+    /// still finds a shallow anchor instead of restoring nothing.
+    ssm_low_anchors: usize = 0,
     /// SSD-first background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
@@ -759,7 +807,18 @@ pub const DiskTier = struct {
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
             const usable: u32 = @intCast(@min(@min(shared, e.kv_len), @as(usize, limit)));
-            const cp = self.highestSsmPosAtOrBelow(i, usable) orelse continue;
+            const cp = self.highestSsmPosAtOrBelow(i, usable) orelse {
+                // A long match with no restorable checkpoint is the one skip an
+                // operator needs to see: it is why the restore depth collapses.
+                if (hybridSkipDiagnosis(e, shared, usable, HYBRID_SKIP_DIAG_MIN_TOKENS)) |diag| {
+                    if (diag.lowest_cp) |low| {
+                        log.info("  [disk-cache] skip e{d}: {d}-token prefix match (usable {d}) but no ssm checkpoint at or below it — lowest grid cp {d}\n", .{ diag.entry_id, diag.shared, diag.usable, low });
+                    } else {
+                        log.info("  [disk-cache] skip e{d}: {d}-token prefix match (usable {d}) but no ssm checkpoints on disk\n", .{ diag.entry_id, diag.shared, diag.usable });
+                    }
+                }
+                continue;
+            };
             if (best == null or cp > best.?.cp) best = .{ .idx = i, .usable = usable, .cp = cp };
         }
         return best;
@@ -2227,8 +2286,11 @@ pub const DiskTier = struct {
             if (std.mem.indexOfScalar(u32, set.items, p) == null) try set.append(self.allocator, p);
         }
         std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
+        // Only the span-preserving policies get anchors; the legacy `.oldest`
+        // retention (the highest N) is left exactly as it was.
+        const anchors = if (self.cp_thin == .oldest) 0 else self.ssm_low_anchors;
         while (set.items.len > self.ssm_max_per_entry) {
-            _ = set.orderedRemove(transformer_mod.positionDropIndex(set.items, self.cp_thin));
+            _ = set.orderedRemove(transformer_mod.positionDropIndexLowAnchored(set.items, self.cp_thin, anchors));
         }
         return set.toOwnedSlice(self.allocator);
     }
@@ -7933,4 +7995,210 @@ test "DiskTier: in-place commits keep an entry's bytes equal to the files it own
     try testing.expect(e.qsa_history_bytes > 0);
     try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
     try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
+test "mediaSharedBound: a repeated pixel key in a superset does not collapse the bound" {
+    // Recipe §7.1: the 227558 request re-sent a pixel key it already carried
+    // (span 5 == span 1, K1). Comparing positionally must walk past the repeat
+    // and clamp only where a start/key pair actually differs.
+    const K1: u64 = 8_376_670_522_757_638_769; // the real K1 from the post-mortem
+    const K2: u64 = 0xB2;
+    const a = [_]MediaSpan{ .{ .start = 100, .key = K1 }, .{ .start = 300, .key = K2 } };
+    const b = [_]MediaSpan{ .{ .start = 100, .key = K1 }, .{ .start = 300, .key = K2 }, .{ .start = 500, .key = K1 } };
+
+    // The superset's extra item REUSES an earlier key: the bound is that item's
+    // start, not a collapse back to the first K1 occurrence.
+    try testing.expectEqual(@as(usize, 500), mediaSharedBound(&a, &b));
+    try testing.expectEqual(@as(usize, 500), mediaSharedBound(&b, &a));
+    // Identical lists agree everywhere.
+    try testing.expectEqual(std.math.maxInt(usize), mediaSharedBound(&a, &a));
+    try testing.expectEqual(std.math.maxInt(usize), mediaSharedBound(&b, &b));
+    // A repeat that sits behind a real divergence still clamps at the divergence.
+    const c = [_]MediaSpan{ .{ .start = 100, .key = K1 }, .{ .start = 300, .key = 0xB9 }, .{ .start = 500, .key = K1 } };
+    try testing.expectEqual(@as(usize, 300), mediaSharedBound(&a, &c));
+    // A text turn still clamps at the first item.
+    try testing.expectEqual(@as(usize, 100), mediaSharedBound(&a, &.{}));
+}
+
+test "hybrid lookup: a long match with no checkpoint below the fork is skipped, and says why" {
+    // Recipe §7.3, the 24576 collapse at the exact post-mortem numbers. The deep
+    // v9 entry shares 31944 tokens with the request (an early client injection
+    // forked the prompt) and its grid starts at 32768, so nothing it persisted
+    // is restorable; the shallower v8 entry (fork at 31794, 8192 grid) wins with
+    // cp@24576 — the depth the server actually restored.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-skipdiag", 0, 1024);
+    defer tier.deinit();
+
+    const fork: usize = 31_944; // deep entry: first differing token
+    const v8_fork: usize = 31_794; // shallow entry: an older injection offset
+    const req_len: usize = 40_000;
+
+    const req = try testing.allocator.alloc(u32, req_len);
+    defer testing.allocator.free(req);
+    for (req, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // The deep donor: identical up to `fork`, checkpoints from 32768 upward.
+    const deep_tokens = try testing.allocator.alloc(u32, 222_972);
+    for (deep_tokens[0..fork], req[0..fork]) |*d, r| d.* = r;
+    for (deep_tokens[fork..], fork..) |*d, i| d.* = @intCast(i + 500_000);
+    const deep_cp = try testing.allocator.alloc(u32, 3);
+    deep_cp[0] = 32_768;
+    deep_cp[1] = 49_152;
+    deep_cp[2] = 65_536;
+
+    // The shallow donor: v8-style 8192 grid, forked 150 tokens earlier.
+    const v8_tokens = try testing.allocator.alloc(u32, 122_880);
+    for (v8_tokens[0..v8_fork], req[0..v8_fork]) |*d, r| d.* = r;
+    for (v8_tokens[v8_fork..], v8_fork..) |*d, i| d.* = @intCast(i + 900_000);
+    const v8_cp = try testing.allocator.alloc(u32, 4);
+    v8_cp[0] = 8_192;
+    v8_cp[1] = 16_384;
+    v8_cp[2] = 24_576;
+    v8_cp[3] = 32_768;
+
+    try tier.entries.append(testing.allocator, try syntheticEntry(1_372, deep_tokens, deep_cp));
+    try tier.entries.append(testing.allocator, try syntheticEntry(1_369, v8_tokens, v8_cp));
+
+    const hm = tier.bestHybridMatchWithMedia(req[0..req_len], false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &.{}).?;
+    try testing.expectEqual(@as(usize, 1), hm.idx); // the v8 entry, not the deep one
+    try testing.expectEqual(@as(u32, 24_576), hm.cp);
+    try testing.expectEqual(@as(u32, @intCast(v8_fork)), hm.usable);
+    // The skipped entry still reports the grid floor the request fell below.
+    const deep_e = &tier.entries.items[0];
+    const diag = hybridSkipDiagnosis(deep_e, fork, @intCast(fork), HYBRID_SKIP_DIAG_MIN_TOKENS).?;
+    try testing.expectEqual(@as(u64, 1_372), diag.entry_id);
+    try testing.expectEqual(@as(u32, @intCast(fork)), diag.shared);
+    try testing.expectEqual(@as(u32, @intCast(fork)), diag.usable);
+    try testing.expectEqual(@as(?u32, 32_768), diag.lowest_cp);
+    // A checkpoint-less entry reports a null floor rather than a bogus one (the
+    // log line says "no checkpoints on disk", not "the grid starts at 0")...
+    const cpless_tokens = try testing.allocator.alloc(u32, fork);
+    var cpless = try syntheticEntry(1_444, cpless_tokens, &[_]u32{});
+    defer freeSyntheticEntry(&cpless);
+    try testing.expectEqual(@as(?u32, null), hybridSkipDiagnosis(&cpless, fork, @intCast(fork), HYBRID_SKIP_DIAG_MIN_TOKENS).?.lowest_cp);
+    // ...and a match below the reporting threshold stays silent (a short probe
+    // grazing a deep entry is normal traffic, not a lost deep restore).
+    try testing.expect(hybridSkipDiagnosis(deep_e, 4_096, 4_096, HYBRID_SKIP_DIAG_MIN_TOKENS) == null);
+}
+
+/// Release what a `syntheticEntry` owns when it never made it into the tier (an
+/// appended entry is released by `DiskTier.deinit` instead).
+fn freeSyntheticEntry(e: *IndexEntry) void {
+    testing.allocator.free(e.tokens);
+    testing.allocator.free(e.chunk_bytes);
+    testing.allocator.free(e.ssm_positions);
+    testing.allocator.free(e.ssm_bytes);
+    testing.allocator.free(e.media);
+}
+
+/// An in-memory `IndexEntry` for lookup-only tests: every owned slice comes from
+/// `testing.allocator` so `DiskTier.deinit` frees exactly what it owns.
+fn syntheticEntry(id: u64, tokens: []u32, ssm_positions: []u32) !IndexEntry {
+    const chunk_bytes = try testing.allocator.alloc(u64, 1);
+    chunk_bytes[0] = 0;
+    const ssm_bytes = try testing.allocator.alloc(u64, ssm_positions.len);
+    @memset(ssm_bytes, 0);
+    return .{
+        .id = id,
+        .tokens = tokens,
+        .kv_len = @intCast(tokens.len),
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 0,
+        .chunk_bytes = chunk_bytes,
+        .ssm_positions = ssm_positions,
+        .ssm_bytes = ssm_bytes,
+        .media = try testing.allocator.alloc(MediaSpan, 0),
+        .last_used = id,
+    };
+}
+
+test "DiskTier: checkpoint thinning never removes the low grid anchors" {
+    // Recipe §6.3. The span-preserving thin already kept index 0; when the cap
+    // forced more drops the survivors migrated upward and left a request that
+    // diverged early (a client injection at ~32k) with no anchor at all. The two
+    // lowest grid points now survive every thin; the legacy `.oldest` retention
+    // is untouched.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-lowanchor", 0, 128);
+    defer tier.deinit();
+    tier.cp_thin = .min_span_recency;
+    tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+    tier.ssm_low_anchors = SSM_DISK_LOW_ANCHORS; // the gated wiring's setting
+
+    // An 8192-token grid, deep enough to force 30 removals.
+    const GRID: u32 = 8_192;
+    const N: usize = 46;
+    var positions: [N]u32 = undefined;
+    for (&positions, 0..) |*p, i| p.* = @as(u32, @intCast((i + 1) * GRID));
+    const L: u32 = @intCast(N * @as(usize, GRID));
+
+    const kept = try tier.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY, kept.len);
+    // The anchor pair: 8192 and 16384, the only restore points for a shallow fork.
+    try testing.expectEqual(@as(u32, GRID), kept[0]);
+    try testing.expectEqual(@as(u32, 2 * GRID), kept[1]);
+    // The newest checkpoint still anchors the warm-turn end.
+    try testing.expectEqual(@as(u32, @intCast(N * @as(usize, GRID))), kept[kept.len - 1]);
+    // Every other survivor is interior — the anchors did not simply push the
+    // whole set down one notch.
+    for (kept[2..]) |p| try testing.expect(p > 2 * GRID);
+
+    // Repeated thins keep the anchors: the grid floor cannot creep upward turn
+    // after turn, which is what emptied e1372's low grid.
+    const round2 = try tier.ssmTargetPositions(kept, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(round2);
+    try testing.expectEqual(@as(u32, GRID), round2[0]);
+    try testing.expectEqual(@as(u32, 2 * GRID), round2[1]);
+
+    // Anchors at 0 reproduce the plain selection for every short list: the scan
+    // must not start at index 0, where the span's `k-1` underflows (the bug that
+    // crashed the hot-cache thinning tests when the parameter first landed).
+    var n: usize = 3;
+    while (n <= 8) : (n += 1) {
+        for ([_]transformer_mod.ThinPolicy{ .min_span, .min_span_recency, .oldest }) |policy| {
+            try testing.expectEqual(
+                transformer_mod.positionDropIndex(positions[0..n], policy),
+                transformer_mod.positionDropIndexLowAnchored(positions[0..n], policy, 0),
+            );
+        }
+        if (n >= 4) {
+            const anchored = transformer_mod.positionDropIndexLowAnchored(positions[0..n], .min_span, 2);
+            try testing.expect(anchored >= 2); // nothing below the anchors goes
+            try testing.expect(anchored < n - 1); // and never the newest
+        }
+    }
+
+    // The legacy arm keeps the highest N, exactly as before (opt-in change).
+    var legacy = try DiskTier.init(testing.allocator, io, base, "fp-lowanchor-legacy", 0, 128);
+    defer legacy.deinit();
+    try testing.expectEqual(transformer_mod.ThinPolicy.oldest, legacy.cp_thin);
+    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(old_kept);
+    try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, old_kept.len);
+    try testing.expectEqualSlices(u32, positions[positions.len - SSM_DISK_MAX_PER_ENTRY_LEGACY ..], old_kept);
+
+    // The knob is what moved the survivors: at 0 the same policy thins the
+    // interior exactly as the spacing tests price it, and 16384 does NOT survive.
+    var unanchored = try DiskTier.init(testing.allocator, io, base, "fp-lowanchor-off", 0, 128);
+    defer unanchored.deinit();
+    unanchored.cp_thin = .min_span_recency;
+    unanchored.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+    const spread = try unanchored.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(spread);
+    try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), spread.len);
+    try testing.expectEqual(@as(u32, GRID), spread[0]); // index 0 always survived
+    try testing.expect(std.mem.indexOfScalar(u32, spread, 2 * GRID) == null);
 }

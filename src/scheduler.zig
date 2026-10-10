@@ -4785,6 +4785,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
+            // Same gate: the long-context thin keeps the two lowest checkpoints so a
+            // prompt that forked early (a client-side injection block) still has a
+            // shallow restore anchor; every other arch keeps the plain spread.
+            entry.prefix_cache.?.disk.?.ssm_low_anchors = if (params.config.longCtxGated() or !ram_prefix_cache)
+                kv_disk_cache.SSM_DISK_LOW_ANCHORS
+            else
+                0;
         }
         // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
         // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.

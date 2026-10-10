@@ -1238,7 +1238,10 @@ pub const HotPrefixCache = struct {
                 target_moe_seq_offset.* = restored;
                 self.last_restored_disk_id = d.entries.items[hm.idx].id;
                 const ms = sw.read() / std.time.ns_per_ms;
-                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d})\n", .{ restored, prompt_ids.len, ms, disk_cp });
+                // The donor identity and the raw match values ride along: without
+                // them a shallow restore is unattributable (the 227558 post-mortem
+                // had to reconstruct the donor from chunk-share lines).
+                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (entry e{d} ssm@{d}, prefix match {d}, media match {d})\n", .{ restored, prompt_ids.len, ms, d.entries.items[hm.idx].id, disk_cp, hm.usable, dm.usable });
                 const disk_mtp = diskRestoreSpec(d, hm.idx, mtp_target, restored, s, .mtp);
                 return .{
                     .matched = restored,
@@ -1273,7 +1276,7 @@ pub const HotPrefixCache = struct {
             };
             target_moe_seq_offset.* = final_len;
             const ms = sw.read() / std.time.ns_per_ms;
-            log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms });
+            log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms (entry e{d}, match {d})\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms, d.entries.items[dm.idx].id, dm.usable });
             const disk_mtp = diskRestoreSpec(d, dm.idx, mtp_target, final_len, s, .mtp);
             return .{
                 .matched = final_len,
