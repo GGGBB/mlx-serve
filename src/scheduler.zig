@@ -4146,6 +4146,17 @@ fn loadGlmHead(allocator: std.mem.Allocator, config: *const model_mod.ModelConfi
 /// On any error the partial state has already been freed via errdefer; the
 /// caller decides how to surface (startup → recordLoadError + signal
 /// started; on-demand → req.error_name + done broadcast).
+/// The disk tier's per-entry SSM checkpoint cap. The hot tier's cap and the
+/// disk grid should agree: an operator who raises the hot cap above the disk
+/// default is paying for denser checkpoints precisely so a post-spill restore
+/// lands near the fork point - pinning the disk side to the constant would
+/// drop them back onto the coarser grid at the first spill. The constant
+/// stays the floor for default runs; the tier's byte budget + LRU bound the
+/// storage (qwen4_exp: one checkpoint ~56 MB, so 40 ~ 2.2 GB per entry).
+fn diskSsmMaxPerEntry(hot_max: u32) usize {
+    return @max(kv_disk_cache.SSM_DISK_MAX_PER_ENTRY, @as(usize, hot_max));
+}
+
 fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // ── ds4 fast path: when the caller passed `ds4_path`, the model is a
     //    GGUF served by the embedded ds4 engine. The MLX scaffolding
@@ -4948,9 +4959,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated() or !ram_prefix_cache) .min_span_recency else .oldest;
             entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated() or !ram_prefix_cache)
-                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
+                diskSsmMaxPerEntry(params.ssm_checkpoint_max)
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
+            log.info("[disk-cache] ssm checkpoints kept per entry on disk: {d}\n", .{entry.prefix_cache.?.disk.?.ssm_max_per_entry});
             // Same gate: the long-context thin keeps the two lowest checkpoints so a
             // prompt that forked early (a client-side injection block) still has a
             // shallow restore anchor; every other arch keeps the plain spread.
@@ -11822,4 +11834,38 @@ test "loop recovery: an answer-side loop and an unarmed request are still cut" {
     const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
+}
+
+test "diskSsmMaxPerEntry: a raised hot cap feeds the disk thin" {
+    // Default/legacy hot caps stay on the upstream disk constant; anything
+    // denser than the constant is an explicit operator choice and carries
+    // over to the disk side (the post-spill grid is the one that matters).
+    try testing.expectEqual(@as(usize, 16), diskSsmMaxPerEntry(0));
+    try testing.expectEqual(@as(usize, 16), diskSsmMaxPerEntry(8));
+    try testing.expectEqual(@as(usize, 16), diskSsmMaxPerEntry(16));
+    try testing.expectEqual(@as(usize, 40), diskSsmMaxPerEntry(40));
+}
+
+test "disk thin at the wired cap keeps every restore gap within one 8k chunk" {
+    // A long session leaves one checkpoint per 4k tokens across a ~256k
+    // prompt. Thinned span-preservingly to the cap the gated wiring now
+    // uses (hot 40 -> disk 40), no two survivors may sit further apart than
+    // a chunk: a fork anywhere in the prompt then restores within 8k tokens
+    // of the divergence point instead of the old ~11k 16-point spread.
+    var list = std.ArrayList(u32).empty;
+    defer list.deinit(testing.allocator);
+    for (0..64) |i| try list.append(testing.allocator, @intCast((i + 1) * 4096 - 2048));
+    const cap = diskSsmMaxPerEntry(40);
+    while (list.items.len > cap) {
+        const drop = transformer_mod.positionDropIndexLowAnchored(
+            list.items,
+            .min_span_recency,
+            kv_disk_cache.SSM_DISK_LOW_ANCHORS,
+        );
+        _ = list.orderedRemove(drop);
+    }
+    try testing.expectEqual(cap, list.items.len);
+    var max_gap: u32 = 0;
+    for (1..list.items.len) |i| max_gap = @max(max_gap, list.items[i] - list.items[i - 1]);
+    try testing.expect(max_gap <= 8192);
 }
