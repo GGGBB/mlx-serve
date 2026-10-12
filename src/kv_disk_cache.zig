@@ -239,6 +239,11 @@ pub const IndexEntry = struct {
     /// spans, not the tokens alone: matching, supersede and chunk share clamp at
     /// `mediaSharedBound`. Owned.
     media: []MediaSpan = &.{},
+    /// v10: the divergence pin persisted for this entry -- the media-start
+    /// clamp every later turn of a re-screenshot session restores AT. Retention
+    /// keeps it even past the per-entry cap; a scan drops the stamp (never the
+    /// entry) when its checkpoint file failed size salvage. 0 = none.
+    ssm_pin: u32 = 0,
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
     last_used: u64,
 };
@@ -330,7 +335,25 @@ pub const Match = struct {
 
 /// `bestHybridMatch`'s result: the winning entry, its usable prefix, and the
 /// restorable checkpoint position (≤ usable) that won it the race.
-pub const HybridMatch = struct { idx: usize, usable: u32, cp: u32 };
+pub const HybridMatch = struct {
+    idx: usize,
+    usable: u32,
+    cp: u32,
+    /// The clamp point this match fell short of: a media-bearing request whose
+    /// usable prefix stops EXACTLY at a media boundary (every later turn of a
+    /// re-screenshot session re-clamps at the same start) with no checkpoint at
+    /// the boundary. Capturing -- and pinning -- a checkpoint there this turn
+    /// makes every following turn restore at zero waste. null = nothing to pin
+    /// (no media clamp, or the winner already restores at the clamp).
+    pin_candidate: ?u32 = null,
+};
+
+/// The one prompt tail token held back from the chunk loop by the generation
+/// side's end-of-prompt snapshot (mirrors `generate.SSM_SNAPSHOT_BACKOFF` --
+/// kv_disk_cache may not import generate, so the value is restated here and
+/// pinned by a test). A pin candidate must sit strictly before that window or
+/// no chunk could ever end on it.
+pub const PIN_MIN_TAIL: u32 = 30;
 
 /// Why the hybrid lookup skipped an entry that DID share a long token prefix:
 /// nothing persisted is restorable below `usable`, so the request falls to a
@@ -798,7 +821,17 @@ pub const DiskTier = struct {
                 }
                 continue;
             };
-            if (best == null or cp > best.?.cp) best = .{ .idx = i, .usable = usable, .cp = cp };
+            if (best == null or cp > best.?.cp) {
+                var m = HybridMatch{ .idx = i, .usable = usable, .cp = cp };
+                // The divergence-pin surface: media-bearing request, its usable clamped
+                // EXACTLY at the media boundary (a text fork above the boundary would
+                // drift turn to turn -- not a pin), no checkpoint at the boundary
+                // today, and the boundary inside chunk reach.
+                const bound = mediaSharedBound(e.media, media);
+                if (media.len > 0 and bound < std.math.maxInt(usize) and bound == usable and
+                    usable > cp and @as(u64, usable) + PIN_MIN_TAIL < prompt_ids.len) m.pin_candidate = @intCast(bound);
+                best = m;
+            }
         }
         if (deepest_skip) |dd| {
             if (dd.lowest_cp) |low| {
@@ -1476,8 +1509,9 @@ pub const DiskTier = struct {
         // kv_len past it.
         const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
         const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
+        const old_ssm_pin: u32 = if (extend_idx) |i| self.entries.items[i].ssm_pin else 0;
         var written_bytes: u64 = 0;
-        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
+        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, old_ssm_pin, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
             // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
             // would double-free (the fault-injection test segfaulted on exactly this).
             return err;
@@ -1561,6 +1595,7 @@ pub const DiskTier = struct {
             .chunk_bytes = try chunk_sizes.toOwnedSlice(self.allocator),
             .inherited_chunks = inherited,
             .ssm_positions = ssm_res.positions,
+            .ssm_pin = ssm_res.pin,
             .ssm_bytes = ssm_res.bytes,
             .spec_bytes = spec_res.bytes,
             .spec_dflash = spec_res.dflash,
@@ -1694,7 +1729,7 @@ pub const DiskTier = struct {
         // Write-ahead bound: the token record, not the flushed kv_len — a
         // checkpoint beyond the current chunks is position-keyed and becomes
         // restorable when a later extend raises kv_len past it.
-        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
+        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, e.ssm_pin, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
         errdefer ssm_res.deinit(self.allocator);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.qsa_history_bytes, e.kv_len, s);
 
@@ -1712,6 +1747,7 @@ pub const DiskTier = struct {
         self.allocator.free(e.ssm_bytes);
         e.ssm_positions = ssm_res.positions;
         e.ssm_bytes = ssm_res.bytes;
+        e.ssm_pin = ssm_res.pin;
         if (qsa_res.inherited) {
             e.inherited_qsa = true;
         } else if (qsa_res.bytes > 0) {
@@ -2237,6 +2273,9 @@ pub const DiskTier = struct {
         /// All target checkpoints made it to disk this flush (false → the
         /// per-flush byte cap deferred some; the caller keeps the entry dirty).
         complete: bool,
+        /// The pin position this on-disk set leaves behind (0 = none): this
+        /// flush's pinned capture, else the old pin retention kept.
+        pin: u32 = 0,
 
         fn deinit(self: *SsmPersistResult, allocator: std.mem.Allocator) void {
             allocator.free(self.positions);
@@ -2255,6 +2294,16 @@ pub const DiskTier = struct {
     /// KV now on disk (a hybrid restore needs KV covering [0, cp_pos)).
     /// Sorted ascending; caller frees.
     fn ssmTargetPositions(self: *DiskTier, old_positions: []const u32, cps: []const transformer_mod.SSMCheckpoint, kv_len: u32) ![]u32 {
+        return self.ssmTargetPositionsPin(old_positions, cps, kv_len, 0);
+    }
+
+    /// `ssmTargetPositions` + the divergence pin. The pin is this session's
+    /// restore point for EVERY following turn (the media clamp a re-screenshot
+    /// client hits each turn), so it survives the per-entry cap: when the only
+    /// drop candidates left are the pin itself, the entry over-cap's instead —
+    /// a few MB here is orders of magnitude cheaper than the full re-prefill of
+    /// the clamp gap every warm turn would otherwise pay.
+    fn ssmTargetPositionsPin(self: *DiskTier, old_positions: []const u32, cps: []const transformer_mod.SSMCheckpoint, kv_len: u32, old_pin: u32) ![]u32 {
         var set = std.ArrayList(u32).empty;
         errdefer set.deinit(self.allocator);
         try set.appendSlice(self.allocator, old_positions);
@@ -2267,8 +2316,27 @@ pub const DiskTier = struct {
         // Only the span-preserving policies get anchors; the legacy `.oldest`
         // retention (the highest N) is left exactly as it was.
         const anchors = if (self.cp_thin == .oldest) 0 else self.ssm_low_anchors;
+        // The pin to protect: this flush's pinned capture wins (a re-pin
+        // replaces the old stamp), else the entry's persisted pin when it
+        // survived into the set.
+        var pin: u32 = 0;
+        for (cps) |*cp| {
+            if (cp.is_pinned and cp.pos > 0 and cp.pos <= kv_len) {
+                pin = @intCast(cp.pos);
+                break;
+            }
+        }
+        if (pin == 0 and old_pin != 0 and std.mem.indexOfScalar(u32, set.items, old_pin) != null) pin = old_pin;
         while (set.items.len > self.ssm_max_per_entry) {
-            _ = set.orderedRemove(transformer_mod.positionDropIndexLowAnchored(set.items, self.cp_thin, anchors));
+            if (pin == 0) {
+                _ = set.orderedRemove(transformer_mod.positionDropIndexLowAnchored(set.items, self.cp_thin, anchors));
+                continue;
+            }
+            const mask = try self.allocator.alloc(bool, set.items.len);
+            defer self.allocator.free(mask);
+            for (mask, set.items) |*p, pos| p.* = pos == pin;
+            const drop = transformer_mod.positionDropIndexPinned(set.items, mask, self.cp_thin, anchors) orelse break;
+            _ = set.orderedRemove(drop);
         }
         return set.toOwnedSlice(self.allocator);
     }
@@ -2280,8 +2348,17 @@ pub const DiskTier = struct {
     fn ssmWorkPending(self: *DiskTier, e: *const IndexEntry, cps_opt: ?[]const transformer_mod.SSMCheckpoint, kv_limit: u32) bool {
         const cps = cps_opt orelse return false;
         if (cps.len == 0) return false;
-        const target = self.ssmTargetPositions(e.ssm_positions, cps, kv_limit) catch return false;
+        const target = self.ssmTargetPositionsPin(e.ssm_positions, cps, kv_limit, e.ssm_pin) catch return false;
         defer self.allocator.free(target);
+        // A pin capture whose POSITION is already on disk but whose stamp is
+        // not this position is still pending work: without the meta rewrite the
+        // next boot's retention would evict the clamp the whole session pays for.
+        for (target) |p| {
+            if (p == e.ssm_pin) continue;
+            if (findCp(cps, p)) |cp| {
+                if (cp.is_pinned) return true;
+            }
+        }
         // A target position missing from disk, OR an on-disk position no
         // longer in target (retention would drop it), is pending work.
         if (target.len != e.ssm_positions.len) return true;
@@ -2310,6 +2387,9 @@ pub const DiskTier = struct {
         kv_limit: u32,
         old_positions: []const u32,
         old_bytes: []const u64,
+        /// The entry's persisted divergence pin (0 = none) — protected by the
+        /// same thin, replaced by a pinned capture this flush.
+        old_pin: u32,
         cps_opt: ?[]const transformer_mod.SSMCheckpoint,
         written_bytes: *u64,
         s: mlx.mlx_stream,
@@ -2323,7 +2403,7 @@ pub const DiskTier = struct {
                 .complete = true,
             };
         }
-        const target = try self.ssmTargetPositions(old_positions, cps, kv_limit);
+        const target = try self.ssmTargetPositionsPin(old_positions, cps, kv_limit, old_pin);
         defer self.allocator.free(target);
 
         // Delete positions retention drops (present on disk, absent from target).
@@ -2372,7 +2452,19 @@ pub const DiskTier = struct {
             positions[i] = pr.pos;
             bytes[i] = pr.bytes;
         }
-        return .{ .positions = positions, .bytes = bytes, .complete = complete };
+        // The pin the surviving set leaves behind: this flush's pinned capture
+        // wins, else the old pin when retention kept its position.
+        var out_pin: u32 = 0;
+        for (positions) |p| {
+            if (findCp(cps, p)) |cp| {
+                if (cp.is_pinned) {
+                    out_pin = p;
+                    break;
+                }
+            }
+        }
+        if (out_pin == 0 and old_pin != 0 and std.mem.indexOfScalar(u32, positions, old_pin) != null) out_pin = old_pin;
+        return .{ .positions = positions, .bytes = bytes, .complete = complete, .pin = out_pin };
     }
 
     /// Write (or, under SSD-first, stage) one SSM checkpoint as `s{pos:0>7}.safetensors`.
@@ -2930,6 +3022,12 @@ pub const DiskTier = struct {
         // token-only matching (it would restore past a placeholder under a
         // possibly different image), so a media entry claims a version the old
         // reader gate rejects.
+        // v10 adds the divergence pin ("ssm_pin") -- stamped ONLY for entries
+        // that actually carry one: pre-pin media entries keep their v9 stamp, so
+        // a downgrade reads them exactly as the pin-less binary wrote them, and
+        // a pin-carrying entry alone claims the version the old gate rejects
+        // (a downgrade drops that tier rather than silently thinning the pin).
+        if (e.ssm_pin != 0) return 10;
         if (e.media.len > 0) return 9;
         if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) return 8;
         if (e.inherited_chunks > 0) return 6;
@@ -2995,6 +3093,10 @@ pub const DiskTier = struct {
             }
             try out.appendSlice(a, "]");
         }
+        // v10: the divergence pin -- the media-clamp position every later turn
+        // of this session restores at (0 = none; the scan drops a stamp whose
+        // checkpoint failed size salvage, never the entry).
+        if (e.ssm_pin != 0) try out.print(a, ",\"ssm_pin\":{d}", .{e.ssm_pin});
         try out.appendSlice(a, "}");
     }
 
@@ -3357,6 +3459,18 @@ pub const DiskTier = struct {
             self.allocator.free(ssm_bytes);
             return null;
         }
+        // v10: the divergence pin. Valid only on a media entry; a stamp whose
+        // position is not in the surviving ssm array (its checkpoint file failed
+        // size salvage) drops the STAMP, not the entry: the next lookup
+        // re-derives the pin candidate and the following prefill re-captures it.
+        var ssm_pin: u32 = 0;
+        if (media.len > 0 and version >= 10) {
+            if (jsonU64(obj, "ssm_pin")) |p| {
+                if (std.math.cast(u32, p)) |pin32| {
+                    if (std.mem.indexOfScalar(u32, ssm_positions, pin32) != null) ssm_pin = pin32;
+                }
+            }
+        }
 
         return .{
             .e = .{
@@ -3370,6 +3484,7 @@ pub const DiskTier = struct {
                 .chunk_bytes = chunk_bytes,
                 .ssm_positions = ssm_positions,
                 .ssm_bytes = ssm_bytes,
+                .ssm_pin = ssm_pin,
                 .spec_bytes = spec_bytes,
                 .spec_dflash = spec_dflash,
                 .spec_mtp = spec_mtp,
@@ -8226,6 +8341,71 @@ test "a fork below a coarse grid's first multiple restores at 24576 once the den
     try testing.expectEqual(@as(u32, @intCast(fork)), hm.usable);
 }
 
+test "divergence pin: the re-screenshot session's clamp point restores nothing and re-prefills every turn" {
+    // Reproduction of the 2026-10-12 23:05 main-session stall: the client
+    // re-injects a screenshot at the SAME prompt position (161569 here) every
+    // turn, so every lookup clamps the shared prefix at the media start even
+    // though the 161k header is identical. The deep donor e382 persisted its
+    // end-of-turn snapshots at 161651/162162 -- both ABOVE the clamp, so it is
+    // skipped (the production line: "deep prefix matches skipped ... lowest
+    // grid cp"). The coarse-grid donor e377 wins at cp 155648 and the turn
+    // re-prefills the 5921-token gap EVERY turn. The lookup must surface the
+    // clamp as the capture pin for this prefill; next turn's clamp then
+    // restores there with zero waste.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-divpin", 0, 1024);
+    defer tier.deinit();
+
+    const clamp: usize = 161_569; // media start, identical across turns
+    const req_len: usize = 162_191;
+
+    const req = try testing.allocator.alloc(u32, req_len);
+    defer testing.allocator.free(req);
+    for (req, 0..) |*t, i| t.* = @intCast(i + 1);
+    const req_media = [_]MediaSpan{.{ .start = @intCast(clamp), .key = 0xAA01 }};
+
+    // e377: an older deep commit, header identical up to the clamp, its own
+    // screenshot key, coarse 8192 grid below.
+    const e377_tokens = try testing.allocator.alloc(u32, clamp + 20_000);
+    for (e377_tokens[0..clamp], req[0..clamp]) |*d, r| d.* = r;
+    for (e377_tokens[clamp..], clamp..) |*d, i| d.* = @intCast(i + 500_000);
+    const e377_cp = try testing.allocator.alloc(u32, 3);
+    e377_cp[0] = 139_264;
+    e377_cp[1] = 147_456;
+    e377_cp[2] = 155_648; // 19 * 8192 -- the highest point at or below the clamp
+
+    // e382: the previous turn's commit. Its checkpoints are end-of-turn
+    // snapshots, both above the clamp -- restorable depth zero for this turn.
+    const e382_tokens = try testing.allocator.alloc(u32, clamp + 700);
+    for (e382_tokens[0..clamp], req[0..clamp]) |*d, r| d.* = r;
+    for (e382_tokens[clamp..], clamp..) |*d, i| d.* = @intCast(i + 900_000);
+    const e382_cp = try testing.allocator.alloc(u32, 2);
+    e382_cp[0] = 161_651;
+    e382_cp[1] = 162_162;
+
+    try tier.entries.append(testing.allocator, try syntheticEntryMedia(1_377, e377_tokens, e377_cp, &.{.{ .start = @intCast(clamp), .key = 0xAA77 }}));
+    try tier.entries.append(testing.allocator, try syntheticEntryMedia(1_382, e382_tokens, e382_cp, &.{.{ .start = @intCast(clamp), .key = 0xAA82 }}));
+
+    // The reproduced bug: the deepest match is skipped for want of a checkpoint
+    // at or below the clamp, and the winner restores 5921 tokens below it.
+    const hm = tier.bestHybridMatch(req, false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &req_media).?;
+    try testing.expectEqual(@as(usize, 0), hm.idx); // e377, not the deep e382
+    try testing.expectEqual(@as(u32, @intCast(clamp)), hm.usable);
+    try testing.expectEqual(@as(u32, 155_648), hm.cp);
+    // The skip is reported WITH its grid floor, same shape as the production line.
+    const diag = hybridSkipDiagnosis(&tier.entries.items[1], clamp, @intCast(clamp), HYBRID_SKIP_DIAG_MIN_TOKENS).?;
+    try testing.expectEqual(@as(u64, 1_382), diag.entry_id);
+    try testing.expectEqual(@as(?u32, 161_651), diag.lowest_cp);
+    // The fix surface: the clamp is surfaced as this prefill's capture pin, so
+    // the next turn restores AT the clamp (waste 0) instead of below it.
+    try testing.expectEqual(@as(?u32, @intCast(clamp)), hm.pin_candidate);
+}
+
 /// Release what a `syntheticEntry` owns when it never made it into the tier (an
 /// appended entry is released by `DiskTier.deinit` instead).
 fn freeSyntheticEntry(e: *IndexEntry) void {
@@ -8239,6 +8419,11 @@ fn freeSyntheticEntry(e: *IndexEntry) void {
 /// An in-memory `IndexEntry` for lookup-only tests: every owned slice comes from
 /// `testing.allocator` so `DiskTier.deinit` frees exactly what it owns.
 fn syntheticEntry(id: u64, tokens: []u32, ssm_positions: []u32) !IndexEntry {
+    return syntheticEntryMedia(id, tokens, ssm_positions, &[_]MediaSpan{});
+}
+
+/// `syntheticEntry` with an explicit media span list.
+fn syntheticEntryMedia(id: u64, tokens: []u32, ssm_positions: []u32, media: []const MediaSpan) !IndexEntry {
     const chunk_bytes = try testing.allocator.alloc(u64, 1);
     chunk_bytes[0] = 0;
     const ssm_bytes = try testing.allocator.alloc(u64, ssm_positions.len);
@@ -8253,7 +8438,7 @@ fn syntheticEntry(id: u64, tokens: []u32, ssm_positions: []u32) !IndexEntry {
         .chunk_bytes = chunk_bytes,
         .ssm_positions = ssm_positions,
         .ssm_bytes = ssm_bytes,
-        .media = try testing.allocator.alloc(MediaSpan, 0),
+        .media = try testing.allocator.dupe(MediaSpan, media),
         .last_used = id,
     };
 }

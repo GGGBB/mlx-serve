@@ -161,6 +161,13 @@ pub const LookupResult = struct {
     slot_owned: bool = false,
     /// `Entry.id` of the RAM entry restored from; 0 = none.
     entry_id: u64 = 0,
+    /// The divergence pin this prefill must capture: a media-bearing request
+    /// whose usable prefix clamps EXACTLY at a media boundary (every later turn
+    /// of a re-screenshot client re-clamps at the same start) with the restored
+    /// checkpoint below it. Generation ends a chunk at this absolute position
+    /// and stamps a pinned checkpoint unconditionally; every retention site
+    /// keeps it over cap. null = nothing to pin.
+    divergence_pin: ?u32 = null,
 };
 
 const Entry = struct {
@@ -1252,6 +1259,9 @@ pub const HotPrefixCache = struct {
                     .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
                     .mtp_base = disk_mtp,
                     .slot_owned = true,
+                    // The clamp the restore fell short of (disk tier's own
+                    // derivation): capture it this prefill, pin it forever.
+                    .divergence_pin = hm.pin_candidate,
                 };
             }
 
@@ -1466,6 +1476,15 @@ pub const HotPrefixCache = struct {
             .mtp_base = restoreMtp(e, mtp_target, matched, s),
             .entry_id = e.id,
         };
+        // The divergence pin (hybrid targets only): the same clamp condition the
+        // disk tier stamps on `HybridMatch.pin_candidate` — the raw match stops
+        // EXACTLY at a media boundary, the restored checkpoint sits below it,
+        // and the boundary is inside the chunk loop's capture reach.
+        if (target_ssm_entries != null and media.len > 0) {
+            const clamp = mediaSharedBound(e.media, media);
+            if (clamp < std.math.maxInt(usize) and clamp == m.shared and effective_matched < clamp and
+                @as(u64, clamp) + kv_disk_cache.PIN_MIN_TAIL < prompt_ids.len) res.divergence_pin = @intCast(clamp);
+        }
         if (!full_reuse) {
             res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
         }
@@ -2560,12 +2579,9 @@ pub const HotPrefixCache = struct {
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
-            const drop = transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                merged.items,
-                self.cp_thin,
-                boundaryCheckpointIndex(merged.items, media_start),
-                self.ssm_low_anchors,
-            );
+            // A pinned checkpoint (the session's divergence clamp) outranks this
+            // cap: null = every candidate is a pin, over-cap for this merge.
+            const drop = transformer_mod.ssmCheckpointDropIndexPinned(merged.items, self.cp_thin, boundaryCheckpointIndex(merged.items, media_start), self.ssm_low_anchors) orelse break;
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
         }
@@ -2684,12 +2700,10 @@ pub const HotPrefixCache = struct {
         var n = cps.len;
         var shed: usize = 0;
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
-            const drop = transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                cps[0..n],
-                self.cp_thin,
-                boundaryCheckpointIndex(cps[0..n], firstSpanStart(newest.media)),
-                self.ssm_low_anchors,
-            );
+            // The pin outranks the byte budget too: shedding the one position
+            // every following turn restores from re-buys its full re-prefill
+            // every turn — the exact cost this feature exists to delete.
+            const drop = transformer_mod.ssmCheckpointDropIndexPinned(cps[0..n], self.cp_thin, boundaryCheckpointIndex(cps[0..n], firstSpanStart(newest.media)), self.ssm_low_anchors) orelse break;
             const freed = ssmCheckpointBytes(&cps[drop]);
             if (checkpointHasQsaPooled(&cps[drop])) {
                 if (drop > 0) {

@@ -13711,6 +13711,11 @@ pub const SSMCheckpoint = struct {
     /// the SSM state, so the model behaves as if it had only seen the first
     /// `pos` tokens of the prompt.
     pos: usize,
+    /// A divergence pin: the one position a later turn of this session must
+    /// restore from (a re-screenshot client's stable media boundary). Pinned
+    /// checkpoints are never thin candidates — retention skips them, and a
+    /// list whose every candidate is pinned over-cap's instead (null).
+    is_pinned: bool = false,
     /// Per-layer SSM snapshots — same length as `ctx.ssm_entries`. Non-SSM
     /// layers (plain attention) get a null-handle snapshot which is a no-op
     /// in `ssmRestore`.
@@ -14000,6 +14005,62 @@ fn usizePosOf(p: *const usize) usize {
     return p.*;
 }
 
+/// Pinned variant of the retention thin: `pinnedOf` marks the divergence-pin
+/// checkpoints (the media-boundary position a later turn of this session must
+/// restore from). A pinned item is never a drop candidate -- and when the cap
+/// leaves no unpinned candidate at all the thin is SKIPPED (null) rather than
+/// evicting the pin: over-capping one entry beats guaranteeing the next warm
+/// turn a zero-restorable clamp and a full re-prefill of the gap.
+fn spanPreservingDropIndexPinnedT(
+    comptime T: type,
+    items: []const T,
+    comptime posOf: fn (*const T) usize,
+    comptime pinnedOf: fn (*const T) bool,
+    policy: ThinPolicy,
+    protect: ?usize,
+    low_anchors: usize,
+) ?usize {
+    std.debug.assert(items.len > 0);
+    const last = items.len - 1;
+    // The plain wrapper's fallbacks all land below the pin region (index 0 or a
+    // low anchor): keep them, but never on a pinned item -- null says "skip the
+    // thin this turn" to the caller.
+    const floor = @min(low_anchors, last);
+    if (items.len <= low_anchors + 1) return if (pinnedOf(&items[floor])) null else floor;
+    if (policy == .oldest) return if (pinnedOf(&items[floor])) null else floor;
+    if (items.len < 3) return if (pinnedOf(&items[floor])) null else floor;
+    const scan_end = if (policy == .min_span_recency and items.len >= RECENCY_DENSE_MIN)
+        items.len - items.len / 4
+    else
+        items.len;
+    const scan_start = @max(low_anchors, 1);
+    var best_at: usize = scan_start;
+    var best_span: usize = std.math.maxInt(usize);
+    var pinned_blocked = false;
+    var k: usize = scan_start;
+    while (k + 1 < items.len and k < scan_end) : (k += 1) {
+        if (protect) |p| if (k == p) continue;
+        if (pinnedOf(&items[k])) {
+            pinned_blocked = true;
+            continue;
+        }
+        const span = posOf(&items[k + 1]) -| posOf(&items[k - 1]);
+        if (span < best_span) {
+            best_span = span;
+            best_at = k;
+        }
+    }
+    // Nothing scannable: the plain fn sends the oldest (it sits below every
+    // anchor). With pins in play, an exhaustion the pins CAUSED skips the whole
+    // thin instead -- chewing through the oldest each turn is the #794 floor
+    // creep, and the pin exists precisely because a later turn restores there.
+    if (best_span == std.math.maxInt(usize)) {
+        if (pinned_blocked or pinnedOf(&items[0])) return null;
+        return 0;
+    }
+    return best_at;
+}
+
 /// `spanPreservingDropIndex` over a checkpoint list.
 pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, protect: ?usize) usize {
     return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, 0);
@@ -14021,6 +14082,65 @@ pub fn ssmCheckpointDropIndexLowAnchored(
 /// `spanPreservingDropIndex` over a bare ascending position list.
 pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
     return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null, 0);
+}
+fn checkpointPinnedOf(cp: *const SSMCheckpoint) bool {
+    return cp.is_pinned;
+}
+
+/// `ssmCheckpointDropIndex` respecting `SSMCheckpoint.is_pinned`: pinned
+/// checkpoints are never dropped, and a list whose every candidate is pinned
+/// returns null -- the caller keeps the list over cap this turn. Null is also
+/// returned when a `.oldest`/anchor fallback would land on a pin.
+pub fn ssmCheckpointDropIndexPinned(
+    cps: []const SSMCheckpoint,
+    policy: ThinPolicy,
+    protect: ?usize,
+    low_anchors: usize,
+) ?usize {
+    return spanPreservingDropIndexPinnedT(SSMCheckpoint, cps, checkpointPosOf, checkpointPinnedOf, policy, protect, low_anchors);
+}
+
+/// `positionDropIndex` over a bare position list with a parallel pinned mask
+/// (the disk tier stores one pin VALUE per entry, not per-position flags).
+/// Same semantics as `ssmCheckpointDropIndexPinned`: pinned positions are never
+/// dropped; when only pins remain the thin is skipped (null).
+pub fn positionDropIndexPinned(
+    positions: []const u32,
+    pinned: []const bool,
+    policy: ThinPolicy,
+    low_anchors: usize,
+) ?usize {
+    std.debug.assert(positions.len == pinned.len);
+    const last = positions.len - 1;
+    const floor = @min(low_anchors, last);
+    if (positions.len <= low_anchors + 1 or policy == .oldest or positions.len < 3) {
+        return if (pinned[floor]) null else floor;
+    }
+    const scan_end = if (policy == .min_span_recency and positions.len >= RECENCY_DENSE_MIN)
+        positions.len - positions.len / 4
+    else
+        positions.len;
+    const scan_start = @max(low_anchors, 1);
+    var best_at: usize = scan_start;
+    var best_span: usize = std.math.maxInt(usize);
+    var pinned_blocked = false;
+    var k: usize = scan_start;
+    while (k + 1 < positions.len and k < scan_end) : (k += 1) {
+        if (pinned[k]) {
+            pinned_blocked = true;
+            continue;
+        }
+        const span = positions[k + 1] -| positions[k - 1];
+        if (span < best_span) {
+            best_span = span;
+            best_at = k;
+        }
+    }
+    if (best_span == std.math.maxInt(usize)) {
+        if (pinned_blocked or pinned[0]) return null;
+        return 0;
+    }
+    return best_at;
 }
 
 pub fn positionDropIndexUsize(positions: []const usize, policy: ThinPolicy) usize {
@@ -71322,6 +71442,61 @@ test "ssm retention: the span-preserving thin keeps both ends and spreads the su
         try t.expectEqual(
             positionDropIndexUsize(pos12[0..7], .min_span),
             positionDropIndexUsize(pos12[0..7], .min_span_recency),
+        );
+    }
+}
+
+test "ssm retention: a pinned checkpoint survives every thin and outranks the cap" {
+    // Divergence pin: the checkpoint at a session's stable fork (a media
+    // boundary that every later turn re-clamps at) is the one restore point a
+    // warm turn needs. Pinned checkpoints are never drop candidates; when the
+    // cap leaves nothing else to drop the list over-cap's (null) instead of
+    // evicting the pin.
+    const t = std.testing;
+    var cps: [12]SSMCheckpoint = undefined;
+    for (&cps, 0..) |*c, i| c.* = .{ .pos = (i + 1) * 4096, .layers = &.{}, .is_pinned = i == 4 or i == 7 };
+    var n: usize = cps.len;
+    while (n > 4) {
+        const drop = ssmCheckpointDropIndexPinned(cps[0..n], .min_span_recency, null, 0).?;
+        try t.expect(!cps[drop].is_pinned);
+        var k = drop;
+        while (k + 1 < n) : (k += 1) cps[k] = cps[k + 1];
+        n -= 1;
+    }
+    // Thinning 12 down to 4 evicts exactly the unanchored interior: both pins
+    // (20480/32768) survive next to the always-kept ends.
+    try t.expectEqual(@as(usize, 4_096), cps[0].pos);
+    try t.expectEqual(@as(usize, 20_480), cps[1].pos);
+    try t.expectEqual(@as(usize, 32_768), cps[2].pos);
+    try t.expectEqual(@as(usize, 49_152), cps[3].pos);
+    // Every interior candidate pinned: no drop, the caller over-cap's.
+    var tight: [4]SSMCheckpoint = undefined;
+    for (&tight, 0..) |*c, i| c.* = .{ .pos = (i + 1) * 4096, .layers = &.{}, .is_pinned = i == 1 or i == 2 };
+    try t.expectEqual(@as(?usize, null), ssmCheckpointDropIndexPinned(&tight, .min_span_recency, null, 0));
+    // Even the `.oldest` policy may not evict a pinned floor: null, not 0.
+    var floor_pin: [5]SSMCheckpoint = undefined;
+    for (&floor_pin, 0..) |*c, i| c.* = .{ .pos = (i + 1) * 4096, .layers = &.{}, .is_pinned = i == 0 };
+    try t.expectEqual(@as(?usize, null), ssmCheckpointDropIndexPinned(&floor_pin, .oldest, null, 0));
+    // Zero pins: byte-identical to the plain wrappers it replaces.
+    var plain: [9]SSMCheckpoint = undefined;
+    for (&plain, 0..) |*c, i| c.* = .{ .pos = (i + 1) * 4_096 + @as(usize, @intCast(i * i)), .layers = &.{} };
+    for ([_]ThinPolicy{ .oldest, .min_span, .min_span_recency }) |policy| {
+        try t.expectEqual(
+            ssmCheckpointDropIndex(&plain, policy, null),
+            ssmCheckpointDropIndexPinned(&plain, policy, null, 0).?,
+        );
+    }
+    // The bare-position variant takes the same predicate as a mask.
+    const pos_list = [_]u32{ 1_000, 2_000, 2_010, 3_000 };
+    const one_pin = [_]bool{ false, true, false, false };
+    try t.expectEqual(@as(?usize, 2), positionDropIndexPinned(&pos_list, &one_pin, .min_span_recency, 0));
+    const all_pins = [_]bool{ false, true, true, false };
+    try t.expectEqual(@as(?usize, null), positionDropIndexPinned(&pos_list, &all_pins, .min_span_recency, 0));
+    for ([_]ThinPolicy{ .oldest, .min_span, .min_span_recency }) |policy| {
+        const none = [_]bool{ false, false, false, false };
+        try t.expectEqual(
+            positionDropIndex(&pos_list, policy),
+            positionDropIndexPinned(&pos_list, &none, policy, 0).?,
         );
     }
 }

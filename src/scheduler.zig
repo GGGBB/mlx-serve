@@ -7427,6 +7427,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // per-request, so prefix matching would reuse stale features.
     var prefill_tokens: []const u32 = slot.full_prompt;
     var hot_matched: u32 = 0;
+    // The divergence pin the lookup surfaced for this request (media clamp
+    // below the restore); forwarded to generation as `ssm_pin_abs`.
+    var hot_divergence_pin: ?u32 = null;
     // Are the restored rows the slot's own? A RAM checkout or a disk restore both credit them.
     var hot_checked_out: bool = false;
     // The DFlash assistant's context rides the prefix cache: a restore
@@ -7503,6 +7506,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             };
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);
+                hot_divergence_pin = lookup.divergence_pin;
                 prefill_tokens = slot.full_prompt[hot_matched..];
                 hot_checked_out = lookup.checked_out or lookup.slot_owned;
                 slot.restored_entry = lookup.entry_id;
@@ -7731,6 +7735,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,
+            // Divergence pin: the media clamp this session re-hits every turn
+            // (the lookup surfaces it when the restore landed below the clamp).
+            // Same #794 gate as the dense low grid: non-gated archs keep their
+            // byte-identical chunking.
+            .ssm_pin_abs = if (xfm_ptr.config.longCtxGated()) (hot_divergence_pin orelse 0) else 0,
             .ssm_checkpoint_pos_offset = hot_matched,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.

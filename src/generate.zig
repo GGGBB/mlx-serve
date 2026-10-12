@@ -1229,6 +1229,25 @@ pub fn nextChunkEnd(
     // extra MoE chunks (each one re-streams the expert weights).
     dense_low_grid: bool,
 ) usize {
+    return nextChunkEndPinned(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid, 0);
+}
+
+/// `nextChunkEnd` + the divergence pin: absolute position (same frame as
+/// ssm_cp_offset) where a re-screenshot session's every later turn re-clamps,
+/// resolved by the prefix lookup. The chunk ENDS on the pin so the capture gate
+/// can stamp a checkpoint there -- off-grid -- and the next turn restores with
+/// zero waste. Pin 0 = byte-identical to the plain chunking.
+pub fn nextChunkEndPinned(
+    pos: usize,
+    prefix_len: usize,
+    default_chunk: usize,
+    want_ssm_cp: bool,
+    ssm_cp_stride: usize,
+    ssm_cp_offset: usize,
+    adaptive_width: bool,
+    dense_low_grid: bool,
+    pin_abs: usize,
+) usize {
     var end = @min(pos + default_chunk, prefix_len);
     if (want_ssm_cp and ssm_cp_stride > 0) {
         const abs_pos = pos + ssm_cp_offset;
@@ -1245,9 +1264,18 @@ pub fn nextChunkEnd(
         const low_anchor = if (dense_low_grid) ssmLowAnchorEnd(pos, end, ssm_cp_offset, ssm_cp_stride) else @as(usize, 0);
         if (low_anchor > pos and low_anchor < end and (cut_abs == 0 or low_anchor + ssm_cp_offset < cut_abs))
             cut_abs = low_anchor + ssm_cp_offset;
+        // The pin beats any grid cut behind it (a restore at the pin is worth one
+        // extra chunk; a grid point stays reachable from the previous end), an
+        // earlier grid cut still wins and the pin waits for its own chunk.
+        if (pin_abs > abs_pos and pin_abs <= abs_end and (cut_abs == 0 or pin_abs < cut_abs))
+            return pin_abs - ssm_cp_offset;
         if (cut_abs != 0) return cut_abs - ssm_cp_offset;
     }
     if (end < prefix_len and prefix_len - end < tailMergeMaxFor(default_chunk, adaptive_width)) {
+        // A merge may not jump over a waiting pin: the stamp may only land on an
+        // evaluated position, and the pin's turn would never come again.
+        if (want_ssm_cp and pin_abs > end + ssm_cp_offset and pin_abs < prefix_len + ssm_cp_offset)
+            return pin_abs - ssm_cp_offset;
         // Absorb a tiny tail instead of paying a full graph build + eval
         // barrier for a few tokens. With checkpointing active this can only
         // extend within a boundary-free span (the boundary case returned
@@ -1311,6 +1339,16 @@ pub fn ssmCapturePos(stride: usize, abs_end: usize, dense_low_grid: bool) bool {
     if (stride == 0) return false;
     if (abs_end % stride == 0) return true;
     return dense_low_grid and abs_end % SSM_GRID_LOW_DENSE_STRIDE == 0 and abs_end <= SSM_GRID_LOW_DENSE_TOP;
+}
+
+/// `ssmCapturePos` plus the divergence pin: a chunk that ends exactly on the
+/// pin captures unconditionally -- the pin was chosen because EVERY later turn
+/// of this session clamps there, and a checkpoint there is worth one extra
+/// chunk. Pin 0 (the overwhelming majority of requests) keeps the plain
+/// predicate byte-for-byte.
+pub fn ssmCapturePosPinned(stride: usize, abs_end: usize, dense_low_grid: bool, pin_abs: usize) bool {
+    if (pin_abs != 0 and abs_end == pin_abs) return true;
+    return ssmCapturePos(stride, abs_end, dense_low_grid);
 }
 
 /// PURE: end the chunk at the first dense low anchor strictly inside
@@ -2486,6 +2524,12 @@ pub const Generator = struct {
         /// request that forked below a coarse grid's first multiple (#794).
         /// 0 = the plain thinning (upstream behaviour, byte-identical).
         ssm_low_anchors: usize = 0,
+        /// Absolute position of this prefill's divergence pin: the stable media
+        /// clamp resolved by the prefix lookup (same #794 gate as the pin
+        /// itself -- only media-bearing requests ever set it). The chunk loop ends
+        /// a chunk here and captures an `is_pinned` checkpoint unconditionally,
+        /// thinning included. 0 = no pin (byte-identical to before).
+        ssm_pin_abs: usize = 0,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
         /// scheduler restored some prefix and now forwards only the tail),
@@ -3039,7 +3083,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid);
+                const end = nextChunkEndPinned(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid, options.ssm_pin_abs);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -3186,8 +3230,11 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
-                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
+                const pin_hit = options.ssm_pin_abs != 0 and abs_end_for_cp2 == options.ssm_pin_abs;
+                if (want_ssm_cp and (pin_hit or ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid))) {
+                    var cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
+                    // The pin survives every later thin the moment it exists.
+                    cp.is_pinned = pin_hit;
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
                         doomed.deinit(allocator);
@@ -3206,15 +3253,13 @@ pub const Generator = struct {
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
-                        var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                                ssm_checkpoints.items,
-                                cp_thin,
-                                null,
-                                options.ssm_low_anchors,
-                            ),
-                        );
-                        dropped.deinit(allocator);
+                        // A pin outranks the per-prefill cap: null = keep the whole
+                        // list this turn rather than evict the one position every
+                        // following turn of this session restores from.
+                        if (transformer_mod.ssmCheckpointDropIndexPinned(ssm_checkpoints.items, cp_thin, null, options.ssm_low_anchors)) |drop| {
+                            var dropped = ssm_checkpoints.orderedRemove(drop);
+                            dropped.deinit(allocator);
+                        }
                     }
                 }
 
@@ -3328,15 +3373,12 @@ pub const Generator = struct {
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
-                        var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                                ssm_checkpoints.items,
-                                cp_thin,
-                                null,
-                                options.ssm_low_anchors,
-                            ),
-                        );
-                        dropped.deinit(allocator);
+                        // Same pin rule as the in-loop thin: over-cap beats evicting
+                        // the position every following turn restores from.
+                        if (transformer_mod.ssmCheckpointDropIndexPinned(ssm_checkpoints.items, cp_thin, null, options.ssm_low_anchors)) |drop| {
+                            var dropped = ssm_checkpoints.orderedRemove(drop);
+                            dropped.deinit(allocator);
+                        }
                     }
                 }
                 // One copy of the QSA key history on the latest snap. Stride
@@ -17013,6 +17055,35 @@ test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
     // INSIDE the chunk still wins over merging (next case).
     try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false, false));
     try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false, false));
+}
+
+test "nextChunkEnd: a divergence pin cuts its own chunk and the capture fires there" {
+    // The re-screenshot session clamps every later turn at its media start
+    // (161569 in the 2026-10-13 stall, under any production stride). The pin
+    // has to become a chunk end so a snapshot can stamp it: cut inside the
+    // natural chunk, stop a mergeable tail from jumping over it, and keep the
+    // absolute coordinate frame the stride boundaries already use.
+    try testing.expectEqual(@as(usize, 6_500), nextChunkEndPinned(0, 10_000, 8_192, true, 8_192, 0, false, false, 6_500));
+    try testing.expectEqual(@as(usize, 8_300), nextChunkEndPinned(0, 8_600, 8_192, true, 8_192, 0, true, false, 8_300));
+    try testing.expectEqual(@as(usize, 8_600), nextChunkEndPinned(0, 8_600, 8_192, true, 8_192, 0, true, false, 0));
+    // The plain wrapper is the pin-less point of the same function.
+    try testing.expectEqual(nextChunkEnd(0, 8_600, 8_192, true, 8_192, 0, true, false), nextChunkEndPinned(0, 8_600, 8_192, true, 8_192, 0, true, false, 0));
+    // Warm tail-forward (offset 1000): pin 1500 is local 500; a pin behind the
+    // restore point is inert; no pin is byte-identical to the old cut.
+    try testing.expectEqual(@as(usize, 500), nextChunkEndPinned(0, 2_000, 8_192, true, 8_192, 1_000, false, false, 1_500));
+    try testing.expectEqual(@as(usize, 2_000), nextChunkEndPinned(0, 2_000, 8_192, true, 8_192, 1_000, false, false, 600));
+    try testing.expectEqual(@as(usize, 2_000), nextChunkEndPinned(0, 2_000, 8_192, true, 8_192, 1_000, false, false, 0));
+    // A pin past the natural chunk end just leaves this chunk alone: the
+    // boundary split continues as usual and the pin waits in a later chunk.
+    try testing.expectEqual(@as(usize, 8_192), nextChunkEndPinned(0, 16_384, 8_192, true, 8_192, 0, false, false, 12_000));
+    // The capture predicate fires unconditionally at the pin, off-grid, while a
+    // pin-less prefill keeps the plain grid byte-for-byte.
+    try testing.expect(ssmCapturePosPinned(32_768, 161_569, false, 161_569));
+    try testing.expect(!ssmCapturePosPinned(32_768, 161_569, false, 161_569 - 1));
+    var x: usize = 0;
+    while (x <= 170_000) : (x += 1_021) {
+        try testing.expectEqual(ssmCapturePos(32_768, x, true), ssmCapturePosPinned(32_768, x, true, 0));
+    }
 }
 
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {

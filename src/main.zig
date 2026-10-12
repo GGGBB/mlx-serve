@@ -1051,6 +1051,23 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    // 自建版私有调参入口：官方 app 壳的 serverOptions JSON 没有 ssm-checkpoint 键，
+    // MLXCore 传不出这两个 flag。用环境变量覆盖网格参数，仅在对应参数仍为默认值时
+    // 生效（显式命令行依旧优先）；非法或 0 值忽略，不设变量时行为与上游完全一致。
+    if (std.c.getenv("MLX_SERVE_SSM_CHECKPOINT_STRIDE")) |r| {
+        const v = std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 0;
+        if (v != 0 and server_mod.ssm_checkpoint_stride == 256) {
+            server_mod.ssm_checkpoint_stride = v;
+            log.info("  [ssm-grid] stride override from env: {d}\n", .{v});
+        }
+    }
+    if (std.c.getenv("MLX_SERVE_SSM_CHECKPOINT_MAX")) |r| {
+        const v = std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 0;
+        if (v != 0 and server_mod.ssm_checkpoint_max == 16) {
+            server_mod.ssm_checkpoint_max = v;
+            log.info("  [ssm-grid] max override from env: {d}\n", .{v});
+        }
+    }
     // MTP verify rounds cost more than they save without the Metal verify
     // kernels: plain decode is faster on CUDA unless `--mtp` asks for it.
     if (!mtp_forced and mlx.cudaAvailable()) enable_mtp = false;
